@@ -1,0 +1,37 @@
+{
+  "name": "dsh-venery",
+  "version": "0.50.0",
+  "private": true,
+  "type": "module",
+  "description": "狩猎：红队信息收集驾驶舱——AI 驾驶舱对话 + 资产/关系/漏洞节点图 + 命令与漏洞实时流 + 密钥/模型/角色/记忆/技能/MCP 控制台。",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "browser_runner.py",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
+    }
+  }
+}

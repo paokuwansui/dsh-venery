@@ -1,0 +1,16 @@
+# dsh-venery bundle（狩猎）
+#
+# Host 行：狩猎事实库 + recon_* 工具 + POST /recon/api 私有点对点桥。
+# Client 行：由 dsh.client 声明的 client.js 提供，侧栏图标 + 主面板整页。
+- insert:
+    - id: venery
+      name: 'dsh-venery'
+      config:
+        # 事实库根目录：$DSH_HOME/recon（engagements/ 存图谱，commands/ 存命令原始输出）
+        root: !!js dshHomePath('recon')
+        # 单条命令回给模型的输出上限（字符）；完整输出始终落盘
+        maxOutputChars: 24000
+        # 命令默认超时（毫秒）
+        defaultTimeoutMs: 300000
+        # 注入给智能体的工作流段落开关
+        systemPrompt: true
