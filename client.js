@@ -376,6 +376,15 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
 .rc2-rail.right > .rc2-railhead:nth-of-type(2){border-top:1px solid var(--dsw-alias-border-l1)}
 .rc2-railhead{display:flex;align-items:center;gap:8px;padding:7px 10px;flex:0 0 auto;
   border-bottom:1px solid var(--dsw-alias-border-l1);font-size:10.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--dsw-alias-label-secondary)}
+.rc2-railhead-title{flex:0 0 auto;white-space:nowrap}
+.rc2-railhead .rc2-spacer{flex:1 1 auto}
+.rc2-boardbar{display:flex;align-items:center;gap:6px;padding:4px 8px;flex:0 0 auto;flex-wrap:nowrap;
+  border-bottom:1px solid var(--dsw-alias-border-l1);min-width:0}
+.rc2-boardbar .rc2-select{flex:0 0 auto}
+.rc2-boardbar .rc2-spacer{flex:1 1 auto}
+.rc2-boardwho{font-size:10px;line-height:16px;white-space:nowrap;flex:0 0 auto;max-width:130px;overflow:hidden;
+  text-overflow:ellipsis;padding:0 6px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1);
+  color:var(--rc-accent);background:color-mix(in srgb,var(--rc-accent) 8%,transparent)}
 .rc2-railhead b{color:var(--rc-accent);font-weight:700}
 .rc2-feed{flex:1 1 auto;overflow:auto;padding:4px 6px 12px;scroll-behavior:smooth}
 .rc2-item{display:flex;flex-direction:column;gap:2px;padding:5px 7px;border-radius:4px;cursor:pointer;
@@ -683,6 +692,16 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
   color:var(--dsw-alias-label-primary);font-size:11.5px;cursor:pointer;border-radius:4px}
 .rc2-menubox button:hover{background:var(--rc-accent-dim);color:var(--rc-accent)}
 .rc2-filterbar{display:flex;gap:3px;padding:4px 8px;flex-wrap:wrap;align-items:center}
+.rc2-merged{margin:4px 8px;border:1px dashed color-mix(in srgb,var(--rc-accent) 45%,var(--dsw-alias-border-l1));border-radius:6px;background:color-mix(in srgb,var(--rc-accent) 4%,transparent);overflow:hidden;flex:0 0 auto}
+.rc2-merged-head{width:100%;display:flex;align-items:center;gap:6px;padding:5px 8px;font-size:10.5px;color:var(--rc-accent);background:none;border:none;cursor:pointer;text-align:left}
+.rc2-merged-head:hover{background:color-mix(in srgb,var(--rc-accent) 8%,transparent)}
+.rc2-merged-body{padding:2px 8px 6px;display:flex;flex-direction:column;gap:4px;max-height:200px;overflow:auto}
+.rc2-merged-item{border-top:1px dashed color-mix(in srgb,var(--dsw-alias-border-l1) 60%,transparent);padding-top:4px}
+.rc2-merged-sample{font-size:11px;line-height:1.5;color:#a8b8cc;margin-top:2px;white-space:pre-wrap;overflow-wrap:anywhere}
+.rc2-merged-authors{margin-top:4px;display:flex;flex-direction:column;gap:3px}
+.rc2-merged-toggle{align-self:flex-start;font-size:10px;padding:0 4px;border:1px dashed var(--dsw-alias-border-l1);border-radius:4px;background:none;color:#94a3b8;cursor:pointer}
+.rc2-merged-authorlist{display:flex;flex-direction:column;gap:2px}
+.rc2-merged-authorrow{display:flex;align-items:center;gap:6px;font-size:10.5px}
 .rc2-fchip{font-size:10px;padding:1px 6px;border-radius:10px;cursor:pointer;border:1px solid var(--dsw-alias-border-l1);
   background:transparent;color:var(--dsw-alias-label-secondary)}
 .rc2-fchip.on{border-color:var(--rc-accent);color:var(--rc-accent);background:var(--rc-accent-dim)}
@@ -1105,6 +1124,9 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
       const [boardQuery, setBoardQuery] = useState('')
       const [boardKindFilter, setBoardKindFilter] = useState('all')
       const [boardAuthor, setBoardAuthor] = useState('all')
+      /* 看板压缩条目的展开状态：按作者汇总块 / 单条按角色明细 */
+      const [mergedBlockOpen, setMergedBlockOpen] = useState({})
+      const [mergedDetailOpen, setMergedDetailOpen] = useState({})
       const [kindFilter, setKindFilter] = useState(() => new Set())
       /* 图例固定高亮：{kind} 或 {vuln:true}，null 表示不高亮；只有「全部」能清掉 */
       const [legendFocus, setLegendFocus] = useState(null)
@@ -3362,6 +3384,57 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
       }
       const kindLabel = (kind) => t(kind === 'finding' ? 'kindFinding' : (kind === 'hypothesis' ? 'kindHypothesis' : (kind === 'task' ? 'kindTask' : (kind === 'conclusion' ? 'kindConclusion' : 'kindNote'))))
 
+      /* 压缩摘要里按角色记了计数与样本：展开后可逐人查看，并可一键「只看他」 */
+      const mergedAuthorsBlock = (entry) => {
+        const merged = entry.refs && entry.refs.merged
+        const list = merged && Array.isArray(merged.authors) ? merged.authors : []
+        if (list.length === 0) return null
+        const open = mergedDetailOpen[entry.id] === true
+        return h('div', { className: 'rc2-merged-authors' },
+          h('button', {
+            className: 'rc2-merged-toggle',
+            onClick: () => setMergedDetailOpen((prev) => ({ ...prev, [entry.id]: !open })),
+          }, `${open ? '▾' : '▸'} 按角色查看（${list.length} 人）`),
+          open ? h('div', { className: 'rc2-merged-authorlist' }, list.map((row) => h('div', {
+            key: `${row.role || ''}:${row.name}`,
+            className: 'rc2-merged-authorrow',
+          },
+          h('span', { className: 'rc2-author', style: { color: ROLE_COLOR[row.role] || '#94a3b8', borderColor: ROLE_COLOR[row.role] || '#94a3b8' } }, row.name),
+          h('span', { className: 'rc2-meta' }, `${Number(row.count) || 0} 条`),
+          h('span', { className: 'rc2-spacer' }),
+          h('button', { className: 'rc2-fchip', onClick: () => setBoardAuthor(row.name) }, '只看他')))) : null)
+      }
+
+      /* 选中某个队员时，把他被压缩掉的发言单独收成一个可展开的小卡片 */
+      const mergedByAuthor = (author) => {
+        if (author === 'all' || author === '') return null
+        const summaries = boardEntries.filter((entry) => {
+          const merged = entry.refs && entry.refs.merged
+          return merged && Array.isArray(merged.authors) && merged.authors.some((row) => row.name === author)
+        })
+        if (summaries.length === 0) return null
+        const total = summaries.reduce((sum, entry) => {
+          const row = entry.refs.merged.authors.find((item) => item.name === author)
+          return sum + (Number(row && row.count) || 0)
+        }, 0)
+        const open = mergedBlockOpen[author] === true
+        return h('div', { className: 'rc2-merged' },
+          h('button', {
+            className: 'rc2-merged-head',
+            onClick: () => setMergedBlockOpen((prev) => ({ ...prev, [author]: !open })),
+          }, `${open ? '▾' : '▸'} 📦 已压缩 ${total} 条 · ${author}`),
+          open ? h('div', { className: 'rc2-merged-body' }, summaries.slice().reverse().map((entry) => {
+            const row = entry.refs.merged.authors.find((item) => item.name === author)
+            return h('div', { key: entry.id, className: 'rc2-merged-item' },
+              h('div', { className: 'rc2-meta' },
+                `${fmtTime(new Date(Number(entry.ts) || Date.now()).toISOString())} · 该段 ${Number(row && row.count) || 0} 条`),
+              (Array.isArray(row && row.samples) ? row.samples : []).map((sample, index) => h('div', {
+                key: index, className: 'rc2-merged-sample',
+              }, sample)),
+              h('div', { className: 'rc2-meta', style: { opacity: 0.7 } }, '完整正文已随压缩移出，这里保留摘要样本'))
+          })) : null)
+      }
+
       const boardRow = (entry) => {
         const authorRole = entry.author && entry.author.role ? entry.author.role : 'system'
         const refs = entry.refs || {}
@@ -3427,6 +3500,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
               },
             }, '删')),
           h('div', { className: `rc2-boardtext${mdOn ? ' rc2-md' : ''}` }, entry.text ? mdOrText(entry.text, entry.id, mdOn) : ''),
+          mergedAuthorsBlock(entry),
           refButtons.length > 0 ? h('div', { className: 'rc2-refs' }, refButtons) : null,
           Array.isArray(entry.shots) && entry.shots.length > 0
             ? h('div', { className: 'rc2-thumbs' }, entry.shots.map((shot) => h('a', {
@@ -3436,7 +3510,41 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
             : null)
       }
 
-      const boardAuthors = Array.from(new Set(boardEntries.map((entry) => (entry.author && entry.author.name) || '?'))).slice(0, 20)
+      /* 每个作者在看板里的条数：live=还没被压缩的，merged=压缩摘要里记下的 */
+      const boardAuthorStats = new Map()
+      const bumpAuthor = (name, field, count) => {
+        if (name === '' || name === '?') return
+        const rec = boardAuthorStats.get(name) || { live: 0, merged: 0 }
+        rec[field] += count
+        boardAuthorStats.set(name, rec)
+      }
+      for (const entry of boardEntries) {
+        bumpAuthor((entry.author && entry.author.name) || '?', 'live', 1)
+        const merged = entry.refs && entry.refs.merged
+        if (merged && Array.isArray(merged.authors)) {
+          for (const row of merged.authors) if (row && row.name) bumpAuthor(row.name, 'merged', Number(row.count) || 0)
+        }
+      }
+      const boardAuthorTotal = (name) => {
+        const rec = boardAuthorStats.get(name)
+        return rec ? rec.live + rec.merged : 0
+      }
+      /* 「你」永远是下拉框第一项（即使还没发过言）；其余按发言量从多到少 */
+      const boardAuthorNames = Array.from(boardAuthorStats.keys())
+        .filter((name) => name !== '你')
+        .sort((a, b) => boardAuthorTotal(b) - boardAuthorTotal(a))
+      const boardAuthors = ['你', ...boardAuthorNames].slice(0, 30)
+      /* 当前选中的队员即使已经没有未压缩发言，也要留在下拉框里，方便看他的压缩块 */
+      const boardAuthorOptions = boardAuthor !== 'all' && boardAuthors.includes(boardAuthor) === false
+        ? [...boardAuthors, boardAuthor]
+        : boardAuthors
+      /* 「你」的条数以服务端全量为准（不受显示切片影响）；其它作者按当前看板统计 */
+      const boardUserPosts = Math.max(Number(boardUserCount) || 0, boardAuthorTotal('你'))
+      const boardAuthorCountOf = (name) => (name === '你' ? boardUserPosts : boardAuthorTotal(name))
+      /* 下拉框后面显示：选中谁 + 他在看板里一共多少条；选「全部」时显示「你 · N 条」 */
+      const boardAuthorLabel = boardAuthor === 'all'
+        ? `你 · ${boardUserPosts} 条`
+        : `${boardAuthor} · ${boardAuthorCountOf(boardAuthor)} 条`
       const boardFilterBar = h('div', { className: 'rc2-filterbar', style: { borderBottom: '1px solid var(--dsw-alias-border-l1)' } },
         h('input', {
           className: 'rc2-search', style: { width: 160, height: 22 },
@@ -3447,8 +3555,12 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
           [['all', '全部类型'], ['finding', '发现'], ['hypothesis', '猜想'], ['task', '任务'], ['conclusion', '结论'], ['note', '备注']]
             .map(([value, label]) => h('option', { key: value, value }, label))),
         h('select', { className: 'rc2-select', style: { height: 22, fontSize: 11 }, value: boardAuthor, onChange: (e) => setBoardAuthor(e.target.value) },
-          h('option', { value: 'all' }, '全部作者'),
-          boardAuthors.map((name) => h('option', { key: name, value: name }, name))),
+          h('option', { value: 'all' }, '全部发言'),
+          boardAuthorOptions.map((name) => h('option', { key: name, value: name }, name))),
+        h('span', {
+          className: 'rc2-boardwho',
+          title: boardAuthor === 'all' ? `当前：全部发言（你的发言 ${boardUserPosts} 条）` : `当前只看：${boardAuthor}，共 ${boardAuthorCountOf(boardAuthor)} 条`,
+        }, boardAuthorLabel),
         h('button', {
           className: 'rc2-btn ghost', style: { height: 22 },
           onClick: async () => {
@@ -3589,9 +3701,11 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
             )
           }))
 
+      const paneMerged = mergedByAuthor(boardAuthor)
       const boardPane = h('div', { className: 'rc2-board', ref: boardRef },
         boardFilterBar,
-        boardEntries.length === 0 ? h('div', { className: 'rc2-note', style: { padding: '10px 4px' } }, t('boardEmpty')) : null,
+        paneMerged,
+        boardEntries.length === 0 && paneMerged === null ? h('div', { className: 'rc2-note', style: { padding: '10px 4px' } }, t('boardEmpty')) : null,
         boardEntries.slice().reverse()
           .filter((entry) => (boardKindFilter === 'all' ? true : entry.kind === boardKindFilter))
           .filter((entry) => (boardAuthor === 'all' ? true : ((entry.author && entry.author.name) || '') === boardAuthor))
@@ -3753,23 +3867,17 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
       }, h('span', { className: 'rc2-hsplit-tag' },
         `${Math.round(vulnRatio * 100)}% / ${100 - Math.round(vulnRatio * 100)}%`))
 
+      const railMerged = mergedByAuthor(boardAuthor)
       const vulnFeed = h('div', { className: 'rc2-rail right', style: { flex: `0 0 ${rightWidth}px` } },
         vulnRailHead,
         h('div', { style: { flex: `0 0 ${Math.round(vulnRatio * 100)}%`, display: 'flex', minHeight: 0 } }, vulnRailRows),
         vulnSplitter,
         h('div', { className: 'rc2-railhead' },
           h('span', { className: 'rc2-dot', style: { background: '#38bdf8', boxShadow: '0 0 8px #38bdf8' } }),
-          h('span', null, t('dockBoard')),
+          h('span', { className: 'rc2-railhead-title' }, t('dockBoard')),
           h('b', { title: `共 ${Math.max(boardTotal, boardEntries.length)} 条：agent ${boardAgentCount}（上限 ${boardLimit}，超限合并）· 你 ${boardUserCount}（无上限、永不压缩）` },
             `${Math.max(boardTotal, boardEntries.length)}/${boardLimit}`),
-          boardUserCount > 0 ? h('span', { className: 'rc2-chip', title: '用户发言：无上限、永不压缩' },
-            '你', h('b', null, boardUserCount)) : null,
           h('span', { className: 'rc2-spacer' }),
-          h('input', {
-            className: 'rc2-search', style: { width: 96, height: 20, fontSize: 10.5 },
-            value: boardQuery, placeholder: '搜索…',
-            onChange: (event) => setBoardQuery(event.target.value),
-          }),
           h('button', { className: 'rc2-zoom', style: { opacity: 1 }, title: '看板放大到中央', onClick: () => setPanelSpot('board') }, '⤢'),
           h('button', {
             className: 'rc2-btn ghost', style: { height: 20 },
@@ -3785,8 +3893,27 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
               setTimeout(() => URL.revokeObjectURL(url), 2000)
             },
           }, '↓')),
+        h('div', { className: 'rc2-boardbar' },
+          h('select', {
+            className: 'rc2-select', title: '只看某个队员的发言',
+            style: { height: 22, fontSize: 11, maxWidth: 110 },
+            value: boardAuthor,
+            onChange: (event) => setBoardAuthor(event.target.value),
+          }, [h('option', { key: 'all', value: 'all' }, '全部发言'),
+            ...boardAuthorOptions.map((name) => h('option', { key: name, value: name }, name))]),
+          h('span', {
+            className: 'rc2-boardwho',
+            title: boardAuthor === 'all' ? `当前：全部发言（你的发言 ${boardUserPosts} 条）` : `当前只看：${boardAuthor}，共 ${boardAuthorCountOf(boardAuthor)} 条`,
+          }, boardAuthorLabel),
+          h('span', { className: 'rc2-spacer' }),
+          h('input', {
+            className: 'rc2-search', style: { width: 96, height: 20, fontSize: 10.5 },
+            value: boardQuery, placeholder: '搜索…',
+            onChange: (event) => setBoardQuery(event.target.value),
+          })),
         h('div', { className: 'rc2-feed rc2-feed-grow', style: { flex: '1 1 auto', minHeight: 0 } },
-          rightBoardRows.length === 0
+          railMerged,
+          rightBoardRows.length === 0 && railMerged === null
             ? h('div', { className: 'rc2-empty', style: { padding: '16px 8px' } }, h('p', null, t('boardEmpty')))
             : rightBoardRows.map(boardRow)))
 
@@ -4276,8 +4403,18 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
                   }, '⤢')))
               }))
         } else if (panelSpot === 'board') {
+          const spotMerged = mergedByAuthor(boardAuthor)
+          const spotRows = boardEntries.slice().reverse()
+            .filter((entry) => (boardKindFilter === 'all' ? true : entry.kind === boardKindFilter))
+            .filter((entry) => (boardAuthor === 'all' ? true : ((entry.author && entry.author.name) || '') === boardAuthor))
+            .filter((entry) => {
+              const needleBoard = boardQuery.trim().toLowerCase()
+              if (needleBoard === '') return true
+              return `${entry.text || ''} ${(entry.author && entry.author.name) || ''} ${entry.kind}`.toLowerCase().includes(needleBoard)
+            })
           rows = h('div', { className: 'rc2-feed', style: { flex: '1 1 auto' } },
-            boardEntries.slice().reverse().map(boardRow))
+            spotMerged,
+            spotRows.map(boardRow))
         } else {
           rows = h('div', { className: 'rc2-chat', style: { flex: '1 1 auto' } }, chatRows)
         }

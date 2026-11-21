@@ -3191,8 +3191,10 @@ class Board {
 
   /** 用户（指挥席本人）的看板发言：无上限、永不压缩、强制进所有 agent 上下文 */
   isUserEntry(row) {
+    /* 只有「真人」经 board.post 写入的才算用户发言（role=user）。
+       role=lead 是主会话 agent（指挥席）自己发的，不能再冒充用户。 */
     const role = row && row.author ? asText(row.author.role) : ''
-    return role === 'lead' || role === 'user'
+    return role === 'user'
   }
 
   /** 用户条目全文（不截断、不压缩），按时间顺序 */
@@ -3252,6 +3254,18 @@ class Board {
     const vulnIds = new Set()
     const commandIds = new Set()
     const highlights = []
+    /* 按作者留存被压缩条目的计数与少量样本：按队员筛选时仍能看到「他被压缩了多少条」 */
+    const authors = new Map()
+    const addAuthor = (name, role, count, samples) => {
+      const key = `${role}|${name}`
+      const rec = authors.get(key) || { name, role, count: 0, samples: [] }
+      rec.count += Number(count) || 0
+      for (const sample of Array.isArray(samples) ? samples : []) {
+        if (asText(sample) === '' || rec.samples.length >= 2) continue
+        rec.samples.push(shortText(sample, 160))
+      }
+      authors.set(key, rec)
+    }
     for (const row of head) {
       const kind = asText(row.kind, 'note')
       byKind[kind] = (byKind[kind] || 0) + 1
@@ -3259,12 +3273,24 @@ class Board {
       for (const id of Array.isArray(refs.nodeIds) ? refs.nodeIds : []) nodeIds.add(id)
       for (const id of Array.isArray(refs.vulnIds) ? refs.vulnIds : []) vulnIds.add(id)
       for (const id of Array.isArray(refs.commandIds) ? refs.commandIds : []) commandIds.add(id)
+      const mergedMeta = refs.merged && Array.isArray(refs.merged.authors) ? refs.merged.authors : null
+      if (mergedMeta !== null) {
+        /* 压缩摘要被再次压缩：继承里面每个作者的计数，不把「调度台」算成作者 */
+        for (const sub of mergedMeta) addAuthor(asText(sub.name, '?'), asText(sub.role, 'system'), sub.count, sub.samples)
+      } else {
+        addAuthor((row.author && row.author.name) || '?', (row.author && row.author.role) || 'system', 1, [row.text])
+      }
       if (kind === 'finding' && highlights.length < 3) {
         highlights.push(`· ${(row.author && row.author.name) || '?'}：${shortText(row.text, 110)}`)
       }
     }
     const span = `${new Date(Number(head[0].ts) || nowMs()).toLocaleString('zh-CN')} – ${new Date(Number(head[head.length - 1].ts) || nowMs()).toLocaleString('zh-CN')}`
     const kindText = Object.entries(byKind).map(([kind, count]) => `${kind} ${count}`).join(' / ')
+    const authorText = Array.from(authors.values())
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 8)
+      .map((row) => `${row.name} ${row.count}`)
+      .join(' / ')
     this.seq += 1
     const summary = {
       id: `b${nowMs().toString(36)}${this.seq}`,
@@ -3275,6 +3301,7 @@ class Board {
       text: [
         `📦 **已合并 ${head.length} 条看板**（${span}）`,
         `构成：${kindText}`,
+        authorText !== '' ? `按人：${authorText}` : '',
         highlights.length > 0 ? `关键发现：\n${highlights.join('\n')}` : '',
         `引用保留：节点 ${nodeIds.size} / 漏洞 ${vulnIds.size} / 命令 ${commandIds.size}（点下方标签可直接跳）`,
       ].filter((line) => line !== '').join('\n'),
@@ -3282,7 +3309,13 @@ class Board {
         nodeIds: Array.from(nodeIds).slice(0, 12),
         vulnIds: Array.from(vulnIds).slice(0, 12),
         commandIds: Array.from(commandIds).slice(0, 6),
-        merged: { count: head.length, from: head[0].id, to: head[head.length - 1].id, at: nowMs() },
+        merged: {
+          count: head.length,
+          from: head[0].id,
+          to: head[head.length - 1].id,
+          at: nowMs(),
+          authors: Array.from(authors.values()),
+        },
       },
       shots: [],
       status: 'done',
@@ -6139,7 +6172,7 @@ function makeHandler(deps) {
           return { node, archived: true }
         })
         await board.post(eng.id, {
-          author: { role: 'user', name: '你' },
+          author: { role: 'system', name: '操作台' },
           kind: 'note',
           text: `${mode === 'restore' ? '恢复' : '归档'}节点 ${result.node.kind}:${result.node.value}`
             + (asText(body.reason) !== '' ? `；原因：${body.reason}` : ''),
@@ -6691,7 +6724,7 @@ function makeHandler(deps) {
           createdBy: { role: 'user', name: '你' },
         })
         await board.post(eng.id, {
-          author: { role: 'user', name: '你' },
+          author: { role: 'system', name: '操作台' },
           kind: 'task',
           text: `[${task.id}] ${task.title}\n目标：${task.goal || '-'}\n验收：${task.acceptance || '-'}\n负责：${task.role}`,
         })
@@ -6798,7 +6831,7 @@ function makeHandler(deps) {
           status: 'done',
         })
         await board.post(eng.id, {
-          author: { role: 'user', name: '你' },
+          author: { role: 'system', name: '操作台' },
           kind: 'conclusion',
           text: `【任务完成】${mission.goal !== '' ? mission.goal : '本轮作战目标'} 已全部通过验收，收队。`,
         })

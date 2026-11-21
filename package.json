@@ -1,6 +1,6 @@
 {
   "name": "dsh-venery",
-  "version": "0.50.0",
+  "version": "0.50.3",
   "private": true,
   "type": "module",
   "description": "狩猎：红队信息收集驾驶舱——AI 驾驶舱对话 + 资产/关系/漏洞节点图 + 命令与漏洞实时流 + 密钥/模型/角色/记忆/技能/MCP 控制台。",
