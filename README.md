@@ -9,7 +9,8 @@
 > ⚠️ 仅限在获得明确授权的范围内使用。使用者需自行确保目标、数据与行为合法合规；本项目不提供任何形式的授权、许可或免责。
 
 ---
-<img width="1232" height="698" alt="image" src="https://github.com/user-attachments/assets/88331a97-416a-4827-aa93-1c1f0f79ca3b" />
+<img width="1237" height="701" alt="image" src="https://github.com/user-attachments/assets/ec6a0101-44cc-4423-8064-dd9553db4e67" />
+
 
 
 ## 功能
