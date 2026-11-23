@@ -7,13 +7,72 @@ window.__ModuleLoader__.load({
 
     const NS = 'reconGraph'
     const TIERS = ['deep', 'fast', 'vision']
+    const MODEL_CHOICES = [...TIERS, 'dsh']
+    const THINKING_LEVELS = ['off', 'low', 'medium', 'high']
+    const THINKING_LABEL = { off: 'Off', low: 'Low', medium: 'Medium', high: 'High' }
+    const TIER_LABEL = { deep: 'Deep', fast: 'Flash', vision: 'Vision', dsh: 'Follow DSH' }
+    const asTextLike = (value) => String(value === undefined || value === null ? '' : value).trim()
+    const normalizeMemoryList = (value) => (Array.isArray(value) ? value : []).map((item) => {
+      if (typeof item === 'string') return { title: '记忆', content: item }
+      if (item !== null && typeof item === 'object') {
+        return { ...item, title: asTextLike(item.title) || '记忆', content: String(item.content || '') }
+      }
+      return { title: '记忆', content: '' }
+    })
+    const mcpLineOf = (row) => {
+      const name = asTextLike(row.name) || 'server'
+      const simpleKeys = new Set(['name', 'transport', 'command', 'args', 'url', 'enabled'])
+      const hasComplex = (row.env && typeof row.env === 'object' && Object.keys(row.env).length > 0)
+        || (row.headers && typeof row.headers === 'object' && Object.keys(row.headers).length > 0)
+        || Object.keys(row).some((key) => simpleKeys.has(key) === false)
+        || row.enabled === false
+      if (hasComplex) {
+        const payload = { ...row }
+        delete payload.name
+        return `${name} = ${JSON.stringify(payload)}`
+      }
+      if ((row.transport || '') === 'streamable-http' || (row.url || '') !== '') return `${name} = ${row.url || ''}`
+      return `${name} = ${[row.command || '', ...(Array.isArray(row.args) ? row.args : [])].join(' ').trim()}`
+    }
+    const parseMcpLines = (text) => {
+      const rows = []
+      for (const line of String(text || '').split('\n')) {
+        const trimmed = line.trim()
+        if (trimmed === '') continue
+        const eq = trimmed.indexOf('=')
+        if (eq <= 0) continue
+        const name = trimmed.slice(0, eq).trim()
+        const rest = trimmed.slice(eq + 1).trim()
+        if (name === '' || rest === '') continue
+        if (rest.startsWith('{')) {
+          try {
+            const parsed = JSON.parse(rest)
+            if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+              rows.push({ ...parsed, name, enabled: parsed.enabled !== false })
+              continue
+            }
+          } catch { /* 落回简单格式 */ }
+        }
+        if (/^https?:\/\//i.test(rest)) rows.push({ name, transport: 'streamable-http', url: rest, enabled: true })
+        else {
+          const parts = rest.split(/\s+/)
+          rows.push({ name, transport: 'stdio', command: parts[0], args: parts.slice(1), enabled: true })
+        }
+      }
+      return rows
+    }
+    const MODEL_PROTOCOLS = [
+      { id: 'openai-completions', label: 'OpenAI Compatible' },
+      { id: 'openai-responses', label: 'OpenAI Responses' },
+      { id: 'anthropic-messages', label: 'Anthropic Messages' },
+    ]
 
     /* ───────────────────────── 文案 ───────────────────────── */
     const DICT = {
       zh: {
         title: '狩猎', cockpit: '驾驶舱', subtitle: '资产 · 关系 · 漏洞 · 命令 · 对话',
         assets: '资产', vulns: '漏洞', commands: '命令', settings: '控制台',
-        search: '搜索资产 / IP / 漏洞关键字', refresh: '刷新', relayout: '重排', fit: '适应',
+        search: '搜索资产 / IP / 漏洞关键字', refresh: '刷新', fit: '适应',
         showVulns: '漏洞节点', exportJson: '导出', newEngagement: '新建靶标', deleteEngagement: '删除靶标',
         newEngagementName: '新靶标名称', deleteEngagementConfirm: '删除整个靶标及其资产/漏洞/命令/对话记录？',
         empty: '还没有任何图谱数据', emptyHint: '在下面驾驶舱里说一句「从这里开始收集」，或者让主会话调用 recon_start。',
@@ -24,7 +83,7 @@ window.__ModuleLoader__.load({
         nodeDetail: '节点详情', vulnDetail: '漏洞详情', evidence: '证据',
         chatPlaceholder: '让 AI 继续收集什么…（Enter 发送 · Shift+Enter 换行 · 可拖入文件 / 粘贴截图 / 点📎选文件）',
         send: '发送', stop: '停止', thinking: '思维流', showThinking: '显示思维', thinkingEmpty: '等待模型开始思考…',
-        tierDeep: '高复杂', tierFast: '普通', tierVision: '视觉', model: '模型', tier: '档位',
+        tierDeep: 'Deep', tierFast: 'Flash', tierVision: 'Vision', tierDsh: '跟随 DSH', model: '模型', tier: '档位',
         connecting: '连接中', connected: '已连接', offline: '未连接', streamPaused: '事件流断开，已切轮询',
         status: '状态', severity: '等级', endpoint: '位置', param: '参数', payload: 'Payload',
         description: '描述', note: '备注', tech: '指纹', tags: '标签', degree: '关联',
@@ -39,23 +98,31 @@ window.__ModuleLoader__.load({
         runningAgents: '在跑', agentIdle: '待命', agentDone: '收工', agentStarting: '启动中',
         archive: '归档', archiveReason: '归档原因', archived: '已归档', restore: '恢复',
         shots: '截图', openShot: '查看截图', boardRefNode: '节点', boardRefVuln: '漏洞', boardRefCmd: '命令',
-        tabRoles: '队伍', rolesHint: '改名称、提示词、模型与技能后保存，下一次派活即生效（在岗成员需重新招募）。',
-        tabAutomation: '自动化', automationHint: '事件触发：新资产自动派猎手、新漏洞自动派浏览器。冷却与并发在下面调。',
-        tabMeeting: '会议与交接',
-        meetingHint: '停滞多久算卡住、两次会议至少隔多久、最多自动开几轮；成员被释放前是否先写离职交接（落看板 + 沉淀记忆）。',
+        rolesHint: '本页统一管理通用提示词、常设席位与队员岗位。总指挥就是最高统领：驾驶舱 lead 与编队总指挥共用同一个总指挥提示词；参谋同样共用参谋提示词。常设席位与队员岗位都可以配置提示词、技能、模型与专属 MCP。',
+        commonPrompt: '通用提示词',
+        commonHint: '注入所有 Agent（驾驶舱、汇报席、主会话与每名队员，含自动化/会议/续跑派发的成员）：最终提示词 = 通用提示词 + 自身提示词。留空不注入；主会话仅在开启插件工作流注入时生效。',
+        commonPlaceholder: '例如：只在授权范围内行动；所有结论必须带 commandId；拿不准的标 info。',
+        cockpitRole: '驾驶舱总指挥（lead）',
+        coreSeats: '常设席位（总指挥 / 参谋）',
+        coreSeatsHint: '每个靶标固定各一个，自动在岗、不会被回收，也不能被召唤为队员；这里只改他们的人设、模型、技能与 MCP。',
+        squadRoles: '队员岗位（可派遣）',
+        tabAutomation: '并发与自动化', automationHint: '先设总并发与自动化独立并发上限；自动化任务超过自己的上限时会排队。下面配置事件触发规则。',
+        tabMeeting: '轨迹会议与交接',
+        meetingHint: '轨迹最高显示数量；停滞多久算卡住、两次会议至少隔多久、最多自动开几轮；成员被释放前是否先写离职交接（落看板 + 沉淀记忆）。',
         meetingStall: '停滞判定（分钟无新信息）', meetingGap: '会议冷却（分钟）', meetingRounds: '最多自动开几轮',
-        handoverEnabled: '离职交接', handoverTimeout: '交接等待上限（秒）', handoverSkill: '交接沉淀为记忆',
-        automationEnabled: '启用自动化', maxAgents: '最大并发 Agent', ruleAdd: '加规则', ruleOn: '事件',
-        ruleRole: '角色', ruleTier: '档位', ruleCooldown: '冷却(ms)', ruleTask: '任务模板', ruleKinds: '资产类型',
+        handoverEnabled: '离职交接', handoverTimeout: '交接等待上限（秒）', handoverSkill: '交接输出',
+        automationEnabled: '是否启用自动化', maxAgents: '最大并发数', maxAutomationAgents: '自动化独立并发上限', automationRules: '事件规则', ruleAdd: '加规则', ruleOn: '事件',
+        ruleRole: '角色', ruleTier: '模型', ruleCooldown: '冷却(ms)', ruleTask: '任务模板', ruleKinds: '资产类型',
         kindFinding: '发现', kindHypothesis: '猜想', kindTask: '任务', kindConclusion: '结论', kindNote: '备注',
-        tabModels: '模型', tabKeys: '密钥', tabRole: '角色·提示词', tabMemory: '记忆', tabSkills: '技能', tabMcp: 'MCP', tabUi: '外观',
+        tabModels: '模型', tabKeys: '密钥', tabRole: '角色与提示词', tabMemory: '记忆', tabSkills: '技能', tabMcp: 'MCP', tabUi: '外观',
         save: '保存', saved: '已保存', saving: '保存中…', apply: '应用', add: '添加', remove: '移除',
-        keysHint: '密钥只写在本机 $DSH_HOME/recon/config.json（0600），并以环境变量注入 recon_run 的命令环境。',
+        keysHint: '密钥以明文写在本机 $DSH_HOME/recon/config.json（权限 0600，未加密），并以环境变量注入 recon_run 的命令环境。',
         envHint: '额外环境变量，每行 KEY=VALUE',
-        modelHint: '留空的档位回落到 Harness 默认模型；reasoning 填 low/medium/high（视模型支持）。',
+        modelHint: '先添加模型并给它起个名字；然后 Deep / Flash / Vision 各自从下拉里选这个名字，选中即把它的 provider/model/思考深度应用到该档；留空跟随 DSH。',
         mcpHint: 'stdio 填 command + args（逗号分隔）；streamable-http 填 url。保存后立即向 mcpManager 注册。',
         mcpStatus: 'MCP 运行时状态', noSkills: '没有可列出的技能', memoryEmpty: '还没有记忆条目',
-        roleName: '角色名', mission: '使命', rules: '规则（每行一条）', extraPrompt: '附加指令',
+        roleName: '角色名', mission: '使命', rules: '规则（每行一条）', extraPrompt: '驾驶舱附加指令（只影响 lead）',
+        customModels: '自定义模型', customModelsHint: '添加模型（Base URL + API Key + 模型 id + 协议）。保存后注册到 DSH；三档都留空时全部跟随 DSH。', addModel: '添加模型', apiKey: 'API Key', baseUrl: 'Base URL', modelId: '模型 id', thinkingDepth: '思考深度', protocol: '协议', savedKey: '已保存，留空不修改', needKey: '必填', keySaved: 'Key 已保存', keyMissing: 'Key 未保存', route: '路由',
         accent: '主色', glow: '光晕', grid: '网格', scanlines: '扫描线', danger: 'danger',
         tierChanged: '已切换档位', nodesHidden: '隐藏', viewFull: '全屏', close: '关闭',
         userLabel: '你', aiLabel: '驾驶舱', toolLabel: '工具', copyCmd: '复制命令',
@@ -64,7 +131,7 @@ window.__ModuleLoader__.load({
       en: {
         title: 'Venery', cockpit: 'Cockpit', subtitle: 'assets · links · vulns · commands · chat',
         assets: 'Assets', vulns: 'Vulns', commands: 'Commands', settings: 'Console',
-        search: 'Search assets / IP / vulnerabilities', refresh: 'Refresh', relayout: 'Relayout', fit: 'Fit',
+        search: 'Search assets / IP / vulnerabilities', refresh: 'Refresh', fit: 'Fit',
         showVulns: 'Vuln nodes', exportJson: 'Export', newEngagement: 'New target', deleteEngagement: 'Delete target',
         newEngagementName: 'New target name', deleteEngagementConfirm: 'Delete this target with its assets, vulns, commands and chat?',
         empty: 'No graph data yet', emptyHint: 'Ask the cockpit below to start collecting, or have the main session call recon_start.',
@@ -75,7 +142,7 @@ window.__ModuleLoader__.load({
         nodeDetail: 'Node', vulnDetail: 'Vulnerability', evidence: 'Evidence',
         chatPlaceholder: 'What should the AI collect next… (Enter to send · Shift+Enter newline · drop files / paste screenshots / 📎 to pick)',
         send: 'Send', stop: 'Stop', thinking: 'Reasoning', showThinking: 'Show reasoning', thinkingEmpty: 'Waiting for the model…',
-        tierDeep: 'Deep', tierFast: 'Fast', tierVision: 'Vision', model: 'Model', tier: 'Tier',
+        tierDeep: 'Deep', tierFast: 'Flash', tierVision: 'Vision', tierDsh: 'Follow DSH', model: 'Model', tier: 'Tier',
         connecting: 'connecting', connected: 'live', offline: 'offline', streamPaused: 'stream lost, polling',
         status: 'Status', severity: 'Severity', endpoint: 'Endpoint', param: 'Param', payload: 'Payload',
         description: 'Description', note: 'Note', tech: 'Tech', tags: 'Tags', degree: 'Links',
@@ -90,23 +157,31 @@ window.__ModuleLoader__.load({
         runningAgents: 'running', agentIdle: 'idle', agentDone: 'done', agentStarting: 'starting',
         archive: 'Archive', archiveReason: 'Reason', archived: 'archived', restore: 'Restore',
         shots: 'Shots', openShot: 'Open', boardRefNode: 'node', boardRefVuln: 'vuln', boardRefCmd: 'cmd',
-        tabRoles: 'Roster', rolesHint: 'Edit name, prompt, model and skills; applies to newly dispatched agents.',
-        tabAutomation: 'Automation', automationHint: 'Event triggers: new asset dispatches a hunter, new vuln dispatches a browser.',
-        tabMeeting: 'Meeting & handover',
-        meetingHint: 'How long without new info counts as stalled, minimum gap between meetings, max auto rounds, and whether releasing a member writes a handover first.',
+        rolesHint: 'One page for the common prompt, the standing seats and squad roles. The commander is the single highest leader: the cockpit lead and the squad commander share the same commander prompt; the staff seat uses the staff prompt. Both standing seats and member roles can configure prompt, skills, model and MCP.',
+        commonPrompt: 'Common prompt',
+        commonHint: 'Injected into every agent (cockpit, briefing seat, main session and every member, including automation/meeting/resume dispatches): final prompt = common prompt + its own prompt. Empty disables it; the main session only receives it while the plugin workflow injection is enabled.',
+        commonPlaceholder: 'e.g. Stay inside the authorized scope; every conclusion cites a commandId; mark uncertain items as info.',
+        cockpitRole: 'Cockpit commander (lead)',
+        coreSeats: 'Standing seats (commander / staff)',
+        coreSeatsHint: 'Exactly one each per target, always on duty, never released, and never summonable as a member; edit only their persona, model, skills and MCP here.',
+        squadRoles: 'Member roles (dispatchable)',
+        tabAutomation: 'Concurrency & automation', automationHint: 'Set total concurrency and the separate automation concurrency cap; excess automation jobs queue. Event rules follow below.',
+        tabMeeting: 'Trace, meetings & handover',
+        meetingHint: 'Max trace rows to render; stall window, minimum meeting gap, max auto rounds, and whether releasing a member writes a handover first.',
         meetingStall: 'Stall window (minutes)', meetingGap: 'Meeting cooldown (minutes)', meetingRounds: 'Max auto rounds',
-        handoverEnabled: 'Handover on release', handoverTimeout: 'Handover wait (seconds)', handoverSkill: 'Save handover to memory',
-        automationEnabled: 'Enabled', maxAgents: 'Max concurrent agents', ruleAdd: 'Add rule', ruleOn: 'Event',
-        ruleRole: 'Role', ruleTier: 'Tier', ruleCooldown: 'Cooldown(ms)', ruleTask: 'Task template', ruleKinds: 'Asset kinds',
+        handoverEnabled: 'Handover on release', handoverTimeout: 'Handover wait (seconds)', handoverSkill: 'Handover output',
+        automationEnabled: 'Automation enabled', maxAgents: 'Max concurrency', maxAutomationAgents: 'Automation concurrency cap', automationRules: 'Event rules', ruleAdd: 'Add rule', ruleOn: 'Event',
+        ruleRole: 'Role', ruleTier: 'Model', ruleCooldown: 'Cooldown(ms)', ruleTask: 'Task template', ruleKinds: 'Asset kinds',
         kindFinding: 'finding', kindHypothesis: 'hypothesis', kindTask: 'task', kindConclusion: 'conclusion', kindNote: 'note',
-        tabModels: 'Models', tabKeys: 'Keys', tabRole: 'Role & prompt', tabMemory: 'Memory', tabSkills: 'Skills', tabMcp: 'MCP', tabUi: 'Look',
+        tabModels: 'Models', tabKeys: 'Keys', tabRole: 'Roles & prompts', tabMemory: 'Memory', tabSkills: 'Skills', tabMcp: 'MCP', tabUi: 'Look',
         save: 'Save', saved: 'Saved', saving: 'Saving…', apply: 'Apply', add: 'Add', remove: 'Remove',
-        keysHint: 'Keys are stored only in $DSH_HOME/recon/config.json (0600) and exported as env vars to recon_run.',
+        keysHint: 'Keys are stored in plain text in $DSH_HOME/recon/config.json (mode 0600, not encrypted) and exported as env vars to recon_run.',
         envHint: 'Extra env vars, one KEY=VALUE per line',
-        modelHint: 'Empty tiers fall back to the Harness default model.',
+        modelHint: 'Add a model and give it a name; then pick that name under Deep / Flash / Vision. The selection applies its provider/model/thinking depth to that tier; empty follows DSH.',
         mcpHint: 'stdio: command + args (comma separated); streamable-http: url. Saved entries register immediately.',
         mcpStatus: 'MCP runtime', noSkills: 'No skills listed', memoryEmpty: 'No memory entries',
-        roleName: 'Role', mission: 'Mission', rules: 'Rules (one per line)', extraPrompt: 'Extra instructions',
+        roleName: 'Role', mission: 'Mission', rules: 'Rules (one per line)', extraPrompt: 'Cockpit extra instructions (lead only)',
+        customModels: 'Custom models', customModelsHint: 'Add a model (Base URL + API key + model id + protocol). It registers into DSH on save; empty tiers follow DSH.', addModel: 'Add model', apiKey: 'API Key', baseUrl: 'Base URL', modelId: 'Model id', thinkingDepth: 'Thinking depth', protocol: 'Protocol', savedKey: 'Saved — leave blank to keep', needKey: 'Required', keySaved: 'Key saved', keyMissing: 'Key missing', route: 'Route',
         accent: 'Accent', glow: 'Glow', grid: 'Grid', scanlines: 'Scanlines', danger: 'danger',
         tierChanged: 'tier changed', nodesHidden: 'hidden', viewFull: 'Full', close: 'Close',
         userLabel: 'You', aiLabel: 'Cockpit', toolLabel: 'tool', copyCmd: 'Copy',
@@ -579,10 +654,6 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
   border:1px solid color-mix(in srgb,var(--rc-accent) 26%,var(--dsw-alias-border-l1));
   background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary)}
 .rc2-input:focus{border-color:var(--rc-accent);box-shadow:0 0 16px -8px var(--rc-accent)}
-.rc2-tier{display:flex;gap:2px;border:1px solid var(--dsw-alias-border-l1);border-radius:4px;overflow:hidden}
-.rc2-tier button{height:26px;padding:0 7px;border:none;background:transparent;cursor:pointer;font-size:10.5px;
-  letter-spacing:.06em;text-transform:uppercase;color:var(--dsw-alias-label-secondary)}
-.rc2-tier button.on{background:var(--rc-accent-dim);color:var(--rc-accent)}
 .rc2-drawer{position:absolute;inset:0;z-index:20;display:flex;justify-content:flex-end;
   background:rgba(4,8,12,.55);backdrop-filter:blur(2px)}
 .rc2-panel{width:min(760px,94%);height:100%;display:flex;flex-direction:column;
@@ -605,6 +676,10 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
 .rc2-grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 .rc2-grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
 .rc2-row{display:flex;gap:6px;align-items:center;margin-bottom:6px}
+.rc2-boardcfg-row{flex-wrap:wrap;gap:8px;align-items:center}
+.rc2-field select.rc2-boardcfg-select{height:34px;min-height:34px;min-width:114px;box-sizing:border-box;line-height:1.4;
+  padding:6px 28px 6px 9px;font-size:12px;border-radius:5px;max-width:100%}
+.rc2-field select.rc2-boardcfg-select.rc2-boardcfg-select-wide{min-width:178px}
 .rc2-note{font-size:10.5px;line-height:1.6;color:var(--dsw-alias-label-secondary);margin:2px 0 10px}
 .rc2-docktabs{display:flex;gap:2px}
 .rc2-docktab{height:24px;padding:0 8px;border-radius:4px;border:1px solid transparent;background:transparent;
@@ -717,6 +792,8 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
 .rc2-empty p{margin:0;max-width:520px;font-size:12px;line-height:1.7}
 .rc2-err{color:var(--rc-danger);font-size:11.5px;padding:6px 10px}
 .rc2-center{flex:1 1 auto;display:flex;align-items:center;justify-content:center;color:var(--dsw-alias-label-secondary)}
+.rc2.rc2-no-grid .rc2-canvas{background:radial-gradient(60% 60% at 50% 50%,color-mix(in srgb,var(--rc-accent) 6%,transparent),transparent 70%),var(--dsw-alias-bg-1)}
+.rc2.rc2-glow{box-shadow:inset 0 0 80px -60px color-mix(in srgb,var(--rc-accent) 80%,transparent)}
 `
 
     /* ───────────────────────── 通信 ───────────────────────── */
@@ -879,8 +956,8 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
     }
 
     /* ───────────────────────── 图布局 ───────────────────────── */
-    const BOARD_LIMIT = 100
     const TRACE_LIMIT = 500
+    const TRACE_BUFFER_MAX = 5000
 
     const CENTER = { x: 900, y: 560 }
 
@@ -1020,6 +1097,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
          任一处点展开都能把 A 放出来（清除该子节点的全部折叠记录）。 */
       const [foldOwners, setFoldOwners] = useState(() => new Map())
       const [showVulns, setShowVulns] = useState(true)
+      const [showArchived, setShowArchived] = useState(false)
       const [showThinking, setShowThinking] = useState(true)
       /* 只有思维链、没有正文的轮次折叠起来：否则几十个空气泡刷屏，看起来「输出一直不变」 */
       const [openSilent, setOpenSilent] = useState({})
@@ -1065,14 +1143,20 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
       const [boardKind, setBoardKind] = useState('finding')
       const [squadMembers, setSquadMembers] = useState([])
       const [squadRunning, setSquadRunning] = useState(0)
-      const [squadRoles, setSquadRoles] = useState([])
       const [roleList, setRoleList] = useState([])
       const [taskItems, setTaskItems] = useState([])
-      const [taskStats, setTaskStats] = useState({ total: 0, open: 0, doing: 0, passed: 0, failed: 0 })
+      const [taskRole, setTaskRole] = useState('web')
+      const [taskStats, setTaskStats] = useState({ total: 0, open: 0, doing: 0, blocked: 0, passed: 0, failed: 0 })
       const [chatTarget, setChatTarget] = useState('lead')
       const [memberMsgs, setMemberMsgs] = useState([])
       const [memberStream, setMemberStream] = useState({ text: '', reasoning: '' })
       const [traceEvents, setTraceEvents] = useState([])
+      const [traceLimit, setTraceLimit] = useState(() => {
+        try {
+          const saved = Number(window.localStorage.getItem('rc2.traceLimit'))
+          return Number.isFinite(saved) ? Math.max(100, Math.min(5000, Math.floor(saved))) : TRACE_LIMIT
+        } catch { return TRACE_LIMIT }
+      })
       const [leftWidth, setLeftWidth] = useState(() => {
         try {
           const saved = Number(window.localStorage.getItem('rc2.leftWidth'))
@@ -1102,7 +1186,6 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
         } catch { return 0.42 }
       })
       const treeRef = useRef(null)
-      const autoScroll = useRef(true)
       const [traceKind, setTraceKind] = useState('all')
       const [traceNoBash, setTraceNoBash] = useState(true)
       const [traceQuery, setTraceQuery] = useState('')
@@ -1119,8 +1202,6 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
       const [spawnTask, setSpawnTask] = useState('')
       const [files, setFiles] = useState([])
       const [uploading, setUploading] = useState(false)
-      const [cmdQuery, setCmdQuery] = useState('')
-      const [cmdFailOnly, setCmdFailOnly] = useState(false)
       const [boardQuery, setBoardQuery] = useState('')
       const [boardKindFilter, setBoardKindFilter] = useState('all')
       const [boardAuthor, setBoardAuthor] = useState('all')
@@ -1173,8 +1254,6 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
         window.addEventListener('keydown', onKey, true)
         return () => window.removeEventListener('keydown', onKey, true)
       }, [dialogState, closeDialog])
-      const doubleTap = useRef(null)
-      const toggleCollapseRef = useRef(null)
       const [hudOpen, setHudOpen] = useState(() => {
         try { return window.localStorage.getItem('rc2.hudOpen') !== '0' } catch { return true }
       })
@@ -1189,28 +1268,23 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
       const [menu, setMenu] = useState(null)
       const [usage, setUsage] = useState({ input: 0, output: 0, total: 0, turns: 0 })
       const fileInputRef = useRef(null)
-      const [freshIds, setFreshIds] = useState(() => new Set())
 
       const positions = useRef(new Map())
       const [, bump] = useReducer((n) => n + 1, 0)
       const canvasRef = useRef(null)
-      const feedRef = useRef(null)
-      const boardRef = useRef(null)
       const chatRef = useRef(null)
       const viewRef = useRef(view)
       const dataRef = useRef(null)
-      const selRef = useRef(null)
       const sim = useRef({ alpha: 0, running: false, raf: 0 })
       const inited = useRef(false)
       const pointer = useRef({ mode: null, id: null, dx: 0, dy: 0, px: 0, py: 0 })
       const saveTimer = useRef(0)
       const refreshTimer = useRef(0)
-      const knownCommands = useRef(new Set())
+      const refreshSeq = useRef(0)
       const arrowId = useMemo(() => `rc2-arrow-${Math.random().toString(36).slice(2, 8)}`, [])
 
       viewRef.current = view
       dataRef.current = data
-      selRef.current = selection
 
       const engagement = data && data.engagement ? data.engagement : null
       const engagements = data && Array.isArray(data.engagements) ? data.engagements : []
@@ -1221,22 +1295,17 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
       const stats = engagement ? engagement.stats : null
       const uiCfg = (data && data.config && data.config.ui) || {}
       const accent = uiCfg.accent || 'cyan'
+      const rootClass = `rc2${uiCfg.glow !== false ? ' rc2-glow' : ''}${uiCfg.grid === false ? ' rc2-no-grid' : ''}`
 
       /* ── 拉取 ── */
       const refresh = useCallback(async (engId) => {
+        const seq = ++refreshSeq.current
         const res = await api({ op: 'overview', engagement: engId })
+        /* 轮询和 SSE 可能同时刷新；只接受最后一次请求，避免旧响应覆盖新项目/新状态。 */
+        if (seq !== refreshSeq.current) return res
         if (res && res.ok) {
           setData(res)
           setError(null)
-          const list = res.engagement ? res.engagement.commands : []
-          const next = new Set(list.map((c) => c.id))
-          const fresh = new Set()
-          for (const id of next) if (!knownCommands.current.has(id)) fresh.add(id)
-          if (knownCommands.current.size > 0 && fresh.size > 0) {
-            setFreshIds(fresh)
-            setTimeout(() => setFreshIds(new Set()), 1400)
-          }
-          knownCommands.current = next
           /* 切项目：清空坐标并触发一次强制重排（否则节点画不出来） */
           const nextEngId = res.engagement ? res.engagement.id : null
           if (nextEngId !== null && nextEngId !== lastEngagementId.current) {
@@ -1244,6 +1313,26 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
             positions.current.clear()
             inited.current = false
             setLayoutEpoch((value) => value + 1)
+            /* 在同一个刷新回调里先清项目级状态；下面新的 board/squad/trace/task 数据会再覆盖。 */
+            setChatQueue([])
+            setFiles([])
+            setShots([])
+            setToolLines([])
+            setBoardAuthor('all')
+            setBoardQuery('')
+            setBoardKindFilter('all')
+            setKindFilter(new Set())
+            setHiddenKinds(new Set())
+            setShowArchived(false)
+            setShowVulns(true)
+            setTaskRole('web')
+            setSelection(null)
+            setMemberMsgs([])
+            setMemberStream({ text: '', reasoning: '' })
+            setBriefMsgs([])
+            setBriefStream('')
+            setMission(null)
+            setMissionProgress(null)
           }
           if (Array.isArray(res.board)) setBoardEntries(res.board)
           if (Number.isFinite(res.boardLimit)) setBoardLimit(res.boardLimit)
@@ -1257,7 +1346,11 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
           }
           if (Array.isArray(res.roles)) setRoleList(res.roles)
           if (Array.isArray(res.trace)) setTraceEvents(res.trace)
-          void api({ op: 'mission.get' }).then((mres) => {
+          if (Number.isFinite(res.traceLimit)) {
+            setTraceLimit(res.traceLimit)
+            try { window.localStorage.setItem('rc2.traceLimit', String(res.traceLimit)) } catch { /* 忽略 */ }
+          }
+          void api({ op: 'mission.get', engagement: res.engagement ? res.engagement.id : undefined }).then((mres) => {
             if (!mres || !mres.ok) return
             setMission(mres.mission || null)
             setMissionProgress(mres.progress || null)
@@ -1266,7 +1359,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
           if (Array.isArray(res.browsers)) setBrowserPanes(res.browsers)
           if (res.tasks) {
             setTaskItems(res.tasks.items || [])
-            setTaskStats(res.tasks.stats || { total: 0, open: 0, doing: 0, passed: 0, failed: 0 })
+            setTaskStats(res.tasks.stats || { total: 0, open: 0, doing: 0, blocked: 0, passed: 0, failed: 0 })
           }
           if (res.chat) {
             setChat((prev) => ({
@@ -1292,6 +1385,12 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
 
       const chatTargetKey = chatTarget.startsWith('member:') ? chatTarget.slice(7) : (chatTarget.startsWith('role:') ? '' : chatTarget)
       const chatTargetRole = chatTarget.startsWith('role:') ? chatTarget.slice(5) : ''
+      const chatTargetMember = chatTarget.startsWith('member:')
+        ? squadMembers.find((member) => member.key === chatTargetKey)
+        : null
+      const targetBusy = chatTarget === 'lead' ? chat.busy === true : chatTargetMember !== null && chatTargetMember !== undefined && (chatTargetMember.status === 'running' || chatTargetMember.status === 'starting')
+      const chatTargetKeyRef = useRef(chatTargetKey)
+      chatTargetKeyRef.current = chatTargetKey
       useEffect(() => {
         /* 在岗队员被回收后自动回到总指挥；按角色对话不受影响 */
         if (chatTarget === 'lead' || chatTargetRole !== '') return undefined
@@ -1301,14 +1400,39 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
       }, [chatTarget, chatTargetKey, chatTargetRole, squadMembers])
 
       useEffect(() => {
+        setSquadRunning(squadMembers.filter((row) => row.status === 'running').length)
+      }, [squadMembers])
+
+      useEffect(() => {
         let cancelled = false
         if (chatTarget === 'lead' || chatTargetKey === '' || chatTargetRole !== '') return undefined
-        api({ op: 'squad.transcript', member: chatTargetKey }).then((res) => {
+        api({ op: 'squad.transcript', member: chatTargetKey, engagement: engagement ? engagement.id : undefined }).then((res) => {
           if (cancelled) return
           if (res && res.ok) setMemberMsgs(res.messages || [])
         })
         return () => { cancelled = true }
       }, [chatTarget, chatTargetKey, chatTargetRole])
+
+      /* 没有靶标时清空所有项目级状态，避免空态仍显示上一个项目的对话/看板。 */
+      useEffect(() => {
+        if (engagement !== null && engagement !== undefined) return
+        setChatQueue([])
+        setFiles([])
+        setShots([])
+        setToolLines([])
+        setBoardEntries([])
+        setSquadMembers([])
+        setTraceEvents([])
+        setTaskItems([])
+        setTaskStats({ total: 0, open: 0, doing: 0, blocked: 0, passed: 0, failed: 0 })
+        setChat((prev) => ({ ...prev, messages: [], streaming: { text: '', reasoning: '' }, busy: false }))
+        setMemberMsgs([])
+        setMemberStream({ text: '', reasoning: '' })
+        setBriefMsgs([])
+        setBriefStream('')
+        setMission(null)
+        setMissionProgress(null)
+      }, [engagement === null || engagement === undefined ? '' : engagement.id])
 
       /* ── SSE ── */
       useEffect(() => {
@@ -1408,6 +1532,8 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
               next.sort((a, b) => rank(a) - rank(b) || Number(a.ageMs || 0) - Number(b.ageMs || 0))
               return next
             })
+          } else if (payload.type === 'browser.shot') {
+            scheduleRefresh(current)
           } else if (payload.type === 'chat.status') {
             setChat((prev) => ({ ...prev, busy: payload.status === 'running' }))
           } else if (payload.type === 'chat.turn-end') {
@@ -1437,32 +1563,32 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
                 return [payload.member, ...rest]
               })
             }
-            setSquadMembers((prev) => {
-              setSquadRunning(prev.filter((row) => row.status === 'running').length)
-              return prev
-            })
+            scheduleRefresh(current)
+          } else if (payload.type === 'squad.group') {
             scheduleRefresh(current)
           } else if (payload.type === 'trace') {
             const event = payload.event
             if (event !== null && event !== undefined) {
-              setTraceEvents((prev) => (prev.some((row) => row.id === event.id) ? prev : [...prev.slice(-(TRACE_LIMIT - 1)), event]))
+              setTraceEvents((prev) => (prev.some((row) => row.id === event.id) ? prev : [...prev.slice(-(Math.max(TRACE_BUFFER_MAX, traceLimit) - 1)), event]))
             }
           } else if (payload.type === 'squad.chat') {
-            if (payload.key === chatTargetKey) {
+            if (payload.key === chatTargetKeyRef.current) {
               setMemberMsgs((prev) => (prev.some((m) => m.id === payload.message.id) ? prev : [...prev, payload.message]))
             }
           } else if (payload.type === 'squad.message') {
-            if (payload.key === chatTargetKey) {
+            if (payload.key === chatTargetKeyRef.current) {
               setMemberMsgs((prev) => (prev.some((m) => m.id === payload.message.id) ? prev : [...prev, payload.message]))
               setMemberStream({ text: '', reasoning: '' })
             }
           } else if (payload.type === 'squad.delta') {
-            if (payload.key === chatTargetKey) setMemberStream((prev) => ({ ...prev, text: prev.text + payload.text }))
+            if (payload.key === chatTargetKeyRef.current) setMemberStream((prev) => ({ ...prev, text: prev.text + payload.text }))
             setSquadMembers((prev) => prev.map((row) => (row.key === payload.key
               ? { ...row, lastText: shortText(`${row.lastText || ''}${payload.text}`, 400), status: 'running' }
               : row)))
           } else if (payload.type === 'squad.tool') {
             setSquadMembers((prev) => prev.map((row) => (row.key === payload.key ? { ...row, lastTool: payload.name } : row)))
+          } else if (payload.type === 'squad.error') {
+            setToolLines((prev) => [...prev.slice(-60), { id: `se${Date.now()}`, kind: 'error', text: `${payload.key || ''} ${payload.text || '成员出错'}` }])
           } else if (payload.type === 'chat.usage') {
             setUsage(payload.usage)
           } else if (payload.type === 'delta') {
@@ -1472,7 +1598,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
           }
         }
         return () => { try { source.close() } catch { /* 已关 */ } }
-      }, [refresh, scheduleRefresh])
+      }, [refresh, scheduleRefresh, traceLimit])
 
       /* ── 轮询兜底 ── */
       useEffect(() => {
@@ -1491,11 +1617,11 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
         if (selection === null) return undefined
         const engId = engagement ? engagement.id : undefined
         if (selection.type === 'node') {
-          api({ op: 'provenance', nodeId: selection.id }).then((res) => {
+          api({ op: 'provenance', nodeId: selection.id, engagement: engagement ? engagement.id : undefined }).then((res) => {
             if (!cancelled && res && res.ok) setProvenance(res)
           })
         } else if (selection.type === 'command') {
-          api({ op: 'command', commandId: selection.id }).then((res) => {
+          api({ op: 'command', commandId: selection.id, engagement: engagement ? engagement.id : undefined }).then((res) => {
             if (!cancelled) setCommandText(res && res.ok ? { text: res.text, command: res.command } : { text: res && res.error ? res.error : '' })
           })
         }
@@ -1570,8 +1696,9 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
       }, [foldOwners])
 
       const visibleNodes = useMemo(() => nodes.filter((n) => !hidden.has(n.id)
+        && (showArchived || n.archived !== true)
         && (kindFilter.size === 0 || kindFilter.has(n.kind))
-        && !hiddenKinds.has(n.kind)), [hidden, kindFilter, hiddenKinds, nodes])
+        && !hiddenKinds.has(n.kind)), [hidden, showArchived, kindFilter, hiddenKinds, nodes])
       const visibleEdges = useMemo(() => {
         const allow = new Set(visibleNodes.map((n) => n.id))
         return edges.filter((e) => allow.has(e.from) && allow.has(e.to))
@@ -1587,7 +1714,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
         }
         startSimulation(0.9)
         /* 切换项目后必须重新布局：engagement.id 变化也算依赖 */
-      }, [layoutEpoch, engagement && engagement.id, engagement && engagement.version, nodes.length])
+      }, [layoutEpoch, engagement && engagement.id, nodes.length])
 
       const startSimulation = useCallback((alpha) => {
         sim.current.alpha = Math.max(sim.current.alpha, alpha)
@@ -1596,7 +1723,6 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
         const step = () => {
           const current = dataRef.current && dataRef.current.engagement
           if (current === null || current === undefined) { sim.current.running = false; return }
-          const hiddenNow = new Set()
           tickGraph(positions.current, current.nodes, current.edges, Math.max(0.15, sim.current.alpha))
           bump()
           sim.current.alpha *= 0.972
@@ -1612,7 +1738,8 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
         clearTimeout(saveTimer.current)
         saveTimer.current = setTimeout(() => {
           const rows = Array.from(positions.current, ([id, p]) => ({ id, x: p.x, y: p.y }))
-          if (rows.length > 0) api({ op: 'saveLayout', positions: rows })
+          const eng = dataRef.current && dataRef.current.engagement ? dataRef.current.engagement.id : undefined
+          if (rows.length > 0) api({ op: 'saveLayout', positions: rows, engagement: eng })
         }, 900)
       }, [])
 
@@ -1637,7 +1764,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
           /* 双击（同一节点 400ms 内两次按下）= 折叠/展开子树 */
           const pos = positions.current.get(raw)
           if (pos !== undefined) {
-            pointer.current = { mode: 'node', id: raw, dx: world.x - pos.x, dy: world.y - pos.y, px: event.clientX, py: event.clientY, captured: false }
+            pointer.current = { mode: 'node', id: raw, dx: world.x - pos.x, dy: world.y - pos.y, px: event.clientX, py: event.clientY, captured: false, moved: false }
             setSelection({ type: 'node', id: raw })
           }
           return
@@ -1656,12 +1783,14 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
           return
         }
         if (state.mode === 'node') {
+          const world = toWorld(event.clientX, event.clientY)
+          const pos0 = positions.current.get(state.id)
+          if (pos0 !== undefined && (Math.abs(event.clientX - state.px) > 2 || Math.abs(event.clientY - state.py) > 2)) state.moved = true
           if (state.captured !== true) {
             /* 真正开始拖动才捕获指针：单击/双击期间不捕获，避免 dblclick 被吃掉 */
             state.captured = true
             try { event.currentTarget.setPointerCapture(event.pointerId) } catch { /* 忽略 */ }
           }
-          const world = toWorld(event.clientX, event.clientY)
           const pos = positions.current.get(state.id)
           if (pos !== undefined) {
             pos.x = world.x - state.dx
@@ -1676,7 +1805,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
 
       const onPointerUp = useCallback((event) => {
         const state = pointer.current
-        const dragged = state.mode === 'node'
+        const dragged = state.mode === 'node' && state.moved === true
         const wasPan = state.mode === 'pan'
         const moved = wasPan && state.sx !== undefined
           ? Math.abs(event.clientX - state.sx) + Math.abs(event.clientY - state.sy)
@@ -1776,13 +1905,8 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
             return next
           }
           const kids = childrenMap.get(id) || []
-          if (kids.length === 0) {
-            /* 叶子节点：折叠自身（隐藏整条后代链没有意义，直接标一格） */
-            const owners = next.get(id) || new Set()
-            owners.add(id)
-            next.set(id, owners)
-            return next
-          }
+          /* 叶子节点没有可折叠的子树；隐藏自己会导致无法再次点开。 */
+          if (kids.length === 0) return next
           for (const kid of kids) {
             const owners = next.get(kid) || new Set()
             owners.add(id)
@@ -1791,7 +1915,6 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
           return next
         })
       }, [childrenMap])
-      toggleCollapseRef.current = toggleCollapse
 
       /* ── 操作 ── */
       const uploadFiles = useCallback(async (fileList) => {
@@ -1899,12 +2022,12 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
         if (chatTarget !== 'lead') setMemberStream({ text: '', reasoning: '' })
 
         /* 队列模式（默认）：正在跑或队列里还有没发完的，就排到队尾 */
-        if (chat.busy === true || chatQueue.length > 0) {
+        if (targetBusy || chatQueue.length > 0) {
           queuePush(job)
           return
         }
         await deliver(job)
-      }, [chat.busy, chat.tier, chatQueue.length, chatTarget, deliver, draft, files, queuePush, shots])
+      }, [targetBusy, chat.tier, chatQueue.length, chatTarget, deliver, draft, files, queuePush, shots])
 
       /* 运行状态：按钮和顶部 chip 都靠它；暂停/继续之后会立刻重拉，不等 30 秒轮询 */
       const loadRunner = useCallback(async () => {
@@ -1982,11 +2105,6 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
         await api({ op: 'chat.stop', engagement: engagement.id })
       }, [engagement])
 
-      const setTier = useCallback(async (tier) => {
-        setChat((prev) => ({ ...prev, tier }))
-        await api({ op: 'config.set', patch: { chat: { tier } } })
-      }, [])
-
       const exportJson = useCallback(() => {
         if (engagement === null) return
         const payload = {
@@ -2008,24 +2126,26 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
       /* ── 派生数据 ── */
       const needle = query.trim().toLowerCase()
       const filteredNodes = useMemo(() => {
+        const pool = showArchived ? nodes : nodes.filter((n) => n.archived !== true)
         const list = needle === ''
-          ? nodes
-          : nodes.filter((n) => `${n.value} ${n.label} ${n.ip || ''} ${n.port || ''} ${(n.tech || []).join(' ')} ${(n.tags || []).join(' ')} ${n.note || ''}`.toLowerCase().includes(needle))
+          ? pool
+          : pool.filter((n) => `${n.value} ${n.label} ${n.ip || ''} ${n.port || ''} ${(n.tech || []).join(' ')} ${(n.tags || []).join(' ')} ${n.note || ''}`.toLowerCase().includes(needle))
         return list.slice(0, 60)
-      }, [needle, nodes])
+      }, [needle, nodes, showArchived])
 
-      const feedCommands = useMemo(() => {
-        const needleCmd = cmdQuery.trim().toLowerCase()
-        return commands.slice().reverse()
-          .filter((c) => (cmdFailOnly ? !(c.exitCode === 0) : true))
-          .filter((c) => (needleCmd === '' ? true : `${c.command} ${c.purpose || ''} ${c.id}`.toLowerCase().includes(needleCmd)))
+      const feedVulns = useMemo(() => {
+        const active = new Set(nodes.filter((n) => showArchived || n.archived !== true).map((n) => n.id))
+        return vulns.filter((v) => active.has(v.nodeId))
+          .sort((a, b) => (SEV_ORDER[a.severity] ?? 9) - (SEV_ORDER[b.severity] ?? 9))
           .slice(0, 300)
-      }, [cmdFailOnly, cmdQuery, commands])
-      const feedVulns = useMemo(() => vulns.slice().sort((a, b) => (SEV_ORDER[a.severity] ?? 9) - (SEV_ORDER[b.severity] ?? 9)).slice(0, 300), [vulns])
+      }, [nodes, showArchived, vulns])
 
       const selectedNode = selection !== null && selection.type === 'node' ? (nodes.find((n) => n.id === selection.id) ?? null) : null
       const selectedVuln = selection !== null && selection.type === 'vuln' ? (vulns.find((v) => v.id === selection.id) ?? null) : null
-      const selectedCommand = selection !== null && selection.type === 'command' ? (commands.find((c) => c.id === selection.id) ?? null) : null
+      const selectedCommand = selection !== null && selection.type === 'command'
+        ? (commands.find((c) => c.id === selection.id)
+          ?? (commandText && commandText.command ? { id: selection.id, command: commandText.command, source: 'history' } : null))
+        : null
 
       /* 多根 + 全路径高亮：把「所有根 → 选中节点」的路径并集算出来
          - roots：kind=root，或入度为 0 的节点（可能有多个根）
@@ -2124,6 +2244,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
         if (legendFocus.vuln === true) {
           const hit = new Set()
           for (const node of nodes) {
+            if (showArchived !== true && node.archived === true) continue
             const has = (node.vulnIds || []).length > 0
               || vulns.some((vuln) => vuln.nodeId === node.id)
             if (has) hit.add(node.id)
@@ -2132,7 +2253,10 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
         }
         const wanted = String(legendFocus.kind || '')
         const hit = new Set()
-        for (const node of nodes) if (String(node.kind || 'note') === wanted) hit.add(node.id)
+        for (const node of nodes) {
+          if (showArchived !== true && node.archived === true) continue
+          if (String(node.kind || 'note') === wanted) hit.add(node.id)
+        }
         return hit
       })()
       const neighborIds = legendNodeIds !== null
@@ -2143,8 +2267,9 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
         const map = new Map()
         if (!showVulns) return map
         const byNode = new Map()
+        const visibleIdSet = new Set(visibleNodes.map((node) => node.id))
         for (const vuln of vulns) {
-          if (hidden.has(vuln.nodeId)) continue
+          if (!visibleIdSet.has(vuln.nodeId)) continue
           if (!byNode.has(vuln.nodeId)) byNode.set(vuln.nodeId, [])
           byNode.get(vuln.nodeId).push(vuln)
         }
@@ -2163,8 +2288,9 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
 
       /* ── SVG ── */
       const edgeEls = []
-      for (const edge of edges) {
-        if (hidden.has(edge.from) || hidden.has(edge.to)) continue
+      const visibleIds = new Set(visibleNodes.map((node) => node.id))
+      for (const edge of visibleEdges) {
+        if (!visibleIds.has(edge.from) || !visibleIds.has(edge.to)) continue
         const a = positions.current.get(edge.from)
         const b = positions.current.get(edge.to)
         if (a === undefined || b === undefined) continue
@@ -2223,7 +2349,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
         const color = colorOfKind(node.kind)
         const selected = selectedNode !== null && selectedNode.id === node.id
         const dim = neighborIds !== null && !neighborIds.has(node.id)
-        const nodeVulns = vulns.filter((v) => v.nodeId === node.id)
+        const nodeVulns = showVulns ? vulns.filter((v) => v.nodeId === node.id) : []
         const isCollapsed = ownsFold(node.id)
         const childCount = collapsedCounts.get(node.id) || 0
         nodeEls.push(h('g', {
@@ -2417,27 +2543,10 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
           }, '下派 ', h('b', null, `${delegation.delegated}/${delegation.total}`))
           : null,
         stats !== null ? h('span', { className: 'rc2-chip' }, t('commands'), h('b', null, stats.commands)) : null,
-        engagement !== null
-          ? h('span', {
-            className: 'rc2-chip',
-            title: runnerInfo.checkpoint
-              ? `断点保存于 ${new Date(runnerInfo.checkpoint.savedAt).toLocaleString('zh-CN')}（${runnerInfo.checkpoint.reason || '手动'}）`
-              : '还没有断点',
-          }, runnerInfo.phase === 'paused' ? '已中断'
-            : runnerInfo.phase === 'interrupted' ? '⏸ 已中断·可恢复'
-              : (runnerInfo.running > 0 ? `运行中 ${runnerInfo.running}` : '待机'))
-          : null,
+        usage.total > 0 ? h('span', { className: 'rc2-chip', title: `输入 ${usage.input} · 输出 ${usage.output} · ${usage.turns} 段` }, 'tokens ', h('b', null, usage.total)) : null,
         h('span', { className: 'rc2-chip' },
           h('span', { className: `rc2-dot${conn === 'live' ? ' pulse' : ''}`, style: conn === 'live' ? undefined : { background: 'var(--dsw-alias-state-idle-primary)', boxShadow: 'none' } }),
           conn === 'live' ? t('connected') : (conn === 'connecting' ? t('connecting') : t('offline'))),
-        h('div', { className: 'rc2-tier' }, TIERS.map((tier) => h('button', {
-          key: tier, className: chat.tier === tier ? 'on' : '',
-          onClick: () => { void setTier(tier) },
-          title: tier === 'deep' ? t('tierDeep') : (tier === 'fast' ? t('tierFast') : t('tierVision')),
-        }, tier === 'deep' ? t('tierDeep') : (tier === 'fast' ? t('tierFast') : t('tierVision'))))),
-        h('button', { className: 'rc2-btn ghost', onClick: () => void refresh(engagement ? engagement.id : undefined) }, t('refresh')),
-        h('button', { className: 'rc2-btn ghost', onClick: () => { positions.current.clear(); if (nodes.length > 0) ensurePositions(positions.current, nodes, edges); startSimulation(1); setTimeout(fit, 800) } }, t('relayout')),
-        h('button', { className: 'rc2-btn ghost', onClick: fit }, t('fit')),
         h('button', { className: 'rc2-btn ghost', onClick: exportJson, disabled: engagement === null }, t('exportJson')),
         h('button', {
           className: `rc2-btn ghost${mdOn ? ' on' : ''}`,
@@ -2526,9 +2635,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
 
       /* ── 左：轨迹树（时间桶并行带 + 泳道） ── */
       const ROW_H = 46
-      const TICK_GAP = 12
-      const PAD_TOP = 20
-      const TICK_MS = 3000
+      const PAD_TOP = 10
       const treeRows = traceFiltered.slice(-400)
       const laneOf = new Map()
       const laneKeys = []
@@ -2647,11 +2754,6 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
         h('filter', { id: 'rc2glow', x: '-60%', y: '-60%', width: '220%', height: '220%' },
           h('feGaussianBlur', { stdDeviation: '2.4', result: 'blur' }),
           h('feMerge', null, h('feMergeNode', { in: 'blur' }), h('feMergeNode', { in: 'source' })))),
-      /* 泳道名 */
-      laneKeys.map((key, index) => h('text', {
-        key: `ln${key}`, x: laneX(index), y: 9, textAnchor: 'middle',
-        fontSize: 8.5, fill: laneColorOf(key), fillOpacity: 0.9, fontWeight: 600,
-      }, fitText(key.split(':')[1] || key, 26, 8.5))),
       bursts.filter((burst) => burst.parallel).map((burst, index) => {
         const top = burstTop.get(burst)
         const height = burst.rows.length * ROW_H
@@ -2949,6 +3051,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
       const kindStats = (() => {
         const map = new Map()
         for (const node of nodes) {
+          if (showArchived !== true && node.archived === true) continue
           const key = node.kind || 'note'
           map.set(key, (map.get(key) || 0) + 1)
         }
@@ -2959,13 +3062,22 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
         return h('button', {
           key: row.kind,
           className: `rc2-legend${active ? ' on' : ''}${hiddenKinds.has(row.kind) ? ' off' : ''}`,
-          title: `${row.kind} · ${row.count} 个（点击固定高亮这类节点，再点一次取消）`,
+          title: `${row.kind} · ${row.count} 个（点击固定高亮，右键隐藏/显示这类节点）`,
           onClick: () => setLegendFocus(active ? null : { kind: row.kind }),
+          onContextMenu: (event) => {
+            event.preventDefault()
+            event.stopPropagation()
+            setHiddenKinds((prev) => {
+              const next = new Set(prev)
+              if (next.has(row.kind)) next.delete(row.kind)
+              else next.add(row.kind)
+              return next
+            })
+          },
         }, h('i', { style: { background: colorOfKind(row.kind) } }), `${row.kind} ${row.count}`)
       }
 
       const vulnFocus = legendFocus !== null && legendFocus.vuln === true
-      const filtered = kindFilter.size > 0 || hiddenKinds.size > 0 || legendFocus !== null
       const moreCount = Math.max(0, kindStats.length - 14)
       const legend = h('div', { className: `rc2-hud bl${legendExpanded ? ' wide' : ''}` },
         /* 可横向滚动的类型区（折叠时只有一行） */
@@ -3025,12 +3137,23 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
               h('button', {
                 className: 'rc2-btn',
                 onClick: async () => {
-                  const reason = await uiPrompt({ title: t('archiveReason'), value: '', okText: selectedNode.archived ? '恢复' : '归档' })
+                  if (selectedNode.archived === true) {
+                    const res = await api({
+                      op: 'archiveNode',
+                      nodeId: selectedNode.id,
+                      mode: 'restore',
+                      reason: '',
+                    })
+                    if (res && res.ok) void refresh(engagement ? engagement.id : undefined)
+                    return
+                  }
+                  const reason = await uiPrompt({ title: t('archiveReason'), value: '', okText: '归档' })
+                  if (reason === null) return
                   const res = await api({
                     op: 'archiveNode',
                     nodeId: selectedNode.id,
-                    mode: selectedNode.archived ? 'restore' : 'archive',
-                    reason: selectedNode.archived ? '' : (reason || ''),
+                    mode: 'archive',
+                    reason: reason || '',
                   })
                   if (res && res.ok) void refresh(engagement ? engagement.id : undefined)
                 },
@@ -3039,7 +3162,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
                 className: 'rc2-btn danger',
                 onClick: async () => {
                   if (!await uiConfirm(t('confirmDelete'), '节点会连同它的边与漏洞一起删除，不可恢复')) return
-                  const res = await api({ op: 'deleteNode', nodeId: selectedNode.id })
+                  const res = await api({ op: 'deleteNode', nodeId: selectedNode.id, engagement: engagement ? engagement.id : undefined })
                   if (res && res.ok) { setSelection(null); void refresh(engagement ? engagement.id : undefined) }
                 },
               }, t('delete'))),
@@ -3085,7 +3208,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
               ...actions.map(([status, label]) => h('button', {
                 key: status, className: `rc2-btn${selectedVuln.status === status ? ' on' : ''}`,
                 onClick: async () => {
-                  const res = await api({ op: 'setVulnStatus', vulnId: selectedVuln.id, status })
+                  const res = await api({ op: 'setVulnStatus', vulnId: selectedVuln.id, status, engagement: engagement ? engagement.id : undefined })
                   if (res && res.ok) void refresh(engagement ? engagement.id : undefined)
                 },
               }, label)),
@@ -3093,7 +3216,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
                 className: 'rc2-btn danger',
                 onClick: async () => {
                   if (!await uiConfirm(t('confirmDelete'), '这条漏洞记录会被删除')) return
-                  const res = await api({ op: 'deleteVuln', vulnId: selectedVuln.id })
+                  const res = await api({ op: 'deleteVuln', vulnId: selectedVuln.id, engagement: engagement ? engagement.id : undefined })
                   if (res && res.ok) { setSelection(null); void refresh(engagement ? engagement.id : undefined) }
                 },
               }, t('delete'))))
@@ -3107,7 +3230,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
               h('button', {
                 className: 'rc2-btn',
                 onClick: async () => {
-                  const res = await api({ op: 'command.rerun', commandId: selectedCommand.id })
+                  const res = await api({ op: 'command.rerun', commandId: selectedCommand.id, engagement: engagement ? engagement.id : undefined })
                   if (res && res.ok) {
                     setSelection({ type: 'command', id: res.commandId })
                     void refresh(engagement ? engagement.id : undefined)
@@ -3179,7 +3302,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
           onClick: () => {
             setSpot({
               kind: 'browser', title: `${pane.name} · ${pane.url || pane.title || '浏览器画面'}`,
-              body: pane.shot ? `![${pane.name}](/recon/asset?p=${encodeURIComponent(pane.shot)})` : '暂无画面',
+              body: pane.shot ? `![${pane.name}](${apiUrl(`/recon/asset?p=${encodeURIComponent(pane.shot)}`)})` : '暂无画面',
               meta: [`状态：${pane.status}`, pane.error ? `错误：${pane.error}` : '', pane.url ? `URL：${pane.url}` : ''].filter((x) => x !== ''),
               shot: pane.shot || null,
             })
@@ -3190,7 +3313,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
           h('span', { className: 'rc2-bpane-name' }, pane.name),
           h('span', { className: 'rc2-bpane-state' }, pane.status === 'running' ? '操作中' : pane.status === 'error' ? '失败' : '待命')),
         pane.shot
-          ? h('img', { className: 'rc2-bpane-shot', src: `/recon/asset?p=${encodeURIComponent(pane.shot)}`, alt: pane.name, loading: 'lazy' })
+          ? h('img', { className: 'rc2-bpane-shot', src: apiUrl(`/recon/asset?p=${encodeURIComponent(pane.shot)}`), alt: pane.name, loading: 'lazy' })
           : h('div', { className: 'rc2-bpane-empty' }, pane.status === 'running' ? '正在加载页面…' : '无画面'),
         h('div', { className: 'rc2-bpane-url' }, pane.url || pane.title || '—'))))
 
@@ -3246,7 +3369,17 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
                 })
               },
             }, t('collapseAll')),
-            h('button', { className: 'rc2-btn ghost', onClick: () => setFoldOwners(new Map()) }, t('expandAll'))),
+            h('button', { className: 'rc2-btn ghost', onClick: () => setFoldOwners(new Map()) }, t('expandAll')),
+            h('button', {
+              className: `rc2-btn ghost${showVulns ? ' on' : ''}`,
+              title: '显示 / 隐藏图中的漏洞菱形',
+              onClick: () => setShowVulns((v) => !v),
+            }, t('showVulns')),
+            h('button', {
+              className: `rc2-btn ghost${showArchived ? ' on' : ''}`,
+              title: '显示 / 隐藏已归档节点',
+              onClick: () => setShowArchived((v) => !v),
+            }, showArchived ? '隐藏归档' : '显示归档')),
           h('div', { className: 'rc2-kindfilter' },
             kindStats.slice(0, 16).map((row) => h('button', {
               key: row.kind,
@@ -3291,8 +3424,9 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
       const leadMsgs = chatTarget === 'lead' ? chat.messages : []
       for (let mi = 0; mi < leadMsgs.length; mi += 1) {
         const message = leadMsgs[mi]
-        const isUser = message.role === 'user'
-        const silent = isUser === false && (message.text || '').trim() === ''
+        const isSystem = message.system === true
+        const isUser = message.role === 'user' && isSystem === false
+        const silent = isUser === false && isSystem === false && (message.text || '').trim() === ''
         if (silent) {
           /* 连续「只有思维链」的轮次合成一个可展开的块 */
           const group = []
@@ -3319,12 +3453,12 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
           continue
         }
         chatRows.push(h('div', { key: message.id, className: `rc2-msg ${isUser ? 'user' : 'ai'}` },
-          h('div', { className: 'who' }, `${isUser ? t('userLabel') : t('aiLabel')}${message.model ? ` · ${message.model}` : (message.tier ? ` · ${message.tier}` : '')}${message.ts ? ` · ${fmtTime(new Date(message.ts).toISOString())}` : ''}`),
+          h('div', { className: 'who' }, `${isSystem ? '调度台' : (isUser ? t('userLabel') : t('aiLabel'))}${message.model ? ` · ${message.model}` : (message.tier ? ` · ${message.tier}` : '')}${message.ts ? ` · ${fmtTime(new Date(message.ts).toISOString())}` : ''}`),
           h('div', { className: `body${mdOn ? ' rc2-md' : ''}` }, message.text ? mdOrText(message.text, message.id, mdOn) : ''),
           message.images ? h('div', { className: 'rc2-meta', style: { marginTop: 3 } }, `🖼 × ${message.images}`) : null,
           Array.isArray(message.attachments) && message.attachments.length > 0
             ? h('div', { className: 'rc2-attachbar', style: { padding: '4px 0 0' } }, message.attachments.map((file) => h('a', {
-              key: file.path, className: 'rc2-attach', href: `/recon/asset?p=${encodeURIComponent(file.path)}`,
+              key: file.path, className: 'rc2-attach', href: apiUrl(`/recon/asset?p=${encodeURIComponent(file.path)}`),
               target: '_blank', rel: 'noreferrer', title: file.path,
             }, '📎 ', h('span', null, file.name), ` ${Math.round((file.bytes || 0) / 1024)}KB`)))
             : null,
@@ -3368,13 +3502,13 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
         }
       }, [engagement, spawnName, spawnPrompt, spawnRole, spawnSkills, spawnTask, spawnTier])
 
-      const stopMember = useCallback(async (name) => { await api({ op: 'squad.stop', member: name }) }, [])
-      const removeMember = useCallback(async (name) => { await api({ op: 'squad.remove', member: name }) }, [])
+      const stopMember = useCallback(async (name) => { await api({ op: 'squad.stop', member: name, engagement: engagement ? engagement.id : undefined }) }, [engagement])
+      const removeMember = useCallback(async (name) => { await api({ op: 'squad.remove', member: name, engagement: engagement ? engagement.id : undefined }) }, [engagement])
       const addMemberTask = useCallback(async (member) => {
         const text = await uiPrompt({ title: t('squadAsk'), detail: `发给 ${member.name}`, multiline: true, okText: '派发' })
         if (text === null || text.trim() === '') return
-        await api({ op: 'squad.task', member: member.name, task: text.trim() })
-      }, [t, uiPrompt])
+        await api({ op: 'squad.task', member: member.name, task: text.trim(), engagement: engagement ? engagement.id : undefined })
+      }, [engagement, t, uiPrompt])
 
       const ROLE_COLOR = {
         lead: '#22d3ee', commander: '#22d3ee', staff: '#38bdf8', scout: '#34d399',
@@ -3472,7 +3606,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
               key: status,
               className: `rc2-fchip${entry.status === status ? ' on' : ''}`,
               onClick: async () => {
-                await api({ op: 'board.update', id: entry.id, status })
+                await api({ op: 'board.update', id: entry.id, status, engagement: engagement ? engagement.id : undefined })
               },
             }, status === 'doing' ? '进行中' : '已完成')),
             h('button', {
@@ -3504,9 +3638,9 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
           refButtons.length > 0 ? h('div', { className: 'rc2-refs' }, refButtons) : null,
           Array.isArray(entry.shots) && entry.shots.length > 0
             ? h('div', { className: 'rc2-thumbs' }, entry.shots.map((shot) => h('a', {
-              key: shot, href: `/recon/asset?p=${encodeURIComponent(shot)}`, target: '_blank', rel: 'noreferrer',
+              key: shot, href: apiUrl(`/recon/asset?p=${encodeURIComponent(shot)}`), target: '_blank', rel: 'noreferrer',
               className: 'rc2-thumb', title: shot,
-            }, h('img', { src: `/recon/asset?p=${encodeURIComponent(shot)}`, alt: shot }))))
+            }, h('img', { src: apiUrl(`/recon/asset?p=${encodeURIComponent(shot)}`), alt: shot }))))
             : null)
       }
 
@@ -3602,13 +3736,17 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
             if (goal === null || goal.trim() === '') return
             const done = await uiPrompt({ title: '完成判据', detail: '什么样算完成（谁看都能判）', value: mission !== null ? (mission.done || '') : '', okText: '保存' })
             if (done === null) return
-            await api({ op: 'mission.set', goal: goal.trim(), done: done === null ? '' : done.trim() })
+            const res = await api({ op: 'mission.set', goal: goal.trim(), done: done === null ? '' : done.trim(), engagement: engagement ? engagement.id : undefined })
+            if (!res || res.ok === false) {
+              await uiAlert('不能登记目标', `${res && res.error ? res.error : '未知错误'}${res && res.hint ? `\n\n${res.hint}` : ''}`)
+              return
+            }
             void refresh(engagement ? engagement.id : undefined)
           },
         }, mission === null ? '登记目标' : '改目标'),
         h('button', {
           className: 'rc2-btn on', style: { height: 20 },
-          title: '全部任务通过后宣布完成，并自动回收空闲队员',
+          title: '全部任务通过 QA 验收后由总指挥宣布结束，并自动停止/回收非核心队员',
           onClick: async () => {
             const res = await api({ op: 'mission.close', engagement: engagement ? engagement.id : undefined })
             if (res && res.ok === false) {
@@ -3650,9 +3788,18 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
           h('span', { className: 'rc2-meta' }, `任务 ${taskStats.total}`),
           h('span', { className: 'rc2-fchip' }, `待派 ${taskStats.open}`),
           h('span', { className: 'rc2-fchip' }, `进行中 ${taskStats.doing}`),
+          h('span', { className: 'rc2-fchip' }, `受阻 ${taskStats.blocked || 0}`),
           h('span', { className: 'rc2-fchip' }, `已验收 ${taskStats.passed}`),
           h('span', { className: 'rc2-fchip' }, `驳回 ${taskStats.failed}`),
           h('span', { className: 'rc2-spacer' }),
+          h('select', {
+            className: 'rc2-select', style: { height: 22, fontSize: 11, maxWidth: 130 },
+            value: taskRole,
+            title: '新任务负责角色',
+            onChange: (event) => setTaskRole(event.target.value),
+          }, (roleList.length > 0 ? roleList : [{ id: 'web', name: 'Web 手' }])
+            .filter((role) => role.core !== true && role.id !== 'commander' && role.id !== 'staff')
+            .map((role) => h('option', { key: role.id, value: role.id }, role.name || role.id))),
           h('button', {
             className: 'rc2-btn ghost', style: { height: 22 },
             onClick: async () => {
@@ -3662,7 +3809,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
               if (goal === null) return
               const acceptance = await uiPrompt({ title: '验收标准', detail: '怎样算完成', value: '', okText: '创建' })
               if (acceptance === null) return
-              await api({ op: 'task.create', title: title.trim(), goal, acceptance, role: 'web', engagement: engagement ? engagement.id : undefined })
+              await api({ op: 'task.create', title: title.trim(), goal, acceptance, role: taskRole, engagement: engagement ? engagement.id : undefined })
               void refresh(engagement ? engagement.id : undefined)
             },
           }, '＋ 新任务')),
@@ -3676,6 +3823,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
                 h('span', { className: 'rc2-author', style: { color: 'var(--rc-accent)', borderColor: 'var(--rc-accent)' } }, roleNameOf(task.role)),
                 h('span', { className: 'rc2-meta' }, task.id),
                 h('span', { className: 'rc2-meta' }, task.assignee || '未指派'),
+                h('span', { className: 'rc2-meta' }, task.verifiedBy && task.verifiedBy.role === 'qa' ? `QA ${task.verifiedBy.name || '已验收'}` : '待 QA'),
                 h('span', { className: 'rc2-spacer' }),
                 h('button', {
                   className: 'rc2-btn ghost', style: { height: 20 },
@@ -3702,7 +3850,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
           }))
 
       const paneMerged = mergedByAuthor(boardAuthor)
-      const boardPane = h('div', { className: 'rc2-board', ref: boardRef },
+      const boardPane = h('div', { className: 'rc2-board' },
         boardFilterBar,
         paneMerged,
         boardEntries.length === 0 && paneMerged === null ? h('div', { className: 'rc2-note', style: { padding: '10px 4px' } }, t('boardEmpty')) : null,
@@ -3720,12 +3868,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
          name = command args      （stdio）
          name = https://host/mcp  （streamable-http） */
       const editMemberMcp = async (member) => {
-        const current = (Array.isArray(member.mcp) ? member.mcp : []).map((row) => {
-          const name = row.name || 'server'
-          if ((row.transport || '') === 'streamable-http' || (row.url || '') !== '') return `${name} = ${row.url || ''}`
-          const cmd = [row.command || '', ...(Array.isArray(row.args) ? row.args : [])].join(' ').trim()
-          return `${name} = ${cmd}`
-        }).join('\n')
+        const current = (Array.isArray(member.mcp) ? member.mcp : []).map(mcpLineOf).join('\n')
         const text = await uiPrompt({
           title: `${member.name} 的专属 MCP`,
           detail: '一行一个：name = command args（stdio），或 name = https://host/mcp（http）。留空表示不挂 MCP，只靠本机命令干活。',
@@ -3733,23 +3876,8 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
           multiline: true,
         })
         if (text === null) return
-        const rows = []
-        for (const line of String(text).split('\n')) {
-          const trimmed = line.trim()
-          if (trimmed === '') continue
-          const eq = trimmed.indexOf('=')
-          if (eq <= 0) continue
-          const name = trimmed.slice(0, eq).trim()
-          const rest = trimmed.slice(eq + 1).trim()
-          if (name === '' || rest === '') continue
-          if (/^https?:\/\//i.test(rest)) {
-            rows.push({ name, transport: 'streamable-http', url: rest, enabled: true })
-          } else {
-            const parts = rest.split(/\s+/)
-            rows.push({ name, transport: 'stdio', command: parts[0], args: parts.slice(1), enabled: true })
-          }
-        }
-        const res = await api({ op: 'squad.mcp', engagement: engagement ? engagement.id : undefined, member: member.name, mcp: rows })
+        const rows = parseMcpLines(text)
+        const res = await api({ op: 'squad.mcp', engagement: engagement ? engagement.id : undefined, member: member.key, mcp: rows })
         if (!res || !res.ok) { await uiAlert('MCP 保存失败', res && res.error ? res.error : '未知错误'); return }
         void refresh(engagement ? engagement.id : undefined)
       }
@@ -3757,8 +3885,8 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
       const squadRow = (member) => {
         const head = h('div', { className: 'rc2-sqrow' },
           h('span', {
-            className: `rc2-dot${member.status === 'running' ? ' pulse' : ''}`,
-            style: member.status === 'running' ? undefined : { boxShadow: 'none', background: 'var(--dsw-alias-state-idle-primary)' },
+            className: `rc2-dot${member.status === 'running' || member.status === 'waiting' ? ' pulse' : ''}`,
+            style: member.status === 'running' || member.status === 'waiting' ? undefined : { boxShadow: 'none', background: 'var(--dsw-alias-state-idle-primary)' },
           }),
           h('span', { className: 'rc2-sqid' },
             h('span', { className: 'rc2-author', style: { color: ROLE_COLOR[member.role] || '#94a3b8', borderColor: ROLE_COLOR[member.role] || '#94a3b8' } }, member.name),
@@ -3770,19 +3898,25 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
             member.promptExtra ? h('span', { className: 'rc2-meta', title: member.promptExtra, style: { color: '#a3e635' } }, '📌') : null,
             Array.isArray(member.mcp) && member.mcp.length > 0
               ? h('span', { className: 'rc2-meta', title: member.mcp.map((row) => row.name).join(', '), style: { color: '#38bdf8' } }, `🔌${member.mcp.length}`)
-              : h('span', { className: 'rc2-meta', style: { opacity: 0.6 }, title: '未挂专属 MCP：直接用本机命令干活' }, 'Shell')),
+              : h('span', { className: 'rc2-meta', style: { opacity: 0.6 }, title: '未挂专属 MCP：直接用本机命令干活' }, 'Shell'),
+            member.groupId ? h('span', { className: 'rc2-meta', title: `协作小组 ${member.groupId}${member.waitingFor ? `；等待 ${member.waitingFor}` : ''}`, style: { color: '#c084fc' } }, '👥组') : null),
           h('span', { className: 'rc2-sqstate' },
             h('span', { className: `rc2-sqpill ${member.status}` },
               member.status === 'running' ? t('runningAgents')
-                : member.status === 'starting' ? t('agentStarting')
-                  : member.status === 'done' ? t('agentDone') : t('agentIdle')),
+                : member.status === 'waiting' ? '等待协作'
+                  : member.status === 'starting' ? t('agentStarting')
+                    : member.status === 'done' ? t('agentDone') : t('agentIdle')),
             member.idleSince ? h('span', { className: 'rc2-meta' }, `${Math.max(0, Math.round((Date.now() - member.idleSince) / 60000))}m`) : null),
           h('span', { className: 'rc2-sqtask', title: member.task || '' }, member.task ? `▸ ${shortText(member.task, 200)}` : '—'),
           h('span', { className: 'rc2-sqacts' },
             h('button', { className: 'rc2-btn ghost', title: '配置这名队员的专属 MCP', onClick: () => void editMemberMcp(member) }, 'MCP'),
             h('button', { className: 'rc2-btn ghost', onClick: () => void addMemberTask(member) }, t('squadAsk')),
-            h('button', { className: 'rc2-btn ghost', onClick: () => void stopMember(member.name) }, t('squadStop')),
-            h('button', { className: 'rc2-btn ghost danger', onClick: () => void removeMember(member.name) }, t('squadRemove'))))
+            (member.core === true || member.role === 'commander' || member.role === 'staff')
+              ? null
+              : h('button', { className: 'rc2-btn ghost', onClick: () => void stopMember(member.name) }, t('squadStop')),
+            (member.core === true || member.role === 'commander' || member.role === 'staff')
+              ? h('span', { className: 'rc2-meta', title: '常设席位：每靶标各一个，不会被释放', style: { color: '#fbbf24' } }, '常设')
+              : h('button', { className: 'rc2-btn ghost danger', onClick: () => void removeMember(member.name) }, t('squadRemove'))))
 
         const hasOut = Boolean(member.lastTool || member.lastText)
         const out = hasOut
@@ -3920,90 +4054,11 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
 
       /* ── 总结汇报：只读聚合视图（资产拓扑 + 漏洞列表 + 看板 + 队员状态）
          不调用任何写接口、不派活、不改图，纯展示，保证不干扰任何流程 ── */
-      const briefMap = (() => {
-        const list = Array.isArray(nodes) ? nodes : []
-        if (list.length === 0) return null
-        const ids = list.map((n) => n.id)
-        const indeg = new Map(ids.map((id) => [id, 0]))
-        const out = new Map(ids.map((id) => [id, []]))
-        for (const edge of edges || []) {
-          if (!out.has(edge.from) || !indeg.has(edge.to)) continue
-          out.get(edge.from).push(edge.to)
-          indeg.set(edge.to, indeg.get(edge.to) + 1)
-        }
-        const roots = ids.filter((id) => indeg.get(id) === 0)
-        const layer = new Map()
-        const seen = new Set()
-        const queue = roots.map((id) => [id, 0])
-        for (const id of roots) seen.add(id)
-        while (queue.length > 0) {
-          const [id, depth] = queue.shift()
-          if (!layer.has(id)) layer.set(id, depth)
-          if (depth >= 8) continue
-          for (const next of out.get(id) || []) {
-            if (seen.has(next)) continue
-            seen.add(next)
-            queue.push([next, depth + 1])
-          }
-        }
-        let maxDepth = 0
-        for (const depth of layer.values()) maxDepth = Math.max(maxDepth, depth)
-        for (const id of ids) if (!layer.has(id)) layer.set(id, maxDepth + 1)
-        const byLayer = new Map()
-        for (const [id, depth] of layer.entries()) {
-          if (!byLayer.has(depth)) byLayer.set(depth, [])
-          byLayer.get(depth).push(id)
-        }
-        const rows = Array.from(byLayer.entries()).sort((a, b) => a[0] - b[0])
-        const widest = rows.reduce((max, row) => Math.max(max, row[1].length), 1)
-        /* 每层最多画 26 个点，超出的用 +N 标注；列宽随层宽自适应，保证整体不超过容器宽度 */
-        const MAX_COLS = 18
-        const cols = Math.min(widest, MAX_COLS)
-        const colW = Math.max(26, Math.min(64, Math.round(880 / Math.max(1, cols))))
-        const width = 40 + cols * colW
-        const height = 26 + rows.length * 34
-        const pos = new Map()
-        const overflow = new Map()
-        for (const [depth, row] of rows) {
-          const shown = row.slice(0, MAX_COLS)
-          if (row.length > MAX_COLS) overflow.set(depth, row.length - MAX_COLS)
-          const span = shown.length * colW
-          const startX = (width - span) / 2 + colW / 2
-          shown.forEach((id, index) => { pos.set(id, { x: startX + index * colW, y: 20 + depth * 34 }) })
-        }
-        const byId = new Map(list.map((node) => [node.id, node]))
-        return { pos, width, height, byId, roots: roots.length, overflow }
-      })()
-
-      const briefKinds = (() => {
-        const map = new Map()
-        for (const node of nodes || []) {
-          const key = node.kind || 'note'
-          map.set(key, (map.get(key) || 0) + 1)
-        }
-        return Array.from(map.entries()).sort((a, b) => b[1] - a[1]).slice(0, 12)
-      })()
-
-      const briefVulns = (vulns || [])
-        .slice()
-        .sort((a, b) => (SEV_ORDER[a.severity] ?? 9) - (SEV_ORDER[b.severity] ?? 9))
-        .slice(0, 10)
-
-      const briefBoard = (boardEntries || []).slice().reverse().slice(0, 6)
-
-      const briefPassRate = taskStats.total === 0
-        ? 0
-        : Math.round((taskStats.passed / taskStats.total) * 100)
-
-      /* ── 总结汇报：一个纯只读的对话框 ──
-         进入时给一句总览，之后用户提问（进度/人员/漏洞/任务/资产/看板）由本地数据即时作答。
-         不调用任何写接口、不派活、不改图、不写对话记录，保证不干扰任何流程。 */
-
       const briefReport = (() => {
         const verified = (vulns || []).filter((v) => v.status === 'verified').length
         const passRate = taskStats.total === 0 ? 0 : Math.round((taskStats.passed / taskStats.total) * 100)
         const running = squadMembers.filter((m) => m.status === 'running').length
-        const k = mission && mission.title ? `目标：${mission.title}` : '尚未登记作战目标'
+        const k = mission && mission.goal ? `目标：${mission.goal}` : '尚未登记作战目标'
         return `当前进度 · ${engagement !== null ? engagement.name : '未命名项目'}\n`
           + `${k}\n`
           + `资产 ${nodes.length} · 关系 ${(edges || []).length} · 漏洞 ${(vulns || []).length}（已验证 ${verified}）\n`
@@ -4115,12 +4170,12 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
 
       /* 队列任务：上一轮结束后自动发下一条（只在空闲时出队，不打断任何进行中的工作） */
       useEffect(() => {
-        if (chat.busy === true) return
+        if (targetBusy) return
         if (chatQueue.length === 0) return
         const next = chatQueue[0]
         setChatQueue((prev) => prev.slice(1))
         void deliver(next)
-      }, [chat.busy, chatQueue, deliver])
+      }, [targetBusy, chatQueue, deliver])
 
       const briefRows = briefMsgs.map((message, index) => h('div', {
         key: message.id ? `bf-${message.id}` : `bf-${index}`,
@@ -4167,7 +4222,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
             placeholder: '直接问总指挥：进度如何、谁在跑、还差什么…（Enter 发送）',
             onChange: (event) => setBriefDraft(event.target.value),
             onKeyDown: (event) => {
-              if (event.key === 'Enter' && !event.shiftKey) {
+              if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && !(event.nativeEvent && event.nativeEvent.isComposing)) {
                 event.preventDefault()
                 askBrief('agent')
               }
@@ -4179,7 +4234,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
               const ok = await uiConfirm('清空汇报席', '只清掉这段独立对话的历史，总指挥的上下文和图谱都不动。确定？')
               if (!ok) return
               await api({ op: 'brief.clear', engagement: engagement ? engagement.id : undefined })
-              setBriefMsgs([]); setBriefStream('')
+              setBriefMsgs([]); setBriefStream(''); setBriefBusy(false)
             },
           }, '清空'),
           h('button', { className: 'rc2-btn ghost', title: '不调用模型，用本地数据拼一份速览', onClick: () => askBrief('local'), disabled: briefDraft.trim() === '' }, '速览'),
@@ -4279,11 +4334,19 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
                 }
               },
               onKeyDown: (event) => {
-                if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendChat() }
+                if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && !(event.nativeEvent && event.nativeEvent.isComposing)) { event.preventDefault(); void sendChat() }
               },
             }),
-            h('button', { className: 'rc2-btn on', onClick: () => void sendChat(), disabled: draft.trim() === '' }, t('send')),
-            chat.busy ? h('button', { className: 'rc2-btn danger', onClick: () => void stopChat() }, t('stop')) : null))
+            h('button', { className: 'rc2-btn on', onClick: () => void sendChat(), disabled: draft.trim() === '' && files.length === 0 && shots.length === 0 }, t('send')),
+            targetBusy ? h('button', {
+              className: 'rc2-btn danger',
+              onClick: () => {
+                if (chatTarget === 'lead') void stopChat()
+                else if (chatTargetMember !== null && chatTargetMember !== undefined) {
+                  void api({ op: 'squad.stop', member: chatTargetMember.name, engagement: engagement ? engagement.id : undefined })
+                }
+              },
+            }, t('stop')) : null))
         : dockTab === 'task'
           ? h('div', { className: 'rc2-inputrow' },
             h('span', { className: 'rc2-meta' }, '任务由总指挥用 recon_task 拆解；验收员在这里点通过/驳回。'),
@@ -4304,7 +4367,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
               placeholder: t('boardHint'),
               onChange: (event) => setBoardDraft(event.target.value),
               onKeyDown: (event) => {
-                if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void postBoard() }
+                if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && !(event.nativeEvent && event.nativeEvent.isComposing)) { event.preventDefault(); void postBoard() }
               },
             }),
             h('button', { className: 'rc2-btn on', onClick: () => void postBoard(), disabled: boardDraft.trim() === '' }, t('boardPost')))
@@ -4312,12 +4375,12 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
             h('div', { className: 'rc2-inputrow' },
             h('select', { className: 'rc2-select', value: spawnRole, onChange: (event) => setSpawnRole(event.target.value) },
               (roleList.length > 0 ? roleList : [
-                { id: 'commander', name: '总指挥' }, { id: 'staff', name: '参谋' }, { id: 'scout', name: '信息收集' },
-                { id: 'web', name: 'Web 手' }, { id: 'reverser', name: '逆向手' }, { id: 'intranet', name: '内网手' },
-                { id: 'qa', name: '验收' },
-              ]).map((role) => h('option', { key: role.id, value: role.id }, `${role.name}（${role.id}）`))),
+                { id: 'scout', name: '信息收集' }, { id: 'web', name: 'Web 手' }, { id: 'reverser', name: '逆向手' },
+                { id: 'intranet', name: '内网手' }, { id: 'qa', name: '验收' },
+              ]).filter((role) => role.core !== true && role.id !== 'commander' && role.id !== 'staff')
+                .map((role) => h('option', { key: role.id, value: role.id }, `${role.name}（${role.id}）`))),
             h('select', { className: 'rc2-select', value: spawnTier, onChange: (event) => setSpawnTier(event.target.value) },
-              TIERS.map((tier) => h('option', { key: tier, value: tier }, tier))),
+              MODEL_CHOICES.map((tier) => h('option', { key: tier, value: tier }, TIER_LABEL[tier]))),
             h('input', {
               className: 'rc2-input', style: { width: 120, minHeight: 28 },
               value: spawnName, placeholder: '代号（可选）',
@@ -4336,7 +4399,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
               placeholder: t('squadTask') + '…',
               onChange: (event) => setSpawnTask(event.target.value),
               onKeyDown: (event) => {
-                if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void spawnMember() }
+                if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && !(event.nativeEvent && event.nativeEvent.isComposing)) { event.preventDefault(); void spawnMember() }
               },
             }),
             h('button', { className: 'rc2-btn on', onClick: () => void spawnMember(), disabled: spawnTask.trim() === '' }, t('squadSpawn'))),
@@ -4354,12 +4417,12 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
         setSpotText('')
         if (kind !== 'command') return
         setSpotBusy(true)
-        api({ op: 'command', commandId: id }).then((res) => {
+        api({ op: 'command', commandId: id, engagement: engagement ? engagement.id : undefined }).then((res) => {
           setSpotBusy(false)
           if (res && res.ok) setSpotText(String(res.text === undefined || res.text === null ? '' : res.text))
           else setSpotText(res && res.error ? `读取失败：${res.error}` : '读取失败')
         })
-      }, [])
+      }, [engagement])
 
       useEffect(() => {
         if (spot === null && panelSpot === null) return undefined
@@ -4378,7 +4441,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
         let rows = null
         if (panelSpot === 'trace') {
           rows = h('div', { className: 'rc2-feed', style: { flex: '1 1 auto' } },
-            traceFiltered.slice(-TRACE_LIMIT).map(traceRow))
+            traceFiltered.slice(-traceLimit).map(traceRow))
         } else if (panelSpot === 'vulns') {
           const order = { critical: 0, high: 1, medium: 2, low: 3, info: 4 }
           const list = vulns.slice().sort((a, b) => (order[a.severity] ?? 9) - (order[b.severity] ?? 9))
@@ -4447,8 +4510,9 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
         const cmd = spot.kind === 'command' ? commands.find((c) => c.id === spot.id) : undefined
         const vul = spot.kind === 'vuln' ? vulns.find((v) => v.id === spot.id) : undefined
         const brd = spot.kind === 'board' ? boardEntries.find((e) => e.id === spot.id) : undefined
-        if (cmd === undefined && vul === undefined && brd === undefined) return null
-        const title = cmd ? cmd.command : vul ? vul.title : shortText(brd.text || '', 140)
+        const historyCommand = spot.kind === 'command' && cmd === undefined
+        if (cmd === undefined && vul === undefined && brd === undefined && historyCommand === false) return null
+        const title = cmd ? cmd.command : vul ? vul.title : brd ? shortText(brd.text || '', 140) : `命令 ${spot.id}`
         const kvs = []
         if (cmd) {
           kvs.push(['退出码', cmd.exitCode === null || cmd.exitCode === undefined ? '…' : String(cmd.exitCode)])
@@ -4531,7 +4595,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
                 kvs.map(([key, value], index) => h('span', { key: index, className: 'rc2-spotkv' },
                   `${key}: `, h('b', null, shortText(String(value), 90))))),
               bodySize === 'command'
-                ? h('pre', null, spotBusy && spotText === '' ? `${cmd.command}\n\n[读取输出…]` : `${cmd.command}\n\n${spotText}`)
+                ? h('pre', null, spotBusy && spotText === '' ? `${cmd ? cmd.command : '读取命令…'}\n\n[读取输出…]` : `${cmd ? cmd.command : ''}\n\n${spotText}`)
                 : null,
               vul ? h('pre', { className: 'rc2-spotlong' }, [
                 vul.description ? vul.description : '（没有描述）',
@@ -4574,8 +4638,8 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
                 h('span', { className: 'rc2-reltext' }, shortText(other.text || '', 90))))),
               brd && Array.isArray(brd.shots) && brd.shots.length > 0
                 ? h('div', { className: 'rc2-spotmeta' }, brd.shots.map((shot) => h('a', {
-                  key: shot, href: `/recon/asset?p=${encodeURIComponent(shot)}`, target: '_blank', rel: 'noreferrer',
-                }, h('img', { src: `/recon/asset?p=${encodeURIComponent(shot)}`, style: { maxWidth: 320, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1)' } }))))
+                  key: shot, href: apiUrl(`/recon/asset?p=${encodeURIComponent(shot)}`), target: '_blank', rel: 'noreferrer',
+                }, h('img', { src: apiUrl(`/recon/asset?p=${encodeURIComponent(shot)}`), style: { maxWidth: 320, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l1)' } }))))
                 : null)))
       })()
 
@@ -4591,14 +4655,14 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
       h('button', {
         onClick: async () => {
           setMenu(null)
-          await api({ op: 'squad.spawn', role: 'hunter', tier: 'deep', task: `针对节点 ${menuNode.kind}:${menuNode.value}（${menuNode.id}）做一轮漏洞探测，结论写进看板。` })
+          await api({ op: 'squad.spawn', role: 'web', tier: 'deep', task: `针对节点 ${menuNode.kind}:${menuNode.value}（${menuNode.id}）做一轮漏洞探测，结论写进看板。`, engagement: engagement ? engagement.id : undefined })
           void refresh(engagement ? engagement.id : undefined)
         },
       }, '派猎手打这个节点'),
       h('button', {
         onClick: async () => {
           setMenu(null)
-          await api({ op: 'archiveNode', nodeId: menuNode.id, mode: menuNode.archived ? 'restore' : 'archive', reason: '右键归档' })
+          await api({ op: 'archiveNode', nodeId: menuNode.id, mode: menuNode.archived ? 'restore' : 'archive', reason: '右键归档', engagement: engagement ? engagement.id : undefined })
           void refresh(engagement ? engagement.id : undefined)
         },
       }, menuNode.archived ? '恢复节点' : '归档节点'),
@@ -4606,7 +4670,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
         onClick: async () => {
           setMenu(null)
           if (!await uiConfirm(t('confirmDelete'), '节点会连同它的边与漏洞一起删除，不可恢复')) return
-          await api({ op: 'deleteNode', nodeId: menuNode.id })
+          await api({ op: 'deleteNode', nodeId: menuNode.id, engagement: engagement ? engagement.id : undefined })
           setSelection(null)
           void refresh(engagement ? engagement.id : undefined)
         },
@@ -4683,7 +4747,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
         ? h('div', { className: 'rc2-queue' },
           h('div', { className: 'rc2-queuehead', onClick: () => setQueueOpen((v) => !v) },
             h('span', { className: 'rc2-queuebadge' }, `队列 ${chatQueue.length}`),
-            h('span', { className: 'rc2-queuetip' }, chat.busy === true ? '当前轮结束后按顺序发送' : '空闲中，马上发送'),
+            h('span', { className: 'rc2-queuetip' }, targetBusy ? '当前轮结束后按顺序发送' : '空闲中，马上发送'),
             h('span', { className: 'rc2-queuetoggle' }, queueOpen ? '▾' : '▸')),
           queueOpen ? h('div', { className: 'rc2-queuelist' }, chatQueue.map(queueItemRow)) : null)
         : null
@@ -4710,8 +4774,8 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
                 `${member.name}（${roleNameOf(member.role)}${member.status === 'running' ? ' · 在跑' : ''}）`)))
             : null,
           h('optgroup', { label: '按角色对话（不在岗会自动招募）' },
-            roleList.filter((role) => role.id !== 'commander').map((role) => h('option', { key: role.id, value: `role:${role.id}` },
-              roleNameOf(role.id))))) : null,
+            roleList.filter((role) => role.core !== true && role.id !== 'commander' && role.id !== 'staff')
+              .map((role) => h('option', { key: role.id, value: `role:${role.id}` }, roleNameOf(role.id))))) : null,
           dockTab === 'chat' ? h('span', { className: 'rc2-meta' }, chatTarget === 'lead' && chat.busy ? `${t('thinking')}…` : '') : null,
           h('button', {
             className: 'rc2-zoom', style: { opacity: 1 }, title: '放大到中央',
@@ -4728,7 +4792,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
           dockTab === 'squad' ? h('button', {
             className: 'rc2-btn ghost',
             onClick: async () => {
-              await api({ op: 'squad.prune', ttlMs: 0 })
+              await api({ op: 'squad.prune', ttlMs: 0, engagement: engagement ? engagement.id : undefined })
               void refresh(engagement ? engagement.id : undefined)
             },
           }, '回收空闲') : null,
@@ -4752,9 +4816,18 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
       useEffect(() => {
         if (dockTab !== 'brief') return
         setDockHeight((height) => (height >= 430 ? height : 430))
-        setBriefMsgs([{ role: 'bot', text: briefReport }])
         const node = briefRef.current
         if (node !== null) node.scrollTop = 0
+        /* 已经显示过消息就保留当前视图；首次进入时优先恢复服务端历史。 */
+        if (briefMsgs.length > 0) return
+        let cancelled = false
+        void (async () => {
+          const res = await api({ op: 'brief.history', engagement: engagement ? engagement.id : undefined })
+          if (cancelled) return
+          const rows = res && res.ok && Array.isArray(res.messages) ? res.messages : []
+          setBriefMsgs(rows.length > 0 ? rows : [{ id: `brief-report-${Date.now()}`, role: 'bot', text: briefReport }])
+        })()
+        return () => { cancelled = true }
       }, [dockTab, engagement === null ? '' : engagement.id])
 
       useEffect(() => {
@@ -4763,10 +4836,10 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
 
       /* ── 空态 ── */
       if (loading) {
-        return h('div', { className: 'rc2', 'data-accent': accent }, topbar, h('div', { className: 'rc2-center' }, t('loading')))
+        return h('div', { className: rootClass, 'data-accent': accent }, topbar, h('div', { className: 'rc2-center' }, t('loading')))
       }
       if (engagement === null) {
-        return h('div', { className: 'rc2', 'data-accent': accent },
+        return h('div', { className: rootClass, 'data-accent': accent },
           topbar,
           error !== null ? h('div', { className: 'rc2-err' }, error) : null,
           contextMenu,
@@ -4796,7 +4869,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
           }) : null)
       }
 
-      return h('div', { className: 'rc2', 'data-accent': accent },
+      return h('div', { className: rootClass, 'data-accent': accent },
         uiCfg.scanlines !== false ? h('div', { className: 'rc2-scan' }) : null,
         topbar,
         error !== null ? h('div', { className: 'rc2-err' }, error) : null,
@@ -4842,17 +4915,18 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
       const [cfg, setCfg] = useState(null)
       const [keys, setKeys] = useState({})
       const [presence, setPresence] = useState({})
-      const [providers, setProviders] = useState([])
-      const [modelsById, setModelsById] = useState({})
       const [skills, setSkills] = useState([])
       const [mcpStatus, setMcpStatus] = useState(null)
       const [autoCfg, setAutoCfg] = useState(null)
+      const [autoStatus, setAutoStatus] = useState(null)
       const [meetCfg, setMeetCfg] = useState({ stallMinutes: 20, gapMinutes: 20, maxRounds: 3 })
       const [handCfg, setHandCfg] = useState({ enabled: true, timeoutMs: 90000, keepSkill: true })
       const [boardCfg, setBoardCfg] = useState({ limit: 100, mergeCount: 50 })
+      const [traceCfg, setTraceCfg] = useState({ limit: 500 })
+      const [traceMode, setTraceMode] = useState('500')
       const [rolesEdit, setRolesEdit] = useState(null)
-      const [providersList, setProvidersList] = useState([])
-      const [modelsByProvider, setModelsByProvider] = useState({})
+      const [coreEdit, setCoreEdit] = useState(null)
+      const [coreSupported, setCoreSupported] = useState(false)
       const [autoRoles, setAutoRoles] = useState([])
       const [saving, setSaving] = useState(false)
       const [notice, setNotice] = useState('')
@@ -4860,25 +4934,37 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
       useEffect(() => {
         let cancelled = false
         ;(async () => {
-          const [conf, prov, skillRes, mcpRes, autoRes] = await Promise.all([
+          const [conf, skillRes, mcpRes, autoRes] = await Promise.all([
             api({ op: 'config.get' }),
-            api({ op: 'providers' }),
             api({ op: 'skills' }),
             api({ op: 'mcp.list' }),
             api({ op: 'automation.get' }),
           ])
-          if (autoRes && autoRes.ok) { setAutoCfg(autoRes.config); setAutoRoles(autoRes.roles || []) }
+          if (autoRes && autoRes.ok) { setAutoCfg(autoRes.config); setAutoRoles(autoRes.roles || []); setAutoStatus(autoRes.status || null) }
           const roleRes = await api({ op: 'roles.get' })
-          if (roleRes && roleRes.ok) setRolesEdit(roleRes.roles || [])
-          if (prov && prov.ok) { setProvidersList(prov.providers || []); setModelsByProvider(prov.models || {}) }
+          if (roleRes && roleRes.ok) {
+            const supported = Array.isArray(roleRes.core)
+            const rows = roleRes.roles || []
+            const legacyCore = rows.filter((role) => role.id === 'commander' || role.id === 'staff')
+            /* 旧宿主不返回 core：从 roles 里把总指挥/参谋提出来当常设席位显示；
+               保存时再合并回 roles，避免重载前编辑丢失。 */
+            setCoreSupported(supported)
+            setCoreEdit(supported ? roleRes.core : legacyCore)
+            setRolesEdit(supported ? rows.filter((role) => role.id !== 'commander' && role.id !== 'staff') : rows)
+          }
           if (cancelled) return
           if (conf && conf.ok) {
+            if (conf.config) conf.config.memory = normalizeMemoryList(conf.config.memory)
             setCfg(conf.config)
             setPresence(conf.keys || {})
-          }
-          if (prov && prov.ok) {
-            setProviders(prov.providers || [])
-            setModelsById(prov.models || {})
+            if (conf.config && conf.config.meeting) setMeetCfg({ ...{ stallMinutes: 20, gapMinutes: 20, maxRounds: 3 }, ...conf.config.meeting })
+            if (conf.config && conf.config.board) setBoardCfg({ ...{ limit: 100, mergeCount: 50 }, ...conf.config.board })
+            if (conf.config && conf.config.handover) setHandCfg({ ...{ enabled: true, timeoutMs: 90000, keepSkill: true }, ...conf.config.handover })
+            if (conf.config && conf.config.trace) {
+              const limit = [500, 1000, 2000].includes(Number(conf.config.trace.limit)) ? Number(conf.config.trace.limit) : Math.max(100, Math.min(5000, Number(conf.config.trace.limit) || 500))
+              setTraceCfg({ limit })
+              setTraceMode([500, 1000, 2000].includes(limit) ? String(limit) : 'custom')
+            }
           }
           if (skillRes && skillRes.ok) setSkills(skillRes.items || [])
           if (mcpRes && mcpRes.ok) setMcpStatus(mcpRes)
@@ -4903,6 +4989,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
           ...(autoCfg !== null ? { automation: autoCfg } : {}),
           meeting: meetCfg,
           board: boardCfg,
+          trace: traceCfg,
           handover: handCfg,
         }
         const keyPatch = {}
@@ -4910,65 +4997,176 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
           if (typeof value === 'string' && value !== '') keyPatch[field] = value
         }
         if (Object.keys(keyPatch).length > 0) patch.keys = keyPatch
-        if (Array.isArray(rolesEdit)) await api({ op: 'roles.set', roles: rolesEdit })
+        if (Array.isArray(rolesEdit)) {
+          const core = Array.isArray(coreEdit) ? coreEdit : []
+          const coreIds = new Set(core.map((role) => role.id))
+          const payloadRoles = coreSupported
+            ? rolesEdit
+            : [...core, ...rolesEdit.filter((role) => !coreIds.has(role.id))]
+          await api({
+            op: 'roles.set',
+            roles: payloadRoles,
+            ...(coreSupported && Array.isArray(coreEdit) ? { core: coreEdit } : {}),
+          })
+        }
         const res = await api({ op: 'config.set', patch })
         setSaving(false)
         if (res && res.ok) {
           setNotice(t('saved'))
           setKeys({})
-          const [conf, mcpRes] = await Promise.all([api({ op: 'config.get' }), api({ op: 'mcp.list' })])
+          const [conf, mcpRes, autoRes2] = await Promise.all([api({ op: 'config.get' }), api({ op: 'mcp.list' }), api({ op: 'automation.get' })])
           if (conf && conf.ok) {
+            if (conf.config) conf.config.memory = normalizeMemoryList(conf.config.memory)
             setCfg(conf.config)
             setPresence(conf.keys || {})
             if (conf.config && conf.config.meeting) setMeetCfg({ ...{ stallMinutes: 20, gapMinutes: 20, maxRounds: 3 }, ...conf.config.meeting })
             if (conf.config && conf.config.board) setBoardCfg({ ...{ limit: 100, mergeCount: 50 }, ...conf.config.board })
+            if (conf.config && conf.config.trace) {
+              const limit = [500, 1000, 2000].includes(Number(conf.config.trace.limit)) ? Number(conf.config.trace.limit) : Math.max(100, Math.min(5000, Number(conf.config.trace.limit) || 500))
+              setTraceCfg({ limit })
+              setTraceMode([500, 1000, 2000].includes(limit) ? String(limit) : 'custom')
+            }
             if (conf.config && conf.config.handover) setHandCfg({ ...{ enabled: true, timeoutMs: 90000, keepSkill: true }, ...conf.config.handover })
           }
           if (mcpRes && mcpRes.ok) setMcpStatus(mcpRes)
+          if (autoRes2 && autoRes2.ok) { setAutoCfg(autoRes2.config); setAutoRoles(autoRes2.roles || []); setAutoStatus(autoRes2.status || null) }
           props.onSaved && props.onSaved()
         } else {
           setNotice(res && res.error ? res.error : t('errorLabel'))
         }
-      }, [autoCfg, cfg, keys, props, rolesEdit, t])
+      }, [autoCfg, boardCfg, cfg, coreEdit, coreSupported, handCfg, keys, meetCfg, props, rolesEdit, t, traceCfg])
 
       const body = (() => {
         if (cfg === null) return h('div', { className: 'rc2-center' }, t('loading'))
 
         if (tab === 'models') {
+          const customRows = cfg.models && Array.isArray(cfg.models.custom) ? cfg.models.custom : []
+          const tierChoices = customRows
+            .filter((row) => asTextLike(row.model) !== '')
+            .map((row) => ({
+              value: JSON.stringify([row.provider, row.model]),
+              label: row.name || row.model,
+              provider: row.provider,
+              model: row.model,
+              reasoning: row.reasoning || '',
+            }))
+          const updateCustom = (index, path, value) => {
+            const current = customRows[index]
+            const next = customRows.map((row, rowIndex) => (rowIndex === index ? { ...row, [path]: value } : row))
+            let nextCfg = setIn(cfg, 'models.custom', next)
+            /* 改模型 id / 默认思考深度时，同步引用这个 provider 的档位，避免档位指向旧 model */
+            if (path === 'model' || path === 'reasoning') {
+              for (const tier of TIERS) {
+                const row = (cfg.models && cfg.models[tier]) || {}
+                if (row.provider === current.provider) nextCfg = setIn(nextCfg, `models.${tier}.${path}`, value)
+              }
+            }
+            setCfg(nextCfg)
+          }
+          const addCustom = () => {
+            const id = `cm_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`
+            const row = {
+              id,
+              name: `模型 ${id.slice(-4)}`,
+              provider: `venery-${id}`,
+              keyRef: `VENERY_MODEL_${id.replace(/[^a-z0-9]/g, '_').toUpperCase()}`,
+              baseUrl: '',
+              model: '',
+              reasoning: 'medium',
+              protocol: 'openai-completions',
+              apiKey: '',
+              hasKey: false,
+              createdAt: new Date().toISOString(),
+            }
+            setCfg(setIn(cfg, 'models.custom', [...customRows, row]))
+          }
+          const removeCustom = (index) => {
+            const removed = customRows[index]
+            let next = setIn(cfg, 'models.custom', customRows.filter((_, rowIndex) => rowIndex !== index))
+            for (const tier of TIERS) {
+              const row = (cfg.models && cfg.models[tier]) || {}
+              if (row.provider === removed.provider) {
+                next = setIn(setIn(setIn(next, `models.${tier}.provider`, ''), `models.${tier}.model`, ''), `models.${tier}.reasoning`, '')
+              }
+            }
+            setCfg(next)
+          }
           return h('div', null,
             h('div', { className: 'rc2-note' }, t('modelHint')),
             TIERS.map((tier) => {
               const row = (cfg.models && cfg.models[tier]) || { provider: '', model: '', reasoning: '' }
-              const providerModels = modelsById[row.provider] || []
-              return h('div', { key: tier, className: 'rc2-grid3', style: { marginBottom: 12 } },
-                h('div', { className: 'rc2-field' },
-                  h('label', null, `${t('tier')} · ${tier}`),
-                  h('select', {
-                    value: row.provider,
-                    onChange: (event) => {
-                      setCfg(setIn(setIn(cfg, `models.${tier}.provider`, event.target.value), `models.${tier}.model`, ''))
-                    },
+              const currentValue = row.provider && row.model ? JSON.stringify([row.provider, row.model]) : ''
+              const currentKnown = tierChoices.some((item) => item.value === currentValue)
+              return h('div', { key: tier, className: 'rc2-field', style: { marginBottom: 12 } },
+                h('label', null, `${t('model')} · ${TIER_LABEL[tier]}`),
+                h('select', {
+                  value: currentValue,
+                  onChange: (event) => {
+                    if (event.target.value === '') {
+                      setCfg(setIn(setIn(setIn(cfg, `models.${tier}.provider`, ''), `models.${tier}.model`, ''), `models.${tier}.reasoning`, ''))
+                      return
+                    }
+                    let picked
+                    try { picked = JSON.parse(event.target.value) } catch { return }
+                    const provider = asTextLike(picked[0])
+                    const model = asTextLike(picked[1])
+                    const choice = tierChoices.find((item) => item.provider === provider && item.model === model)
+                    let next = setIn(setIn(cfg, `models.${tier}.provider`, provider), `models.${tier}.model`, model)
+                    next = setIn(next, `models.${tier}.reasoning`, choice !== undefined ? (choice.reasoning || '') : '')
+                    setCfg(next)
                   },
-                  h('option', { value: '' }, '—'),
-                  providers.map((p) => h('option', { key: p.id, value: p.id }, p.name || p.id)))),
-                h('div', { className: 'rc2-field' },
-                  h('label', null, t('model')),
-                  h('select', {
-                    value: row.model,
-                    onChange: (event) => setCfg(setIn(cfg, `models.${tier}.model`, event.target.value)),
-                  },
-                  h('option', { value: '' }, '—'),
-                  providerModels.map((m) => h('option', { key: m.id, value: m.id }, m.name || m.id)),
-                  row.model !== '' && !providerModels.some((m) => m.id === row.model)
-                    ? h('option', { value: row.model }, row.model) : null)),
-                h('div', { className: 'rc2-field' },
-                  h('label', null, 'reasoning'),
-                  h('input', {
-                    value: row.reasoning || '',
-                    placeholder: 'low / medium / high',
-                    onChange: (event) => setCfg(setIn(cfg, `models.${tier}.reasoning`, event.target.value)),
-                  })))
-            }))
+                },
+                h('option', { value: '' }, '— 跟随 DSH（不单独配置）'),
+                ...tierChoices.map((item) => h('option', { key: item.value, value: item.value }, item.label)),
+                currentValue !== '' && !currentKnown
+                  ? h('option', { value: currentValue }, `${row.model} · ${row.provider}`) : null))
+            }),
+            h('div', { className: 'rc2-sect' }, t('customModels')),
+            h('div', { className: 'rc2-note' }, t('customModelsHint')),
+            customRows.map((row, index) => h('div', {
+              key: row.id,
+              style: { border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 6, padding: 8, marginBottom: 8 },
+            },
+            h('div', { className: 'rc2-grid3' },
+              h('div', { className: 'rc2-field' }, h('label', null, '名称'),
+                h('input', { value: row.name || '', onChange: (event) => updateCustom(index, 'name', event.target.value) })),
+              h('div', { className: 'rc2-field' }, h('label', null, t('baseUrl')),
+                h('input', {
+                  value: row.baseUrl || '',
+                  placeholder: 'https://api.example.com/v1',
+                  onChange: (event) => updateCustom(index, 'baseUrl', event.target.value),
+                })),
+              h('div', { className: 'rc2-field' }, h('label', null, t('modelId')),
+                h('input', {
+                  value: row.model || '',
+                  placeholder: 'gpt-4o-mini',
+                  onChange: (event) => updateCustom(index, 'model', event.target.value),
+                }))),
+            h('div', { className: 'rc2-grid3' },
+              h('div', { className: 'rc2-field' }, h('label', null, t('protocol')),
+                h('select', {
+                  value: MODEL_PROTOCOLS.some((item) => item.id === row.protocol) ? row.protocol : 'openai-completions',
+                  onChange: (event) => updateCustom(index, 'protocol', event.target.value),
+                }, MODEL_PROTOCOLS.map((item) => h('option', { key: item.id, value: item.id }, item.label)))),
+              h('div', { className: 'rc2-field' }, h('label', null, t('apiKey')),
+                h('input', {
+                  type: 'password',
+                  value: row.apiKey || '',
+                  placeholder: row.hasKey ? t('savedKey') : t('needKey'),
+                  onChange: (event) => updateCustom(index, 'apiKey', event.target.value),
+                })),
+              h('div', { className: 'rc2-field' }, h('label', null, t('thinkingDepth')),
+                h('select', {
+                  value: THINKING_LEVELS.includes(row.reasoning) ? row.reasoning : 'medium',
+                  onChange: (event) => updateCustom(index, 'reasoning', event.target.value),
+                }, THINKING_LEVELS.map((level) => h('option', { key: level, value: level }, THINKING_LABEL[level]))))),
+            h('div', { className: 'rc2-row' },
+              h('span', { className: 'rc2-meta' }, `${t('route')}: ${row.provider || '—'}`),
+              h('span', { className: 'rc2-meta' }, row.hasKey ? t('keySaved') : t('keyMissing')),
+              h('span', { className: 'rc2-spacer' }),
+              h('button', { className: 'rc2-btn danger', onClick: () => removeCustom(index) }, t('remove'))))),
+            h('div', { className: 'rc2-row' },
+              h('button', { className: 'rc2-btn on', onClick: addCustom }, t('addModel'))))
         }
 
         if (tab === 'keys') {
@@ -4990,6 +5188,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
                     onClick: async () => {
                       await api({ op: 'config.set', patch: { keys: { [field]: '' } } })
                       setPresence((prev) => ({ ...prev, [field]: false }))
+                      setKeys((prev) => { const next = { ...prev }; delete next[field]; return next })
                     },
                   }, '⌫'))))),
             h('div', { className: 'rc2-field' },
@@ -4998,22 +5197,6 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
                 value: Array.isArray(cfg.env) ? cfg.env.join('\n') : String(cfg.env || ''),
                 onChange: (event) => setCfg(setIn(cfg, 'env', event.target.value)),
               })))
-        }
-
-        if (tab === 'role') {
-          return h('div', null,
-            h('div', { className: 'rc2-field' },
-              h('label', null, t('roleName')),
-              h('input', { value: (cfg.role && cfg.role.name) || '', onChange: (event) => setCfg(setIn(cfg, 'role.name', event.target.value)) })),
-            h('div', { className: 'rc2-field' },
-              h('label', null, t('mission')),
-              h('textarea', { value: (cfg.role && cfg.role.mission) || '', onChange: (event) => setCfg(setIn(cfg, 'role.mission', event.target.value)) })),
-            h('div', { className: 'rc2-field' },
-              h('label', null, t('rules')),
-              h('textarea', { style: { minHeight: 96 }, value: (cfg.role && cfg.role.rules) || '', onChange: (event) => setCfg(setIn(cfg, 'role.rules', event.target.value)) })),
-            h('div', { className: 'rc2-field' },
-              h('label', null, t('extraPrompt')),
-              h('textarea', { style: { minHeight: 96 }, value: (cfg.prompt && cfg.prompt.extra) || '', onChange: (event) => setCfg(setIn(cfg, 'prompt.extra', event.target.value)) })))
         }
 
         if (tab === 'memory') {
@@ -5114,40 +5297,16 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
               h('div', { className: 'rc2-pre' }, JSON.stringify(mcpStatus.servers || mcpStatus.bindings || mcpStatus, null, 2))) : null)
         }
 
-      /* MCP 文本 <-> 数组：一行一个 name = 命令 或 name = url */
-      const mcpTextOf = (role) => (Array.isArray(role.mcp) ? role.mcp : []).map((row) => {
-        const name = row.name || 'server'
-        if ((row.transport || '') === 'streamable-http' || (row.url || '') !== '') return `${name} = ${row.url || ''}`
-        return `${name} = ${[row.command || '', ...(Array.isArray(row.args) ? row.args : [])].join(' ').trim()}`
-      }).join('\n')
-      const parseMcpText = (text) => {
-        const rows = []
-        for (const line of String(text || '').split('\n')) {
-          const trimmed = line.trim()
-          if (trimmed === '') continue
-          const eq = trimmed.indexOf('=')
-          if (eq <= 0) continue
-          const name = trimmed.slice(0, eq).trim()
-          const rest = trimmed.slice(eq + 1).trim()
-          if (name === '' || rest === '') continue
-          if (/^https?:\/\//i.test(rest)) rows.push({ name, transport: 'streamable-http', url: rest, enabled: true })
-          else {
-            const parts = rest.split(/\s+/)
-            rows.push({ name, transport: 'stdio', command: parts[0], args: parts.slice(1), enabled: true })
-          }
-        }
-        return rows
-      }
+      /* MCP 文本 <-> 数组：一行一个 name = 命令/URL，复杂配置可写成 JSON。 */
+      const mcpTextOf = (role) => (Array.isArray(role.mcp) ? role.mcp : []).map(mcpLineOf).join('\n')
+      const parseMcpText = parseMcpLines
 
         if (tab === 'roles') {
           if (rolesEdit === null) return h('div', { className: 'rc2-center' }, t('loading'))
           const update = (index, path, value) => {
             const next = rolesEdit.slice()
             const row = { ...next[index] }
-            if (path === 'model.provider' || path === 'model.model' || path === 'model.reasoning') {
-              const key = path.split('.')[1]
-              row.model = { ...(row.model || { provider: '', model: '', reasoning: '' }), [key]: value }
-            } else if (path === 'skills') {
+            if (path === 'skills') {
               row.skills = String(value).split(',').map((x) => x.trim()).filter(Boolean)
             } else {
               row[path] = value
@@ -5155,8 +5314,69 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
             next[index] = row
             setRolesEdit(next)
           }
+          const updateCore = (index, path, value) => {
+            const next = (coreEdit || []).slice()
+            const row = { ...next[index] }
+            if (path === 'skills') {
+              row.skills = String(value).split(',').map((x) => x.trim()).filter(Boolean)
+            } else {
+              row[path] = value
+            }
+            next[index] = row
+            setCoreEdit(next)
+          }
+          const coreCard = (role, index) => h('div', {
+            key: role.id,
+            style: { border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 6, padding: 8, marginBottom: 8 },
+          },
+          h('div', { className: 'rc2-line' },
+            h('span', { className: 'rc2-kind' }, role.id === 'commander' ? '总指挥' : '参谋'),
+            h('span', { className: 'rc2-meta' }, '常设席位 · 每靶标各一个 · 不可召唤/回收'),
+            h('span', { className: 'rc2-spacer' }),
+            h('span', { className: 'rc2-meta' }, role.id === 'commander' ? '最高指挥' : '向总指挥汇报')),
+          h('div', { className: 'rc2-grid3' },
+            h('div', { className: 'rc2-field' }, h('label', null, 'ID'),
+              h('input', { value: role.id, readOnly: true, style: { opacity: 0.7 } })),
+            h('div', { className: 'rc2-field' }, h('label', null, '名称'),
+              h('input', { value: role.name || '', onChange: (e) => updateCore(index, 'name', e.target.value) })),
+            h('div', { className: 'rc2-field' }, h('label', null, t('ruleTier')),
+              h('select', { value: role.tier || 'dsh', onChange: (e) => updateCore(index, 'tier', e.target.value) },
+                MODEL_CHOICES.map((tier) => h('option', { key: tier, value: tier }, TIER_LABEL[tier]))))),
+          h('div', { className: 'rc2-field' }, h('label', null, '技能（逗号分隔）'),
+            h('input', { value: (role.skills || []).join(', '), placeholder: 'nuclei-scan, web-fingerprint', onChange: (e) => updateCore(index, 'skills', e.target.value) })),
+          h('div', { className: 'rc2-field' }, h('label', null, '提示词'),
+            h('textarea', { style: { minHeight: 84 }, value: role.prompt || '', onChange: (e) => updateCore(index, 'prompt', e.target.value) })),
+          h('div', { className: 'rc2-field' }, h('label', null, '专属 MCP（一行一个：name = command args 或 name = https://host/mcp；留空=只用本机命令）'),
+            h('textarea', {
+              style: { minHeight: 54, fontFamily: 'var(--dsw-font-mono, monospace)', fontSize: 11 },
+              value: mcpTextOf(role),
+              placeholder: 'nuclei-mcp = python3 /opt/mcp/nuclei_server.py',
+              onChange: (e) => updateCore(index, 'mcp', parseMcpText(e.target.value)),
+            })))
+          const memberRows = rolesEdit.map((role, index) => ({ role, index }))
+            .filter(({ role }) => role.id !== 'commander' && role.id !== 'staff')
+          const reportTargetsOf = (role) => [...(Array.isArray(coreEdit) ? coreEdit : []), ...rolesEdit]
+            .filter((row) => row.id !== role.id)
           return h('div', null,
             h('div', { className: 'rc2-note' }, t('rolesHint')),
+            h('div', { className: 'rc2-sect' }, t('commonPrompt')),
+            h('div', { className: 'rc2-note' }, t('commonHint')),
+            h('div', { className: 'rc2-field' },
+              h('textarea', {
+                style: { minHeight: 96 },
+                value: (cfg.prompt && cfg.prompt.common) || '',
+                placeholder: t('commonPlaceholder'),
+                onChange: (event) => setCfg(setIn(cfg, 'prompt.common', event.target.value)),
+              })),
+            h('div', { className: 'rc2-sect' }, t('coreSeats')),
+            h('div', { className: 'rc2-note' }, t('coreSeatsHint')),
+            Array.isArray(coreEdit) && coreEdit.length > 0
+              ? coreEdit.map(coreCard)
+              : h('div', { className: 'rc2-note' }, '没有读到常设席位配置：重载插件后会恢复内置总指挥/参谋。'),
+            coreSupported
+              ? null
+              : h('div', { className: 'rc2-note' }, '宿主插件尚未重载：这里的修改会先写回旧的角色配置，重载后自动迁移到常设席位。'),
+            h('div', { className: 'rc2-sect' }, t('squadRoles')),
             h('div', { className: 'rc2-row' },
               h('button', {
                 className: 'rc2-btn on',
@@ -5165,7 +5385,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
                   reportsTo: 'commander', prompt: '', skills: [], model: null,
                 }]),
               }, t('add'))),
-            rolesEdit.map((role, index) => h('div', {
+            memberRows.map(({ role, index }) => h('div', {
               key: role.id,
               style: { border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 6, padding: 8, marginBottom: 8 },
             },
@@ -5175,25 +5395,8 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
               h('div', { className: 'rc2-field' }, h('label', null, '名称'),
                 h('input', { value: role.name || '', onChange: (e) => update(index, 'name', e.target.value) })),
               h('div', { className: 'rc2-field' }, h('label', null, t('ruleTier')),
-                h('select', { value: role.tier || 'deep', onChange: (e) => update(index, 'tier', e.target.value) },
-                  TIERS.map((tier) => h('option', { key: tier, value: tier }, tier))))),
-            h('div', { className: 'rc2-grid3' },
-              h('div', { className: 'rc2-field' }, h('label', null, 'provider'),
-                h('select', {
-                  value: (role.model && role.model.provider) || '',
-                  onChange: (e) => update(index, 'model.provider', e.target.value),
-                },
-                h('option', { value: '' }, '— 跟随档位 —'),
-                providersList.map((p) => h('option', { key: p.id, value: p.id }, p.name || p.id)))),
-              h('div', { className: 'rc2-field' }, h('label', null, 'model'),
-                h('select', {
-                  value: (role.model && role.model.model) || '',
-                  onChange: (e) => update(index, 'model.model', e.target.value),
-                },
-                h('option', { value: '' }, '—'),
-                ((role.model && modelsByProvider[role.model.provider]) || []).map((m) => h('option', { key: m.id, value: m.id }, m.name || m.id)))),
-              h('div', { className: 'rc2-field' }, h('label', null, 'reasoning'),
-                h('input', { value: (role.model && role.model.reasoning) || '', placeholder: 'low / medium / high', onChange: (e) => update(index, 'model.reasoning', e.target.value) }))),
+                h('select', { value: role.tier || 'dsh', onChange: (e) => update(index, 'tier', e.target.value) },
+                  MODEL_CHOICES.map((tier) => h('option', { key: tier, value: tier }, TIER_LABEL[tier]))))),
             h('div', { className: 'rc2-field' }, h('label', null, '技能（逗号分隔）'),
               h('input', { value: (role.skills || []).join(', '), placeholder: 'nuclei-scan, web-fingerprint', onChange: (e) => update(index, 'skills', e.target.value) })),
             h('div', { className: 'rc2-field' }, h('label', null, '提示词'),
@@ -5213,7 +5416,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
                 onChange: (e) => update(index, 'reportsTo', e.target.value || null),
               },
               h('option', { value: '' }, '— 无（最高）'),
-              rolesEdit.filter((x) => x.id !== role.id).map((x) => h('option', { key: x.id, value: x.id }, x.name || x.id))),
+              reportTargetsOf(role).map((x) => h('option', { key: x.id, value: x.id }, x.name || x.id))),
               h('span', { className: 'rc2-spacer' }),
               h('button', {
                 className: 'rc2-btn danger',
@@ -5225,6 +5428,38 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
           const num = (value, fallback) => (Number.isFinite(Number(value)) ? Number(value) : fallback)
           return h('div', null,
             h('div', { className: 'rc2-note' }, t('meetingHint')),
+            h('div', { className: 'rc2-field', style: { marginTop: 4 } }, h('label', null, '轨迹最高显示数量'),
+              h('div', { className: 'rc2-row rc2-boardcfg-row' },
+                h('select', {
+                  className: 'rc2-select rc2-boardcfg-select',
+                  value: traceMode,
+                  onChange: (e) => {
+                    const mode = e.target.value
+                    setTraceMode(mode)
+                    if (mode !== 'custom') {
+                      const limit = Number(mode) || 500
+                      setTraceCfg({ limit })
+                      try { window.localStorage.setItem('rc2.traceLimit', String(limit)) } catch { /* 忽略 */ }
+                    }
+                  },
+                },
+                h('option', { value: '500' }, '500 条'),
+                h('option', { value: '1000' }, '1000 条'),
+                h('option', { value: '2000' }, '2000 条'),
+                h('option', { value: 'custom' }, '自定义')),
+                traceMode === 'custom'
+                  ? h('input', {
+                    type: 'number', min: 100, max: 5000, step: 100,
+                    style: { width: 120 },
+                    value: num(traceCfg.limit, 500),
+                    onChange: (e) => {
+                      const limit = Math.max(100, Math.min(5000, Number(e.target.value) || 500))
+                      setTraceCfg({ limit })
+                      try { window.localStorage.setItem('rc2.traceLimit', String(limit)) } catch { /* 忽略 */ }
+                    },
+                  })
+                  : null,
+                h('span', { className: 'rc2-meta' }, `当前：最多显示 ${num(traceCfg.limit, 500)} 条轨迹`))),
             h('div', { className: 'rc2-grid3' },
               h('div', { className: 'rc2-field' }, h('label', null, t('meetingStall')),
                 h('select', {
@@ -5242,9 +5477,9 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
                   onChange: (e) => setMeetCfg({ ...meetCfg, maxRounds: Number(e.target.value) || 3 }),
                 }))),
             h('div', { className: 'rc2-field', style: { marginTop: 12 } }, h('label', null, '看板：保留上限 / 触顶后合并条数'),
-              h('div', { className: 'rc2-row' },
+              h('div', { className: 'rc2-row rc2-boardcfg-row' },
                 h('select', {
-                  className: 'rc2-select', style: { maxWidth: 120 },
+                  className: 'rc2-select rc2-boardcfg-select',
                   value: String(boardCfg.limit || 100),
                   onChange: (e) => {
                     const limit = Number(e.target.value) || 100
@@ -5252,7 +5487,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
                   },
                 }, ['50', '100', '200'].map((v) => h('option', { key: v, value: v }, `${v} 条`))),
                 h('select', {
-                  className: 'rc2-select', style: { maxWidth: 150 },
+                  className: 'rc2-select rc2-boardcfg-select rc2-boardcfg-select-wide',
                   value: String(Math.min(boardCfg.mergeCount || 50, Math.max(10, Math.floor((boardCfg.limit || 100) / 2)))),
                   onChange: (e) => setBoardCfg({ ...boardCfg, mergeCount: Number(e.target.value) || 50 }),
                 }, ['25', '50', '100'].filter((v) => Number(v) <= Math.max(10, Math.floor((boardCfg.limit || 100) / 2)))
@@ -5270,10 +5505,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
                   onChange: (e) => setHandCfg({ ...handCfg, timeoutMs: (Number(e.target.value) || 90) * 1000 }),
                 })),
               h('div', { className: 'rc2-field' }, h('label', null, t('handoverSkill')),
-                h('select', {
-                  value: handCfg.keepSkill === false ? 'no' : 'yes',
-                  onChange: (e) => setHandCfg({ ...handCfg, keepSkill: e.target.value === 'yes' }),
-                }, h('option', { value: 'yes' }, '写入'), h('option', { value: 'no' }, '不写'))))) 
+                h('span', { className: 'rc2-meta', style: { paddingTop: 7 } }, '只写看板，不写记忆')))) 
         }
 
         if (tab === 'automation') {
@@ -5281,12 +5513,27 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
           const rules = Array.isArray(autoCfg.rules) ? autoCfg.rules : []
           return h('div', null,
             h('div', { className: 'rc2-note' }, t('automationHint')),
-            h('div', { className: 'rc2-grid3' },
-              h('div', { className: 'rc2-field' }, h('label', null, t('automationEnabled')),
-                h('select', { value: autoCfg.enabled === false ? 'no' : 'yes', onChange: (e) => setAutoCfg({ ...autoCfg, enabled: e.target.value === 'yes' }) },
-                  h('option', { value: 'yes' }, 'yes'), h('option', { value: 'no' }, 'no'))),
+            autoStatus !== null && autoStatus !== undefined
+              ? h('div', { className: 'rc2-note' }, `自动化队列 ${autoStatus.queued || 0} · 运行 ${autoStatus.runningAutomation || 0}/${autoStatus.maxAutomationAgents || 3}`)
+              : null,
+            h('div', { className: 'rc2-grid2' },
               h('div', { className: 'rc2-field' }, h('label', null, t('maxAgents')),
-                h('input', { type: 'number', value: autoCfg.maxAgents || 3, onChange: (e) => setAutoCfg({ ...autoCfg, maxAgents: Number(e.target.value) || 1 }) }))),
+                h('input', {
+                  type: 'number', min: 1, max: 50, value: autoCfg.maxAgents || 8,
+                  onChange: (e) => setAutoCfg({ ...autoCfg, maxAgents: Math.max(1, Math.min(50, Number(e.target.value) || 1)) }),
+                })),
+              h('div', { className: 'rc2-field' }, h('label', null, t('maxAutomationAgents')),
+                h('input', {
+                  type: 'number', min: 1, max: 50, value: autoCfg.maxAutomationAgents || 3,
+                  title: '自动化自己的独立并发上限；超出的触发任务会排队',
+                  onChange: (e) => setAutoCfg({ ...autoCfg, maxAutomationAgents: Math.max(1, Math.min(50, Number(e.target.value) || 3)) }),
+                }))),
+            h('div', { className: 'rc2-field' }, h('label', null, t('automationEnabled')),
+              h('select', {
+                value: autoCfg.enabled === false ? 'no' : 'yes',
+                onChange: (e) => setAutoCfg({ ...autoCfg, enabled: e.target.value === 'yes' }),
+              }, h('option', { value: 'yes' }, '开启'), h('option', { value: 'no' }, '关闭'))),
+            h('div', { className: 'rc2-sect' }, t('automationRules')),
             h('div', { className: 'rc2-row', style: { flexWrap: 'wrap' } },
               h('button', {
                 className: 'rc2-btn on',
@@ -5345,7 +5592,10 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
                 h('input', { value: rule.id || '', onChange: (e) => setAutoCfg(setIn(autoCfg, `rules.${index}.id`, e.target.value)) })),
               h('div', { className: 'rc2-field' }, h('label', null, t('ruleOn')),
                 h('select', { value: rule.on || 'node.created', onChange: (e) => setAutoCfg(setIn(autoCfg, `rules.${index}.on`, e.target.value)) },
-                  h('option', { value: 'node.created' }, 'node.created'), h('option', { value: 'vuln.created' }, 'vuln.created'))),
+                  h('option', { value: 'node.created' }, 'node.created'),
+                  h('option', { value: 'vuln.created' }, 'vuln.created'),
+                  h('option', { value: 'command.finished' }, 'command.finished'),
+                  h('option', { value: 'interval' }, 'interval'))),
               h('div', { className: 'rc2-field' }, h('label', null, 'enabled'),
                 h('select', { value: rule.enabled === false ? 'no' : 'yes', onChange: (e) => setAutoCfg(setIn(autoCfg, `rules.${index}.enabled`, e.target.value === 'yes')) },
                   h('option', { value: 'yes' }, 'yes'), h('option', { value: 'no' }, 'no')))),
@@ -5353,13 +5603,13 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
               h('div', { className: 'rc2-field' }, h('label', null, t('ruleRole')),
                 h('select', { value: rule.role || 'hunter', onChange: (e) => setAutoCfg(setIn(autoCfg, `rules.${index}.role`, e.target.value)) },
                   (autoRoles.length > 0 ? autoRoles : [
-                    { id: 'commander', name: '总指挥' }, { id: 'staff', name: '参谋' }, { id: 'scout', name: '信息收集' },
-                    { id: 'web', name: 'Web 手' }, { id: 'reverser', name: '逆向手' }, { id: 'intranet', name: '内网手' },
-                    { id: 'qa', name: '验收' },
-                  ]).map((role) => h('option', { key: role.id, value: role.id }, `${role.name}（${role.id}）`)))),
+                    { id: 'scout', name: '信息收集' }, { id: 'web', name: 'Web 手' }, { id: 'reverser', name: '逆向手' },
+                    { id: 'intranet', name: '内网手' }, { id: 'qa', name: '验收' },
+                  ]).filter((role) => role.core !== true && role.id !== 'commander' && role.id !== 'staff')
+                    .map((role) => h('option', { key: role.id, value: role.id }, `${role.name}（${role.id}）`)))),
               h('div', { className: 'rc2-field' }, h('label', null, t('ruleTier')),
                 h('select', { value: rule.tier || 'deep', onChange: (e) => setAutoCfg(setIn(autoCfg, `rules.${index}.tier`, e.target.value)) },
-                  TIERS.map((tier) => h('option', { key: tier, value: tier }, tier)))),
+                  MODEL_CHOICES.map((tier) => h('option', { key: tier, value: tier }, TIER_LABEL[tier])))),
               h('div', { className: 'rc2-field' }, h('label', null, rule.on === 'interval' ? 'everyMs' : t('ruleCooldown')),
                 h('input', {
                   type: 'number',
@@ -5371,6 +5621,12 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
                 value: Array.isArray(rule.whenKinds) ? rule.whenKinds.join(', ') : '',
                 placeholder: 'subdomain, ip, url',
                 onChange: (e) => setAutoCfg(setIn(autoCfg, `rules.${index}.whenKinds`, e.target.value.split(',').map((s2) => s2.trim()).filter(Boolean))),
+              })),
+            h('div', { className: 'rc2-field' }, h('label', null, '漏洞等级（逗号分隔）'),
+              h('input', {
+                value: Array.isArray(rule.whenSeverity) ? rule.whenSeverity.join(', ') : '',
+                placeholder: 'critical, high, medium',
+                onChange: (e) => setAutoCfg(setIn(autoCfg, `rules.${index}.whenSeverity`, e.target.value.split(',').map((s2) => s2.trim()).filter(Boolean))),
               })),
             h('div', { className: 'rc2-field' }, h('label', null, t('ruleTask')),
               h('textarea', {
@@ -5407,8 +5663,8 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
             h('button', { className: 'rc2-btn on', onClick: () => void save(), disabled: saving }, saving ? t('saving') : t('save')),
             h('button', { className: 'rc2-btn ghost', onClick: props.onClose }, '✕')),
           h('div', { className: 'rc2-tabs' },
-            [['models', 'tabModels'], ['keys', 'tabKeys'], ['role', 'tabRole'], ['memory', 'tabMemory'],
-              ['skills', 'tabSkills'], ['roles', 'tabRoles'], ['mcp', 'tabMcp'], ['automation', 'tabAutomation'],
+            [['models', 'tabModels'], ['keys', 'tabKeys'], ['roles', 'tabRole'], ['memory', 'tabMemory'],
+              ['skills', 'tabSkills'], ['mcp', 'tabMcp'], ['automation', 'tabAutomation'],
               ['meeting', 'tabMeeting'], ['ui', 'tabUi']].map(([key, labelKey]) => h('button', {
               key, className: `rc2-tab${tab === key ? ' on' : ''}`, onClick: () => setTab(key),
             }, t(labelKey)))),

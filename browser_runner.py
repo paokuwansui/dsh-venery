@@ -101,6 +101,8 @@ def main():
             return data
 
         try:
+            if action == "goto" and not url:
+                raise RuntimeError("goto 需要 url")
             if url:
                 page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
 
@@ -167,7 +169,12 @@ def main():
             elif action == "text":
                 if selector:
                     result["text"] = page.inner_text(selector)[:max_chars]
-                    result["value"] = page.input_value(selector) if page.query_selector(selector) else ""
+                    try:
+                        tag = page.eval_on_selector(selector, "e => e.tagName.toLowerCase()")
+                        if tag in ("input", "textarea", "select"):
+                            result["value"] = page.input_value(selector)
+                    except Exception:
+                        result["value"] = ""
                 result.update(snapshot())
             elif action == "html":
                 result["html"] = page.content()[: max_chars * 6]
@@ -221,6 +228,17 @@ def main():
                 pass
             traceback.print_exc(file=sys.stderr)
         finally:
+            # 登录成功后即使后续动作失败，也尽量把 storageState 落盘。
+            if state_path:
+                try:
+                    os.makedirs(os.path.dirname(state_path), exist_ok=True)
+                    context.storage_state(path=state_path)
+                    try:
+                        os.chmod(state_path, 0o600)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
             try:
                 context.close()
             except Exception:
@@ -230,7 +248,18 @@ def main():
             except Exception:
                 pass
 
-    sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
+    try:
+        sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
+    except Exception as error:
+        fallback = {
+            "ok": False,
+            "action": action,
+            "url": url,
+            "title": "",
+            "shot": result.get("shot") if isinstance(result, dict) else None,
+            "error": f"result serialization failed: {type(error).__name__}: {error}",
+        }
+        sys.stdout.write(json.dumps(fallback, ensure_ascii=False) + "\n")
 
 
 if __name__ == "__main__":

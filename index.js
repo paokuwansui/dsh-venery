@@ -21,7 +21,7 @@
  * 因此事实库必须是进程级单例，不能放进 preset。
  */
 import { spawn } from 'node:child_process'
-import { mkdir, readFile, writeFile, appendFile, readdir, rename, stat, unlink, rm } from 'node:fs/promises'
+import { mkdir, readFile, writeFile, appendFile, readdir, rename, stat, unlink, rm, chmod } from 'node:fs/promises'
 import { readFileSync, existsSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -51,6 +51,7 @@ export const EDGE_TYPES = [
 
 const SEVERITIES = ['critical', 'high', 'medium', 'low', 'info']
 const VULN_STATUSES = ['open', 'verified', 'false-positive', 'fixed']
+const TASK_STATUSES = ['open', 'doing', 'passed', 'failed', 'blocked']
 
 /** 密钥字段 → 注入给 shell 的环境变量（recon_run 与驾驶舱命令都能直接读到）。 */
 const KEY_ENV = {
@@ -71,6 +72,13 @@ const KEY_ENV = {
 }
 
 const MODEL_TIERS = ['deep', 'fast', 'vision']
+/** 角色/队员可选的模型档位：三档 + 跟随 DSH。 */
+const MODEL_CHOICES = [...MODEL_TIERS, 'dsh']
+/** 思考深度四档（界面上显示英文）。 */
+const THINKING_LEVELS = ['off', 'low', 'medium', 'high']
+const CUSTOM_MODEL_PROVIDER_PREFIX = 'venery-'
+/** 自定义模型可选的 wire protocol（llm-pi-ai 支持的主要三种）。 */
+const CUSTOM_MODEL_PROTOCOLS = ['openai-completions', 'openai-responses', 'anthropic-messages']
 
 const DEFAULT_CONFIG = {
   version: 1,
@@ -79,8 +87,10 @@ const DEFAULT_CONFIG = {
     deep: { provider: '', model: '', reasoning: '' },
     fast: { provider: '', model: '', reasoning: '' },
     vision: { provider: '', model: '', reasoning: '' },
+    /** 控制台添加的自定义模型（OpenAI 兼容），注册到 dsh-llm-pi-ai。 */
+    custom: [],
   },
-  /** 测绘 / 情报平台密钥（加密不下发到页面以外的任何地方，只在本机 config.json 与命令环境里）。 */
+  /** 测绘 / 情报平台密钥（明文保存在本机 $DSH_HOME/recon/config.json，文件权限 0600；接口只回显“是否已配置”）。 */
   keys: {
     github: '', fofa: '', fofaEmail: '', shodan: '', virustotal: '', hunter: '', quake: '',
     censysId: '', censysSecret: '', securitytrails: '', hunterhow: '', daybreak: '',
@@ -99,16 +109,18 @@ const DEFAULT_CONFIG = {
       '任何“可疑”都必须给出可复现命令；没有证据的结论标 info。',
     ].join('\n'),
   },
-  /** 附加提示词。 */
-  prompt: { extra: '' },
+  /** 附加提示词：common 注入所有 Agent，extra 只进驾驶舱总指挥。 */
+  prompt: { common: '', extra: '' },
   /** 长期记忆条目。 */
   memory: [],
   /** 启用的技能名（会写进驾驶舱 AI 的系统提示）。 */
   skills: { enabled: [] },
   /** 页面里配置的 MCP 服务器。 */
   mcp: [],
-  /** 编队角色（留空用内置四角色）。 */
+  /** 编队队员角色（留空用内置队员角色；总指挥/参谋不在这里，见 core）。 */
   roles: { squad: [] },
+  /** 常设席位（总指挥/参谋）配置：全局各一个，不能召唤/回收，只能在这里或控制台改。 */
+  core: {},
   /** 事件触发规则（留空用内置两条：新资产派猎手、新漏洞派浏览器）。 */
   automation: null,
   /** 外观。 */
@@ -117,13 +129,46 @@ const DEFAULT_CONFIG = {
   chat: { tier: 'deep', history: 200 },
   /** 全员会议：多久没新信息算停滞、同一项目开会冷却、最多自动开几轮。 */
   meeting: { stallMinutes: 20, gapMinutes: 20, maxRounds: 3 },
+  /** 轨迹面板最高显示条数（控制台可配置 500/1000/2000/自定义）。 */
+  trace: { limit: 500 },
   /** 离职交接：成员被释放前是否先产出交接（发现/经验/坑/技巧），写进看板。 */
-  handover: { enabled: true, timeoutMs: 90000, keepSkill: true },
+  handover: { enabled: true, timeoutMs: 90000, keepSkill: false },
 }
 
 /* ────────────────────────────── 小工具 ────────────────────────────── */
 
 const nowIso = () => new Date().toISOString()
+
+/** 统一把 ISO 字符串 / 数字 / Date 转成 epoch 毫秒；无效值返回 0。 */
+function toEpoch(value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : 0
+  if (value instanceof Date) return Number.isFinite(value.getTime()) ? value.getTime() : 0
+  const text = asText(value)
+  if (text === '') return 0
+  const parsed = Date.parse(text)
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+/** 规范化节点类型：自定义类型也允许；空值回退 guessKind。 */
+function normalizeKind(value) {
+  const raw = asText(value).trim().toLowerCase().replace(/[^\p{L}\p{N}_-]/gu, '').slice(0, 28)
+  return raw
+}
+
+/** 兼容旧版把记忆写成字符串的格式；统一转成 { title, content }。 */
+function memoryEntryOf(item) {
+  if (typeof item === 'string') return { title: '记忆', content: item, category: 'other', importance: 'high' }
+  if (item !== null && typeof item === 'object') {
+    return {
+      ...item,
+      title: asText(item.title, '记忆'),
+      content: asText(item.content),
+      category: asText(item.category, 'other'),
+      importance: asText(item.importance, 'high'),
+    }
+  }
+  return { title: '记忆', content: '', category: 'other', importance: 'high' }
+}
 
 function dshHome() {
   return process.env.DSH_HOME || join(homedir(), '.dsh')
@@ -131,6 +176,19 @@ function dshHome() {
 
 function asText(value, fallback = '') {
   return typeof value === 'string' && value.trim() !== '' ? value.trim() : fallback
+}
+
+/** 通用提示词：所有 Agent 的提示词都以「common + 换行 + 自身提示词」拼接。 */
+function commonPromptOf(config) {
+  const prompt = config !== null && typeof config === 'object' ? config.prompt : undefined
+  return asText(prompt && prompt.common)
+}
+
+function withCommonPrompt(config, own) {
+  const common = commonPromptOf(config)
+  const text = String(own === undefined || own === null ? '' : own)
+  /* 通用提示词同样是用户输入：双花括号必须消毒，否则会破坏整个提示词模板 */
+  return common === '' ? text : `${safePromptText(common)}\n${text}`
 }
 
 /** MCP 配置数组：保留对象结构，只丢掉空项与没名字的项。 */
@@ -154,9 +212,18 @@ function lower(value) {
 }
 
 /** 一次 JSON 读写的原子替换：先写临时文件再 rename，避免半截文件。 */
-async function writeJsonAtomic(path, value) {
-  const tmp = `${path}.${process.pid}.${Date.now()}.tmp`
-  await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, 'utf8')
+async function writeJsonAtomic(path, value, mode) {
+  const tmp = `${path}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`
+  await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', ...(Number.isFinite(mode) ? { mode } : {}) })
+  await rename(tmp, path)
+  if (Number.isFinite(mode) && process.platform !== 'win32') {
+    try { await chmod(path, mode) } catch { /* 权限设置失败不阻断写入 */ }
+  }
+}
+
+async function writeJsonLines(path, value) {
+  const tmp = `${path}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`
+  await writeFile(tmp, `${value.map((row) => JSON.stringify(row)).join('\n')}\n`, 'utf8')
   await rename(tmp, path)
 }
 
@@ -218,7 +285,9 @@ function killProcessTree(child, signal = 'SIGKILL') {
 function hostEnvNote() {
   return IS_WIN
     ? '你运行在 Windows 主机上（shell 是 cmd.exe；如已装 Git Bash / PowerShell 也可用 DSH_RECON_SHELL 指定）。'
-    : '你运行在一台 Kali Linux 主机上：有任意 shell 能力，系统里装的命令与工具都可以直接用（nmap / nuclei / ffuf / sqlmap / subfinder / httpx / whatweb / gobuster / dirsearch / feroxbuster / masscan / netexec / impacket / curl / python3 / jq …）。'
+    : (process.platform === 'darwin'
+      ? '你运行在一台 macOS 主机上：有 shell 能力；用 `which` / `--help` 确认工具是否存在，缺工具可用 brew/pip 安装。'
+      : '你运行在一台 Linux 主机上：有任意 shell 能力，系统里装的命令与工具都可以直接用（nmap / nuclei / ffuf / sqlmap / subfinder / httpx / whatweb / gobuster / dirsearch / feroxbuster / masscan / netexec / impacket / curl / python3 / jq …）。')
 }
 
 /** 驾驶舱（总指挥）会话 id 登记表：执行层据此拦住「指挥席自己跑扫描」。 */
@@ -229,11 +298,13 @@ const COMMANDER_SESSIONS = new Set()
  * 只做内存态 + 文件兜底（截图落盘路径由 Browser 组件返回），供图谱左侧浮窗渲染。
  */
 class Browsers {
-  constructor(store, trace) {
+  constructor(store, trace, hub) {
     this.store = store
     this.trace = trace
+    this.hub = hub
     /** key: engagementId -> Map(sessionKey -> entry) */
     this.byEngagement = new Map()
+    this.restored = new Set()
   }
 
   sessionKey(exec, caller) {
@@ -299,6 +370,7 @@ class Browsers {
   drop(engagementId, sessionKey) {
     const bucket = this.bucket(engagementId)
     bucket.delete(sessionKey)
+    void this.persist(engagementId)
     this.broadcast(engagementId, null)
   }
 
@@ -309,7 +381,7 @@ class Browsers {
   }
 
   hubBroadcast(payload) {
-    if (this.store !== null && this.store !== undefined && typeof this.store.broadcast === 'function') this.store.broadcast(payload)
+    if (this.hub !== null && this.hub !== undefined && typeof this.hub.broadcast === 'function') this.hub.broadcast(payload)
   }
 
   async fileOf(engagementId) {
@@ -321,11 +393,13 @@ class Browsers {
       const bucket = this.byEngagement.get(engagementId)
       const rows = bucket === undefined ? [] : Array.from(bucket.values())
       await mkdir(join(this.store.root, 'browsers'), { recursive: true })
-      await writeFile(await this.fileOf(engagementId), JSON.stringify(rows, null, 2), 'utf8')
+      await writeJsonAtomic(await this.fileOf(engagementId), rows)
     } catch { /* 落盘失败不影响显示 */ }
   }
 
   async restore(engagementId) {
+    if (this.restored.has(engagementId)) return
+    this.restored.add(engagementId)
     try {
       const raw = JSON.parse(await readFile(await this.fileOf(engagementId), 'utf8'))
       if (!Array.isArray(raw)) return
@@ -457,7 +531,10 @@ class ReconStore {
   withLock(id, operation) {
     const previous = this.locks.get(id) || Promise.resolve()
     const next = previous.then(operation, operation)
-    this.locks.set(id, next.then(() => undefined, () => undefined))
+    const tail = next.then(() => undefined, () => undefined)
+    this.locks.set(id, tail)
+    /* 锁链结束后清掉表项，避免已删除靶标长期占用内存。 */
+    void tail.finally(() => { if (this.locks.get(id) === tail) this.locks.delete(id) })
     return next
   }
 
@@ -477,8 +554,9 @@ class ReconStore {
   async save(eng) {
     eng.version = (eng.version || 0) + 1
     eng.updatedAt = nowIso()
-    this.cache.set(eng.id, eng)
+    /* 先成功落盘再替换缓存，避免磁盘失败后内存出现“假成功”状态。 */
     await writeJsonAtomic(this.fileOf(eng.id), eng)
+    this.cache.set(eng.id, eng)
     try { this.onSave?.(eng) } catch { /* 广播失败不影响落盘 */ }
     return eng
   }
@@ -505,61 +583,84 @@ class ReconStore {
 
   /** 按名称复用已有靶标，否则新建（名称大小写不敏感）。 */
   async openOrCreate(rawName, scope) {
-    const nameText = asText(rawName, '默认靶标')
-    const existing = await this.list()
-    const hit = existing.find((row) => lower(row.name) === lower(nameText))
-    if (hit !== undefined) {
-      const eng = await this.load(hit.id)
-      if (eng !== undefined) {
-        const merged = asList(scope)
-        if (merged.length > 0) {
-          const set = new Set([...(eng.scope || []), ...merged])
-          eng.scope = Array.from(set)
+    /* 名称查重与创建必须串行，否则并发 recon_start 会创建两个同名靶标。 */
+    return this.withLock('__openOrCreate__', async () => {
+      const nameText = asText(rawName, '默认靶标')
+      const existing = await this.list()
+      const hit = existing.find((row) => lower(row.name) === lower(nameText))
+      if (hit !== undefined) {
+        const eng = await this.load(hit.id)
+        if (eng !== undefined) {
+          const merged = asList(scope)
+          let changed = false
+          if (merged.length > 0) {
+            const set = new Set([...(eng.scope || []), ...merged])
+            const nextScope = Array.from(set)
+            const oldScope = eng.scope || []
+            if (nextScope.length !== oldScope.length || nextScope.some((value, index) => value !== oldScope[index])) {
+              eng.scope = nextScope
+              changed = true
+            }
+          }
+          this.state.active = eng.id
+          await this.saveState()
+          return { engagement: changed ? await this.save(eng) : eng, created: false }
         }
-        this.state.active = eng.id
-        await this.saveState()
-        return { engagement: await this.save(eng), created: false }
       }
-    }
-    const id = `eng_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`
-    const eng = normalizeEngagement({
-      id,
-      name: nameText,
-      scope: asList(scope),
-      createdAt: nowIso(),
-      updatedAt: nowIso(),
-      version: 0,
-      seq: 0,
-      nodes: [],
-      edges: [],
-      vulns: [],
-      commands: [],
+      const id = `eng_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`
+      const eng = normalizeEngagement({
+        id,
+        name: nameText,
+        scope: asList(scope),
+        createdAt: nowIso(),
+        updatedAt: nowIso(),
+        version: 0,
+        seq: 0,
+        nodes: [],
+        edges: [],
+        vulns: [],
+        commands: [],
+      })
+      await ensureDir(join(this.workDir, id))
+      this.state.active = id
+      await this.save(eng)
+      await this.saveState()
+      return { engagement: eng, created: true }
     })
-    await ensureDir(join(this.workDir, id))
-    this.state.active = id
-    await this.save(eng)
-    await this.saveState()
-    return { engagement: eng, created: true }
   }
 
   async mutate(id, operation) {
     return this.withLock(id, async () => {
       const eng = await this.load(id)
       if (eng === undefined) throw new Error(`靶标不存在：${id}`)
+      /* 操作可能在中途抛错（例如 parent 不存在）。draft 是缓存里的活对象，
+         必须在失败时恢复，否则失败调用会污染后续保存。 */
+      const backup = cloneJson(eng)
       const before = {
         nodes: new Set(eng.nodes.map((row) => row.id)),
         edges: new Set(eng.edges.map((row) => row.id)),
         vulns: new Set(eng.vulns.map((row) => row.id)),
         commands: new Set(eng.commands.map((row) => row.id)),
       }
-      const result = await operation(eng)
+      let result
+      try {
+        result = await operation(eng)
+      } catch (error) {
+        this.cache.set(id, backup)
+        throw error
+      }
       const delta = {
         newNodes: eng.nodes.filter((row) => !before.nodes.has(row.id)),
         newEdges: eng.edges.filter((row) => !before.edges.has(row.id)),
         newVulns: eng.vulns.filter((row) => !before.vulns.has(row.id)),
         newCommands: eng.commands.filter((row) => !before.commands.has(row.id)),
       }
-      await this.save(eng)
+      try {
+        await this.save(eng)
+      } catch (error) {
+        this.cache.set(id, backup)
+        throw error
+      }
       if (this.onDelta !== undefined && this.onDelta !== null) {
         try { this.onDelta(eng, delta) } catch { /* 观察者不外溢 */ }
       }
@@ -586,6 +687,10 @@ class ReconStore {
         join(this.root, 'trace', `${key}.jsonl`),
         join(this.root, 'browser', key),
         join(this.root, 'browsers', `${key}.json`),
+        join(this.root, 'brief', `${key}.json`),
+        join(this.root, 'meeting', `${key}.json`),
+        /* 与 Runner.fileOf 用同一套 id 清洗规则，避免非常规 id 删不到断点 */
+        join(this.root, 'checkpoints', `${String(key).replace(/[^a-zA-Z0-9_-]/g, '_')}.json`),
         join(this.root, 'work', key),
         join(this.root, 'uploads', key),
       ]
@@ -670,18 +775,22 @@ function normalizeEngagement(raw) {
 }
 
 function statsOf(eng) {
+  const activeNodes = (eng.nodes || []).filter((node) => node.archived !== true)
+  const activeIds = new Set(activeNodes.map((node) => node.id))
+  const activeEdges = (eng.edges || []).filter((edge) => activeIds.has(edge.from) && activeIds.has(edge.to))
+  const activeVulns = (eng.vulns || []).filter((vuln) => activeIds.has(vuln.nodeId))
   const bySeverity = {}
   for (const sev of SEVERITIES) bySeverity[sev] = 0
-  for (const vuln of eng.vulns) {
+  for (const vuln of activeVulns) {
     const sev = SEVERITIES.includes(vuln.severity) ? vuln.severity : 'info'
     bySeverity[sev] += 1
   }
   return {
-    nodes: eng.nodes.length,
-    edges: eng.edges.length,
-    vulns: eng.vulns.length,
-    openVulns: eng.vulns.filter((v) => v.status !== 'false-positive' && v.status !== 'fixed').length,
-    commands: eng.commands.length,
+    nodes: activeNodes.length,
+    edges: activeEdges.length,
+    vulns: activeVulns.length,
+    openVulns: activeVulns.filter((v) => v.status !== 'false-positive' && v.status !== 'fixed').length,
+    commands: (eng.commands || []).length,
     bySeverity,
   }
 }
@@ -726,14 +835,15 @@ function candidateHint(eng, ref) {
 function upsertNode(eng, input) {
   const value = asText(input.value || input.node || input.label)
   if (value === '') throw new Error('缺少资产标识：value 不能为空（域名 / IP / URL / 端口 / 账号等）')
-  const rawKind = asText(input.kind).trim().toLowerCase().replace(/[^\p{L}\p{N}_-]/gu, '').slice(0, 28)
+  const rawKind = normalizeKind(input.kind)
   const kind = rawKind !== '' ? rawKind : (NODE_KINDS.includes(input.kind) ? input.kind : 'note')
   const existing = eng.nodes.find((n) => lower(n.value) === lower(value))
     || eng.nodes.find((n) => lower(n.label) === lower(value) && n.kind === kind)
   const patch = {
     kind,
     value,
-    label: asText(input.label, value),
+    /* 合并更新时没有显式 label 必须保留原 label，不能被 value 覆盖。 */
+    label: asText(input.label) || (existing !== undefined ? asText(existing.label, value) : value),
     ip: asText(input.ip) || undefined,
     port: input.port === undefined || input.port === null || input.port === '' ? undefined : String(input.port),
     proto: asText(input.proto) || undefined,
@@ -802,12 +912,16 @@ function addVuln(eng, input) {
   const existing = eng.vulns.find((v) => v.nodeId === anchor.id && lower(v.title) === lower(title)
     && lower(v.endpoint) === lower(asText(input.endpoint)))
   if (existing !== undefined) {
-    existing.severity = severity
+    /* 只在本次显式提供等级时更新，避免补证据时把 high 降成默认 info。 */
+    if (SEVERITIES.includes(lower(input.severity))) existing.severity = severity
     if (asText(input.param)) existing.param = asText(input.param)
     if (asText(input.payload)) existing.payload = asText(input.payload)
     if (asText(input.description)) existing.description = asText(input.description)
+    if (asText(input.cvss)) existing.cvss = asText(input.cvss)
+    if (asText(input.cve)) existing.cve = asText(input.cve)
     if (asText(input.commandId)) existing.commandId = asText(input.commandId)
     if (asText(input.type)) existing.type = asText(input.type)
+    if (VULN_STATUSES.includes(lower(input.status))) existing.status = lower(input.status)
     existing.updatedAt = nowIso()
     return { vuln: existing, created: false }
   }
@@ -833,19 +947,23 @@ function addVuln(eng, input) {
 
 /** 图谱的紧凑文本视图：给模型看的，不是给页面看的。 */
 function graphSummary(eng, options = {}) {
-  const limit = Number.isFinite(options.limit) ? options.limit : 400
-  const nodes = eng.nodes.slice(0, limit).map((n) => {
+  const limit = Number.isFinite(Number(options.limit))
+    ? Math.max(1, Math.min(2000, Math.floor(Number(options.limit))))
+    : 400
+  const activeNodes = (eng.nodes || []).filter((node) => node.archived !== true)
+  const activeIds = new Set(activeNodes.map((node) => node.id))
+  const nodes = activeNodes.slice(0, limit).map((n) => {
     const bits = [n.id, n.kind, n.value]
     if (n.ip) bits.push(`ip=${n.ip}`)
     if (n.port) bits.push(`port=${n.port}`)
     if (n.tech && n.tech.length > 0) bits.push(`tech=${n.tech.join('/')}`)
-    const vulns = eng.vulns.filter((v) => v.nodeId === n.id)
+    const vulns = (eng.vulns || []).filter((v) => v.nodeId === n.id)
     if (vulns.length > 0) bits.push(`vulns=${vulns.map((v) => `${v.severity}:${v.title}`).join('|')}`)
     return bits.join('  ')
   })
-  const edges = eng.edges.slice(0, limit).map((e) => `${e.from} -[${e.type}]-> ${e.to}`)
-  const vulns = eng.vulns.slice(0, limit).map((v) => {
-    const node = eng.nodes.find((n) => n.id === v.nodeId)
+  const edges = (eng.edges || []).filter((e) => activeIds.has(e.from) && activeIds.has(e.to)).slice(0, limit).map((e) => `${e.from} -[${e.type}]-> ${e.to}`)
+  const vulns = (eng.vulns || []).filter((v) => activeIds.has(v.nodeId)).slice(0, limit).map((v) => {
+    const node = activeNodes.find((n) => n.id === v.nodeId)
     return `${v.id}  ${v.severity}  ${node ? node.value : v.nodeId}  ${v.title}  status=${v.status}`
   })
   const commands = eng.commands.slice(-Math.min(limit, 60)).map(
@@ -858,7 +976,8 @@ function graphSummary(eng, options = {}) {
     edges,
     vulns,
     recentCommands: commands,
-    ...(eng.nodes.length > limit ? { note: `节点多于 ${limit}，仅列出前 ${limit} 个；完整数据在页面上。` } : {}),
+    ...(activeNodes.length > limit ? { note: `节点多于 ${limit}，仅列出前 ${limit} 个；完整数据在页面上。` } : {}),
+    ...(eng.nodes.length > activeNodes.length ? { archived: eng.nodes.length - activeNodes.length } : {}),
   }
 }
 
@@ -886,8 +1005,10 @@ function runShell(command, options) {
       const body = IS_WIN && /(^|[\\/])cmd(\.exe)?$/i.test(spec.file)
         ? `chcp 65001>nul & ${command}`
         : command
+      let localChild
+      let superseded = false
       try {
-        child = spawn(spec.file, [...spec.args, body], {
+        localChild = spawn(spec.file, [...spec.args, body], {
           cwd,
           env: options.env || process.env,
           /* Windows 上 detached 会另开控制台，进程组语义也不存在；杀树统一走 killProcessTree */
@@ -896,17 +1017,25 @@ function runShell(command, options) {
           stdio: ['ignore', 'pipe', 'pipe'],
         })
       } catch (error) {
+        if (attempt + 1 < candidates.length) {
+          superseded = true
+          attempt += 1
+          launch()
+          return
+        }
         resolvePromise({
           exitCode: null, signal: null, stdout: '', stderr: String(error && error.message ? error.message : error),
           durationMs: 0, timedOut: false, truncated: false, outBytes: 0, errBytes: 0, spawnError: true,
         })
         return
       }
-      child.stdout.on('data', (chunk) => collect(chunk, 'out'))
-      child.stderr.on('data', (chunk) => collect(chunk, 'err'))
-      child.on('error', (error) => {
+      child = localChild
+      localChild.stdout.on('data', (chunk) => collect(chunk, 'out'))
+      localChild.stderr.on('data', (chunk) => collect(chunk, 'err'))
+      localChild.on('error', (error) => {
         /* 本机没有这个 shell（典型：Windows 上写死了 /bin/bash）→ 换下一个候选 */
         if (error && error.code === 'ENOENT' && attempt + 1 < candidates.length) {
+          superseded = true
           attempt += 1
           launch()
           return
@@ -914,7 +1043,11 @@ function runShell(command, options) {
         err += `\n[spawn error] ${error && error.message ? error.message : error}`
         finish(null, null)
       })
-      child.on('close', (code, sig) => finish(code, sig))
+      localChild.on('close', (code, sig) => {
+        /* 已被后续候选取代的旧子进程，它的 close 不能结束整个 Promise。 */
+        if (superseded) return
+        finish(code, sig)
+      })
     }
     const collect = (chunk, streamName) => {
       const text = chunk.toString('utf8')
@@ -952,6 +1085,115 @@ function runShell(command, options) {
       else signal.addEventListener('abort', onAbort, { once: true })
     }
   })
+}
+
+/** 直接执行一个可执行文件并收集输出（不经过 shell，避免指纹把命令注进 shell）。 */
+function runCapture(file, args, timeoutMs = 20000) {
+  return new Promise((resolvePromise) => {
+    let child
+    try {
+      child = spawn(file, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, detached: !IS_WIN })
+    } catch (error) {
+      resolvePromise({ stdout: '', stderr: '', error: error && error.message ? error.message : String(error) })
+      return
+    }
+    let stdout = ''
+    let stderr = ''
+    let settled = false
+    const finish = (value) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolvePromise(value)
+    }
+    const timer = setTimeout(() => {
+      killProcessTree(child)
+      finish({ stdout, stderr, error: `执行超时（${timeoutMs}ms）` })
+    }, timeoutMs)
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString('utf8')
+      if (stdout.length > 2 * 1024 * 1024) stdout = stdout.slice(-2 * 1024 * 1024)
+    })
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString('utf8')
+      if (stderr.length > 2 * 1024 * 1024) stderr = stderr.slice(-2 * 1024 * 1024)
+    })
+    child.on('error', (error) => {
+      finish({ stdout, stderr, error: error && error.code === 'ENOENT' ? `未找到 ${file}` : (error && error.message ? error.message : String(error)) })
+    })
+    child.on('close', (code) => finish({ exitCode: code, stdout, stderr }))
+  })
+}
+
+/** Exploit-DB 本地库检索（searchsploit --json）。 */
+async function searchExploitDb(fingerprint, limit) {
+  const file = asText(process.env.SEARCHSPLOIT) || 'searchsploit'
+  const outcome = await runCapture(file, ['--json', fingerprint], 25000)
+  if (outcome.error !== undefined) return { source: 'exploitdb', candidates: [], error: `${file}: ${outcome.error}` }
+  try {
+    const parsed = JSON.parse(asText(outcome.stdout) === '' ? '{}' : outcome.stdout.trim())
+    const rows = [
+      ...(Array.isArray(parsed.RESULTS_EXPLOIT) ? parsed.RESULTS_EXPLOIT : []),
+      ...(Array.isArray(parsed.RESULTS_SHELLCODE) ? parsed.RESULTS_SHELLCODE : []),
+    ]
+    const candidates = rows.slice(0, limit).map((row) => {
+      const id = asText(row['EDB-ID'] !== undefined ? row['EDB-ID'] : row.EDBID)
+      return {
+        source: 'exploitdb',
+        id,
+        title: shortText(asText(row.Title), 200),
+        date: asText(row.Date),
+        type: asText(row.Type),
+        platform: asText(row.Platform),
+        path: asText(row.Path),
+        url: id !== '' ? `https://www.exploit-db.com/exploits/${encodeURIComponent(id)}` : '',
+      }
+    })
+    return { source: 'exploitdb', candidates, error: '' }
+  } catch {
+    return { source: 'exploitdb', candidates: [], error: `searchsploit 输出无法解析：${shortText(asText(outcome.stderr) || asText(outcome.stdout), 200)}` }
+  }
+}
+
+/** NVD（CVE）公开库检索；只按关键字查历史漏洞，不碰目标。 */
+async function searchNvd(fingerprint, limit) {
+  if (typeof fetch !== 'function') return { source: 'nvd', candidates: [], error: '当前 Node 没有 fetch' }
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 20000)
+  try {
+    const url = `https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=${encodeURIComponent(fingerprint)}&resultsPerPage=${limit}`
+    const response = await fetch(url, { signal: controller.signal, headers: { 'user-agent': 'dsh-venery/0.50.6' } })
+    if (!response.ok) return { source: 'nvd', candidates: [], error: `NVD HTTP ${response.status}` }
+    const data = await response.json()
+    const rows = Array.isArray(data.vulnerabilities) ? data.vulnerabilities : []
+    const candidates = rows.slice(0, limit).map((item) => {
+      const cve = item && item.cve ? item.cve : {}
+      const metrics = cve.metrics || {}
+      const metric = (Array.isArray(metrics.cvssMetricV31) && metrics.cvssMetricV31[0])
+        || (Array.isArray(metrics.cvssMetricV30) && metrics.cvssMetricV30[0])
+        || (Array.isArray(metrics.cvssMetricV2) && metrics.cvssMetricV2[0])
+        || null
+      const severity = metric && metric.cvssData && asText(metric.cvssData.baseSeverity)
+        ? asText(metric.cvssData.baseSeverity)
+        : (metric && asText(metric.baseSeverity) !== '' ? asText(metric.baseSeverity) : '')
+      const description = (Array.isArray(cve.descriptions) ? cve.descriptions : [])
+        .find((row) => row && row.lang === 'en')
+      return {
+        source: 'nvd',
+        id: asText(cve.id),
+        title: shortText(asText(description && description.value), 240),
+        published: asText(cve.published),
+        severity,
+        url: asText(cve.id) !== '' ? `https://nvd.nist.gov/vuln/detail/${encodeURIComponent(asText(cve.id))}` : '',
+      }
+    })
+    return { source: 'nvd', candidates, error: '' }
+  } catch (error) {
+    const reason = error && error.name === 'AbortError' ? '超时' : (error && error.message ? error.message : String(error))
+    return { source: 'nvd', candidates: [], error: `NVD 查询失败：${reason}` }
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 function headTail(text, budget) {
@@ -1008,6 +1250,7 @@ class ConfigStore {
     this.value = cloneJson(DEFAULT_CONFIG)
     this.listeners = new Set()
     this.ready = null
+    this.writeQueue = Promise.resolve()
   }
 
   async init() {
@@ -1029,17 +1272,21 @@ class ConfigStore {
   }
 
   async patch(patch) {
-    this.value = mergeDeep(this.value, patch && typeof patch === 'object' ? patch : {})
-    await this.persist()
-    for (const listener of Array.from(this.listeners)) {
-      try { listener(this.value) } catch { /* 观察者异常不外溢 */ }
-    }
-    return this.value
+    const run = this.writeQueue.then(async () => {
+      this.value = mergeDeep(this.value, patch && typeof patch === 'object' ? patch : {})
+      await this.persist()
+      for (const listener of Array.from(this.listeners)) {
+        try { listener(this.value) } catch { /* 观察者异常不外溢 */ }
+      }
+      return this.value
+    })
+    this.writeQueue = run.then(() => undefined, () => undefined)
+    return run
   }
 
   /** 只写盘不触发观察者（用于初始迁移）。 */
   async persist() {
-    await writeFile(this.file, `${JSON.stringify(this.value, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
+    await writeJsonAtomic(this.file, this.value, 0o600)
   }
 
   /** 密钥环境：把配置里的 key 映射成命令可直接读取的环境变量。 */
@@ -1067,16 +1314,205 @@ class ConfigStore {
     return out
   }
 
-  redacted() {
+  redacted(options = {}) {
     const copy = cloneJson(this.value)
     for (const field of Object.keys(copy.keys || {})) {
       if (asText(copy.keys[field]) !== '') copy.keys[field] = '••••••••'
+    }
+    if (options.redactEnv === true) {
+      copy.env = (Array.isArray(copy.env) ? copy.env : []).map((line) => {
+        const text = String(line)
+        const at = text.indexOf('=')
+        return at > 0 ? `${text.slice(0, at)}=••••••••` : '••••••••'
+      })
+      copy.mcp = (Array.isArray(copy.mcp) ? copy.mcp : []).map((row) => {
+        if (row === null || typeof row !== 'object') return row
+        const next = { ...row }
+        if (next.env !== null && typeof next.env === 'object' && !Array.isArray(next.env)) {
+          next.env = Object.fromEntries(Object.keys(next.env).map((key) => [key, '••••••••']))
+        }
+        if (next.headers !== null && typeof next.headers === 'object' && !Array.isArray(next.headers)) {
+          next.headers = Object.fromEntries(Object.keys(next.headers).map((key) => [key, '••••••••']))
+        }
+        return next
+      })
     }
     return copy
   }
 }
 
 /* ────────────────────────── 事件中心（SSE） ────────────────────────── */
+
+/** 自定义模型的稳定 id / provider 路由 / 凭据引用。 */
+function customModelId() {
+  return `cm_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
+}
+function customModelProviderOf(id) {
+  return `${CUSTOM_MODEL_PROVIDER_PREFIX}${String(id).replace(/[^a-zA-Z0-9_-]/g, '_')}`
+}
+function customModelKeyRefOf(id) {
+  return `VENERY_MODEL_${String(id).replace(/[^a-zA-Z0-9]/g, '_').toUpperCase()}`
+}
+
+/**
+ * 自定义模型 = 控制台里填 Base URL / API Key / 模型名 / 思考深度，
+ * 落到 DSH 的 llm-pi-ai provider 配置（OpenAI 兼容协议），
+ * API Key 只进 credentials 服务，不写进 venery 的 config.json。
+ */
+class CustomModelRegistry {
+  constructor(ctx, configStore) {
+    this.ctx = ctx
+    this.configStore = configStore
+  }
+
+  current() {
+    const models = this.configStore.get().models
+    return models !== null && typeof models === 'object' && Array.isArray(models.custom) ? models.custom : []
+  }
+
+  async hasKey(ref) {
+    if (asText(ref) === '') return false
+    const credentials = this.ctx.get('credentials')
+    if (credentials === undefined || credentials === null || typeof credentials.describe !== 'function') return false
+    try {
+      const info = await credentials.describe(ref)
+      return info !== undefined && info !== null && info.configured === true
+    } catch {
+      return false
+    }
+  }
+
+  async list(rows = this.current()) {
+    const out = []
+    for (const row of rows) {
+      if (row === null || typeof row !== 'object') continue
+      out.push({ ...row, hasKey: await this.hasKey(row.keyRef) })
+    }
+    return out
+  }
+
+  /** 校验并规范化 UI 提交的自定义模型；apiKey 只用于写 credentials，不会返回。 */
+  async prepare(incoming) {
+    const rows = Array.isArray(incoming) ? incoming : []
+    const existing = new Map(this.current().map((row) => [asText(row.id), row]))
+    const next = []
+    const keyUpdates = []
+    const seenNames = new Set()
+    for (const raw of rows) {
+      if (raw === null || typeof raw !== 'object') continue
+      const givenId = asText(raw.id).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 48)
+      const prev = existing.get(givenId)
+      const id = givenId !== '' ? givenId : customModelId()
+      const name = asText(raw.name, prev !== undefined ? asText(prev.name) : '')
+      const baseUrl = asText(raw.baseUrl, prev !== undefined ? asText(prev.baseUrl) : '')
+      const modelId = asText(raw.model, prev !== undefined ? asText(prev.model) : '')
+      if (name === '') throw new Error('自定义模型缺少名称')
+      if (seenNames.has(name.toLowerCase())) throw new Error(`模型名称重复：「${name}」；档位下拉按名称选择，名称必须唯一`)
+      seenNames.add(name.toLowerCase())
+      if (modelId === '') throw new Error(`自定义模型「${name}」缺少模型名称（API model id）`)
+      if (!/^https?:\/\//i.test(baseUrl)) throw new Error(`自定义模型「${name}」的 Base URL 必须以 http:// 或 https:// 开头`)
+      const reasoning = THINKING_LEVELS.includes(asText(raw.reasoning))
+        ? asText(raw.reasoning)
+        : (prev !== undefined && THINKING_LEVELS.includes(asText(prev.reasoning)) ? asText(prev.reasoning) : 'medium')
+      const protocol = CUSTOM_MODEL_PROTOCOLS.includes(asText(raw.protocol))
+        ? asText(raw.protocol)
+        : (prev !== undefined && CUSTOM_MODEL_PROTOCOLS.includes(asText(prev.protocol)) ? asText(prev.protocol) : 'openai-completions')
+      const provider = prev !== undefined && asText(prev.provider) !== '' ? asText(prev.provider) : customModelProviderOf(id)
+      const keyRef = prev !== undefined && asText(prev.keyRef) !== '' ? asText(prev.keyRef) : customModelKeyRefOf(id)
+      const apiKey = typeof raw.apiKey === 'string' ? raw.apiKey.trim() : ''
+      if (apiKey !== '') keyUpdates.push({ ref: keyRef, key: apiKey })
+      if (apiKey === '' && !(await this.hasKey(keyRef))) {
+        throw new Error(`自定义模型「${name}」缺少 API Key；编辑已有模型时留空表示沿用已保存的 Key`)
+      }
+      next.push({
+        id,
+        name,
+        provider,
+        keyRef,
+        baseUrl,
+        model: modelId,
+        reasoning,
+        protocol,
+        createdAt: prev !== undefined && asText(prev.createdAt) !== '' ? asText(prev.createdAt) : nowIso(),
+      })
+    }
+    const nextIds = new Set(next.map((row) => row.id))
+    const removed = this.current().filter((row) => !nextIds.has(asText(row.id)))
+    return { next, keyUpdates, removed }
+  }
+
+  /** 同步到 DSH：credentials 存 key，llm-pi-ai 的 providers 注册路由。 */
+  async apply(next, removed = [], keyUpdates = []) {
+    if (next.length === 0 && removed.length === 0) return
+    const settings = this.ctx.get('settings')
+    const credentials = this.ctx.get('credentials')
+    if (settings === undefined || settings === null) throw new Error('settings 服务不可用：无法注册自定义模型')
+    if (keyUpdates.length > 0 || next.length > 0) {
+      if (credentials === undefined || credentials === null || typeof credentials.set !== 'function') {
+        throw new Error('credentials 服务不可用：无法保存自定义模型 API Key')
+      }
+    }
+    for (const item of keyUpdates) await credentials.set(item.ref, item.key)
+    if (next.length > 0) {
+      const providers = {}
+      for (const row of next) {
+        providers[row.provider] = {
+          displayName: row.name,
+          api: asText(row.protocol, 'openai-completions'),
+          baseURL: row.baseUrl,
+          apiKeyEnv: row.keyRef,
+          models: [{
+            id: row.model,
+            name: row.name,
+            reasoningEfforts: { off: null, low: 'low', medium: 'medium', high: 'high' },
+          }],
+        }
+      }
+      await settings.update('llm-pi-ai', { providers })
+    }
+    if (removed.length > 0) {
+      const ops = removed
+        .filter((row) => asText(row.provider) !== '')
+        .map((row) => ({ op: 'unset', path: ['providers', asText(row.provider)] }))
+      if (ops.length > 0) {
+        try { await settings.mutate('llm-pi-ai', ops) } catch { /* 路由可能已经被移除 */ }
+      }
+      if (credentials !== undefined && credentials !== null && typeof credentials.unset === 'function') {
+        for (const row of removed) {
+          try { await credentials.unset(asText(row.keyRef)) } catch { /* 忽略 */ }
+        }
+      }
+    }
+    const llm = this.ctx.get('llm')
+    if (next.length > 0) {
+      if (llm === undefined || llm === null || typeof llm.listProviders !== 'function') {
+        throw new Error('llm 服务不可用：无法确认自定义模型路由')
+      }
+      const missing = new Set(next.map((row) => row.provider))
+      const deadline = Date.now() + 8000
+      while (missing.size > 0 && Date.now() < deadline) {
+        const ids = new Set((await llm.listProviders()).map((row) => row.id))
+        for (const provider of Array.from(missing)) if (ids.has(provider)) missing.delete(provider)
+        if (missing.size > 0) await new Promise((resolve) => setTimeout(resolve, 150))
+      }
+      if (missing.size > 0) throw new Error(`自定义模型路由未注册成功：${Array.from(missing).join(', ')}`)
+    }
+  }
+
+  /** 插件启动时把已有自定义模型重新挂到 llm-pi-ai；路由已在则跳过，避免每次重载都写配置。 */
+  async syncCurrent() {
+    const current = this.current()
+    if (current.length === 0) return
+    const llm = this.ctx.get('llm')
+    if (llm !== undefined && llm !== null && typeof llm.listProviders === 'function') {
+      try {
+        const ids = new Set((await llm.listProviders()).map((row) => row.id))
+        if (current.every((row) => ids.has(asText(row.provider)))) return
+      } catch { /* 查不到就继续重新挂 */ }
+    }
+    await this.apply(current, [], [])
+  }
+}
 
 class EventHub {
   constructor() {
@@ -1173,10 +1609,12 @@ function registerTools(ctx, store, cfg, bindings, configStore, trace, resolveAct
         if (nameText === '') throw new Error('缺少参数 name')
         const opened = await store.openOrCreate(nameText, args.scope)
         const eng = opened.engagement
+        void squadRef?.ensureCore?.(eng.id).catch(() => {})
         for (const key of bindingKeys(exec)) bindings.set(key, eng.id)
         let rootNode
         if (asText(args.root) !== '') {
-          const inferred = NODE_KINDS.includes(args.rootKind) ? args.rootKind : guessKind(args.root)
+          const wantedKind = normalizeKind(args.rootKind)
+          const inferred = wantedKind !== '' ? wantedKind : guessKind(args.root)
           rootNode = await store.mutate(eng.id, (draft) => {
             const { node, created } = upsertNode(draft, {
               value: args.root,
@@ -1197,7 +1635,7 @@ function registerTools(ctx, store, cfg, bindings, configStore, trace, resolveAct
           engagement: { id: fresh.id, name: fresh.name, scope: fresh.scope },
           rootNode: rootNode ? rootNode.node.id : null,
           stats: statsOf(fresh),
-          next: '接下来用 recon_run 跑命令、recon_asset 记录资产、recon_link 连边、recon_vuln 记漏洞；页面会实时刷新。',
+          next: '先让参谋把整体方案写进看板 kind=hypothesis，再登记 mission 并拆任务给专人；成员完成后必须由 QA 核查证据并 accept/reject，最后你才能 mission close 宣布结束。',
         })
       } catch (error) {
         return toolFailure(error)
@@ -1236,13 +1674,13 @@ function registerTools(ctx, store, cfg, bindings, configStore, trace, resolveAct
       try {
         const eng = await resolveEngagement(exec, args.engagement)
         const result = await store.mutate(eng.id, (draft) => {
+          const parent = asText(args.parent) !== '' ? findNode(draft, args.parent) : undefined
+          if (asText(args.parent) !== '' && parent === undefined) {
+            throw new Error(`父节点不存在：${args.parent}。候选：${candidateHint(draft, args.parent).join(' ; ')}`)
+          }
           const { node, created } = upsertNode(draft, { ...args, kind: args.kind || guessKind(args.value) })
           let edge = null
-          if (asText(args.parent) !== '') {
-            const parent = findNode(draft, args.parent)
-            if (parent === undefined) {
-              throw new Error(`父节点不存在：${args.parent}。候选：${candidateHint(draft, args.parent).join(' ; ')}`)
-            }
+          if (parent !== undefined) {
             edge = ensureEdge(draft, parent.id, node.id, asText(args.edge, 'discovered_from'), { commandId: args.commandId }).edge
           }
           return { node, created, edge }
@@ -1295,6 +1733,14 @@ function registerTools(ctx, store, cfg, bindings, configStore, trace, resolveAct
           const to = findNode(draft, args.to)
           if (to === undefined) throw new Error(`终点节点不存在：${args.to}。候选：${candidateHint(draft, args.to).join(' ; ')}`)
           return ensureEdge(draft, from.id, to.id, args.type, args)
+        })
+        void trace?.push?.(eng.id, {
+          kind: 'graph',
+          actor: who(exec),
+          title: `${result.created ? '图谱 +1 关系' : '图谱 ~ 关系'} ${result.edge.from} -[${result.edge.type}]-> ${result.edge.to}`,
+          detail: asText(args.note) || '',
+          refs: { commandId: asText(args.commandId) },
+          meta: { op: result.created ? 'edge.add' : 'edge.update' },
         })
         return json({
           ok: true,
@@ -1369,9 +1815,12 @@ function registerTools(ctx, store, cfg, bindings, configStore, trace, resolveAct
       properties: {
         vuln: { type: 'string', description: '漏洞 id（形如 v12），或「节点 value + 标题关键字」' },
         node: { type: 'string', description: '要更新的资产节点 id 或 value' },
-        status: { type: 'string', enum: VULN_STATUSES, description: '新状态' },
-        severity: { type: 'string', enum: SEVERITIES, description: '新等级' },
+        status: { type: 'string', enum: VULN_STATUSES, description: '漏洞新状态（open/verified/false-positive/fixed）' },
+        nodeStatus: { type: 'string', description: '资产节点新状态，例如 alive/dead/interesting/owned' },
+        severity: { type: 'string', enum: SEVERITIES, description: '漏洞新等级' },
         note: { type: 'string', description: '资产节点备注' },
+        clearNote: { type: 'boolean', description: '清空资产节点备注' },
+        tags: { type: 'array', items: { type: 'string' }, description: '追加到资产节点的标签' },
         description: { type: 'string', description: '漏洞补充描述' },
         engagement: { type: 'string', description: '靶标 id 或名称' },
       },
@@ -1399,13 +1848,29 @@ function registerTools(ctx, store, cfg, bindings, configStore, trace, resolveAct
           if (asText(args.node) !== '') {
             const node = findNode(draft, args.node)
             if (node === undefined) throw new Error(`节点不存在：${args.node}。候选：${candidateHint(draft, args.node).join(' ; ')}`)
-            if (asText(args.note)) node.note = asText(args.note)
-            if (asText(args.status) && !VULN_STATUSES.includes(lower(args.status))) node.status = asText(args.status)
+            if (args.clearNote === true) delete node.note
+            else if (asText(args.note)) node.note = asText(args.note)
+            if (asText(args.nodeStatus)) node.status = asText(args.nodeStatus)
+            else if (asText(args.status) && !VULN_STATUSES.includes(lower(args.status))) node.status = asText(args.status)
+            if (Array.isArray(args.tags)) {
+              node.tags = Array.from(new Set([...(Array.isArray(node.tags) ? node.tags : []), ...asList(args.tags)]))
+            }
             node.updatedAt = nowIso()
             touched.node = node
           }
           if (touched.vuln === null && touched.node === null) throw new Error('没有可更新的对象：至少给 vuln 或 node')
           return touched
+        })
+        void trace?.push?.(eng.id, {
+          kind: 'graph',
+          actor: who(exec),
+          title: result.vuln ? `漏洞更新 ${result.vuln.id}｜${shortText(result.vuln.title, 80)}` : `资产更新 ${result.node.id}｜${shortText(result.node.value, 80)}`,
+          detail: asText(args.description) || asText(args.note) || '',
+          refs: {
+            vulnIds: result.vuln ? [result.vuln.id] : [],
+            nodeIds: result.node ? [result.node.id] : [],
+          },
+          meta: { status: args.status || '', severity: args.severity || '', nodeStatus: args.nodeStatus || '' },
         })
         return json({
           ok: true,
@@ -1460,6 +1925,7 @@ function registerTools(ctx, store, cfg, bindings, configStore, trace, resolveAct
               if (asText(row.parent) !== '') {
                 const parent = findNode(draft, row.parent)
                 if (parent !== undefined) ensureEdge(draft, parent.id, node.id, asText(row.edge, 'discovered_from'), { commandId: args.commandId })
+                else report.nodes.failed.push(`${row.value}: 父节点不存在 ${row.parent}`)
               }
             } catch (error) {
               report.nodes.failed.push(`${row && row.value}: ${error.message}`)
@@ -1492,7 +1958,7 @@ function registerTools(ctx, store, cfg, bindings, configStore, trace, resolveAct
         void trace?.push?.(eng.id, {
           kind: 'graph',
           actor: who(exec),
-          title: `批量入图：+${result.nodes || 0} 资产 / +${result.edges || 0} 关系 / +${result.vulns || 0} 漏洞`,
+          title: `批量入图：+${result.nodes.created} 资产 / +${result.edges.created} 关系 / +${result.vulns.created} 漏洞`,
           detail: asText(args.note) || '',
           refs: { commandId: asText(args.commandId) },
           meta: { report: result },
@@ -1568,8 +2034,11 @@ function registerTools(ctx, store, cfg, bindings, configStore, trace, resolveAct
         const timeoutMs = Number.isFinite(args.timeoutMs) && args.timeoutMs > 0
           ? Math.min(args.timeoutMs, 6 * 60 * 60 * 1000)
           : cfg.defaultTimeoutMs
-        const cmdId = `c${(eng.commands.length + 1).toString()}_${Date.now().toString(36)}`
+        const cmdId = `c${(eng.commands.length + 1).toString()}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
         const nodeHit = asText(args.node) !== '' ? findNode(eng, args.node) : undefined
+        if (asText(args.node) !== '' && nodeHit === undefined) {
+          throw new Error(`要关联的节点不存在：${args.node}。候选：${candidateHint(eng, args.node).join(' ; ')}`)
+        }
         const started = nowIso()
         /* 测绘密钥 → 环境变量：nmap/nuclei/curl 之外，fofa/github 的 CLI 也能直接读到 */
         const keyEnv = configStore !== undefined && configStore !== null ? configStore.keyEnv() : {}
@@ -1710,6 +2179,48 @@ function registerTools(ctx, store, cfg, bindings, configStore, trace, resolveAct
       }
     },
   })
+
+  register({
+    name: 'recon_nday',
+    description:
+      '按指纹 / 产品 / 版本检索历史 Nday 漏洞（只查 Exploit-DB 与 NVD 公开库，不对目标发包）。'
+      + '信息收集手专用：测绘中探测到服务/中间件/产品/版本指纹（如 “Apache 2.4.49”“Spring Boot 2.3”“致远OA A8”）后，主动用它找 CVE / EDB 与受影响版本，不必等总指挥指派；'
+      + '候选先写进 recon_board（kind=hypothesis，附来源），交 Web/QA 实测后再 recon_vuln。',
+    parameters: {
+      type: 'object',
+      properties: {
+        fingerprint: { type: 'string', description: '指纹 / 产品 + 版本，例如 “Apache 2.4.49”“Spring Boot 2.3”“致远OA A8”' },
+        limit: { type: 'number', description: '每个来源最多返回多少条，默认 8，最大 20' },
+      },
+      required: ['fingerprint'],
+      additionalProperties: false,
+    },
+    output: { schema: { type: 'string' }, render: (_args, value) => textBlocks(value) },
+    async execute(args) {
+      try {
+        const fingerprint = asText(args.fingerprint).replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160)
+        if (fingerprint.length < 2) throw new Error('缺少有效指纹：请给产品/版本/中间件特征，例如 “Apache 2.4.49”；只查历史库，不对目标发包')
+        const limit = Number.isFinite(args.limit) ? Math.min(20, Math.max(1, Math.round(args.limit))) : 8
+        const [exploitdb, nvd] = await Promise.all([
+          searchExploitDb(fingerprint, limit),
+          searchNvd(fingerprint, limit),
+        ])
+        const candidates = [...exploitdb.candidates, ...nvd.candidates].slice(0, limit * 2)
+        return json({
+          ok: true,
+          fingerprint,
+          sources: {
+            exploitdb: { source: 'exploitdb', candidates: exploitdb.candidates.length, error: exploitdb.error || '' },
+            nvd: { source: 'nvd', candidates: nvd.candidates.length, error: nvd.error || '' },
+          },
+          candidates,
+          hint: '只查了公开历史漏洞库，没有对目标发包；候选必须实测后才 recon_vuln，先写看板 kind=hypothesis 并附来源。',
+        })
+      } catch (error) {
+        return toolFailure(error)
+      }
+    },
+  })
 }
 
 function guessKind(value) {
@@ -1728,6 +2239,30 @@ function guessKind(value) {
 function shortText(value, max) {
   const text = String(value === undefined || value === null ? '' : value)
   return text.length > max ? `${text.slice(0, max - 1)}…` : text
+}
+
+/** 模型档位 → agentOptions：dsh / 未配置档位都回落到 DSH 默认模型。 */
+function modelSelectionFor(ctx, configStore, tier) {
+  const config = configStore.get()
+  const models = config.models || {}
+  const wanted = MODEL_TIERS.includes(asText(tier))
+    ? asText(tier)
+    : (asText(tier) === 'dsh' ? 'dsh' : 'deep')
+  if (wanted !== 'dsh') {
+    const pick = models[wanted] || {}
+    if (asText(pick.provider) !== '' && asText(pick.model) !== '') {
+      const selection = { provider: asText(pick.provider), model: asText(pick.model) }
+      const reasoning = asText(pick.reasoning)
+      if (THINKING_LEVELS.includes(reasoning)) selection.reasoningEffort = reasoning
+      return selection
+    }
+  }
+  const fallback = ctx.get('agentDefaultModel')
+  if (fallback !== undefined && fallback !== null && typeof fallback.currentSelection === 'function') {
+    const selection = fallback.currentSelection()
+    if (selection !== undefined && selection !== null && asText(selection.provider) !== '') return { ...selection }
+  }
+  return {}
 }
 
 /** 把一条消息的 content blocks 拼成纯文本（assistant/message 与 tool/result 共用）。 */
@@ -1755,6 +2290,8 @@ class Cockpit {
     this.counter = 0
     this.usage = new Map()
     this.lastNudge = new Map()
+    this.pendingNudges = new Map()
+    this.ensuring = new Map()
   }
 
   /** 项目被删除时丢掉它的驾驶舱会话与缓存，避免 session 泄漏 */
@@ -1767,8 +2304,17 @@ class Cockpit {
     this.transcripts?.delete?.(engagementId)
     this.usage?.delete?.(engagementId)
     this.lastNudge?.delete?.(engagementId)
+    this.pendingNudges?.delete?.(engagementId)
     this.promptCache?.delete?.(engagementId)
-    COMMANDER_SESSIONS.delete?.(engagementId)
+    this.ensuring?.delete?.(engagementId)
+    const saveTimer = this.saveTimers?.get?.(engagementId)
+    if (saveTimer !== undefined) clearTimeout(saveTimer)
+    this.saveTimers?.delete?.(engagementId)
+    /* 驾驶舱 session id 形如 recon-<eng>-<ts>-<n>：按前缀扫掉，别只删靶标 id（那永远删不到） */
+    const commanderPrefix = `recon-${String(engagementId).replace(/[^a-zA-Z0-9]/g, '')}-`
+    for (const id of Array.from(COMMANDER_SESSIONS)) {
+      if (id.startsWith(commanderPrefix)) COMMANDER_SESSIONS.delete(id)
+    }
   }
 
   chatDir() {
@@ -1812,28 +2358,14 @@ class Cockpit {
     this.scheduleSave(engagementId)
   }
 
-  /** 三档模型 → 真实 provider/model；空配置回落到 Harness 默认选择。 */
+  /** 三档模型 → 真实 provider/model；dsh / 空配置回落到 Harness 默认选择。 */
   modelFor(tier) {
-    const models = (this.configStore.get().models || {})
-    const wanted = MODEL_TIERS.includes(tier) ? tier : 'deep'
-    const pick = models[wanted] || {}
-    if (asText(pick.provider) !== '' && asText(pick.model) !== '') {
-      const selection = { provider: asText(pick.provider), model: asText(pick.model) }
-      if (asText(pick.reasoning) !== '') selection.reasoningEffort = asText(pick.reasoning)
-      return selection
-    }
-    const fallback = this.ctx.get('agentDefaultModel')
-    if (fallback !== undefined && fallback !== null && typeof fallback.currentSelection === 'function') {
-      const selection = fallback.currentSelection()
-      if (selection !== undefined && selection !== null && asText(selection.provider) !== '') return { ...selection }
-    }
-    return {}
+    return modelSelectionFor(this.ctx, this.configStore, tier)
   }
 
   /** 驾驶舱 AI 的系统提示：角色 + 靶标现场 + 记忆 + 密钥状态 + 技能。 */
   async cockpitPrompt(engagementId) {
     const config = this.configStore.get()
-    const role = config.role || {}
     const lines = []
     lines.push('## 你在「狩猎 · 驾驶舱」里工作')
     lines.push('')
@@ -1845,20 +2377,21 @@ class Cockpit {
     lines.push('- 派活时把要求写死：`name`（代号）、`prompt`（专属指令：目标/边界/产出/禁止事项）、`skills`（要加载哪些技能）、');
     lines.push('  `asRole`+`roleName`+`rolePrompt`（需要新兵种时现开，如 jsre/fuzzer/reporter/db-exploiter）；')
     lines.push('- 派完先回一句话「已派 X（代号）去做 Y」，然后继续推进下一步，不要自己顶上去干。')
+    lines.push('- 成员用 `recon_group request` 报告卡点时，你要判断是否需要建立小组：需要就用 `recon_squad action=group`，把专业角色、模型档位、skills、MCP 一并指定；小组整体只算一个并发，组内由成员用 `recon_group ask` 串行协作。')
     lines.push('')
     lines.push('## 谁出方案：参谋，不是你')
     lines.push('- 「怎么打、先打谁、优先级排序、绕过思路、下一步路线」这类**方案**，一律 `recon_squad task` 派给参谋（role=staff）出；')
     lines.push('- 你的活是：把参谋的方案拆成可验收的任务 → 派给执行角色 → 收结果 → 交用户；方案本身不由你拍；')
-    lines.push('- 参谋没到位时，先 `recon_org recruit role=staff` 补位（每场只有一个参谋），再把问题丢给它，别自己顶上；')
+    lines.push('- 参谋是常设席位（每场一个、自动补位），不在岗时等补位，不要尝试 recruit；把问题丢给参谋，别自己顶上；')
     lines.push('- 你只对「派谁、什么时候派、验收过没过」负责；对「这仗该怎么打」负责的是参谋。')
-    lines.push(`角色：${asText(role.name, '红队指挥席')}`)
-    if (asText(role.mission) !== '') lines.push(`任务：${asText(role.mission)}`)
-    if (asText(role.rules) !== '') {
-      lines.push('规则：')
-      for (const rule of String(role.rules).split('\n')) {
-        const line = rule.trim()
-        if (line !== '') lines.push(`- ${line}`)
-      }
+    /* 驾驶舱总指挥就是常设席位的总指挥：共用 core.commander 的人设与提示词 */
+    const commanderRole = this.squad !== undefined && this.squad !== null
+      ? this.squad.coreRoles().find((item) => item.id === 'commander')
+      : DEFAULT_CORE_ROLES.find((item) => item.id === 'commander')
+    lines.push(`角色：${commanderRole !== undefined ? asText(commanderRole.name, '总指挥') : '总指挥'}（最高统领）`)
+    if (commanderRole !== undefined && asText(commanderRole.prompt) !== '') {
+      lines.push('')
+      lines.push(commanderRole.prompt)
     }
     const eng = await this.store.load(engagementId)
     if (eng !== undefined) {
@@ -1867,19 +2400,20 @@ class Cockpit {
       lines.push(`当前靶标：${eng.name}（id ${eng.id}）`)
       if (eng.scope.length > 0) lines.push(`授权范围：${eng.scope.join(', ')}`)
       lines.push(`图谱现状：节点 ${stats.nodes} · 关系 ${stats.edges} · 漏洞 ${stats.vulns} · 命令 ${stats.commands}`)
-      const recent = eng.nodes.slice(-30).map((node) => `${node.kind}:${node.value}`)
+      const recent = eng.nodes.filter((node) => node.archived !== true).slice(-30).map((node) => `${node.kind}:${node.value}`)
       if (recent.length > 0) lines.push(`已收录资产（尾 30）：${recent.join(' , ')}`)
-      const openVulns = eng.vulns.filter((v) => v.status !== 'false-positive' && v.status !== 'fixed').slice(-10)
+      const activeNodeIds = new Set(eng.nodes.filter((node) => node.archived !== true).map((node) => node.id))
+      const openVulns = eng.vulns.filter((v) => activeNodeIds.has(v.nodeId) && v.status !== 'false-positive' && v.status !== 'fixed').slice(-10)
       if (openVulns.length > 0) {
         lines.push(`未闭环漏洞：${openVulns.map((v) => `${v.severity}/${v.title}`).join(' ; ')}`)
       }
     }
-    /* 用户在看板上的发言：全量置顶注入总指挥上下文 */
+    /* 完整看板：所有 agent 必须看到全部文字，用户发言全文且无上限 */
     try {
-      const directives = await userDirectives(this.board, engagementId)
-      if (directives !== '') {
+      const boardText = await boardPromptText(this.board, engagementId)
+      if (boardText !== '') {
         lines.push('')
-        lines.push(directives)
+        lines.push(boardText)
       }
     } catch { /* 取不到就跳过 */ }
     try {
@@ -1919,52 +2453,68 @@ class Cockpit {
     const memory = Array.isArray(config.memory) ? config.memory : []
     if (memory.length > 0) {
       lines.push('')
-      lines.push('长期记忆：')
-      for (const item of memory.slice(0, 40)) {
-        const title = asText(item.title, '记忆')
-        const body = asText(item.content)
-        if (body !== '') lines.push(`- ${title}：${body}`)
+      lines.push('## 长期记忆（全局强制阅读，全部条目）')
+      for (const item of memory) {
+        const entry = memoryEntryOf(item)
+        if (entry.content !== '') lines.push(`- [${entry.category || 'other'}] ${entry.title}：${entry.content}`)
       }
     }
     const enabledSkills = Array.isArray(config.skills && config.skills.enabled) ? config.skills.enabled : []
-    if (enabledSkills.length > 0) lines.push(`\n可用技能（需要时用 skill 工具加载）：${enabledSkills.join(', ')}`)
+    if (enabledSkills.length > 0) lines.push(`\n可用技能（需要时用 recon_skill action=load 读取完整技能；若会话另有 skill 工具也可用）：${enabledSkills.join(', ')}`)
     const presence = this.configStore.keyPresence()
     const ready = Object.entries(presence).filter(([, ok]) => ok).map(([key]) => key)
     const missing = Object.entries(presence).filter(([, ok]) => !ok).map(([key]) => key)
     lines.push(`\n测绘密钥：已配置 ${ready.length > 0 ? ready.join('/') : '（无）'}；未配置 ${missing.length > 0 ? missing.join('/') : '（无）'}`)
     lines.push('密钥已注入命令环境（如 FOFA_KEY / GITHUB_TOKEN / SHODAN_API_KEY），recon_run 里可直接引用，不要在回答里回显明文。')
-    if (asText(config.prompt && config.prompt.extra) !== '') {
-      lines.push('')
-      lines.push('附加指令：')
-      lines.push(String(config.prompt.extra))
-    }
     lines.push('')
     lines.push('你也可以当指挥：`recon_squad` 派独立 Agent 并行推进（不用等），`recon_board` 读写团队看板，`recon_browser` 做真实页面操作。')
     lines.push('')
     lines.push('组织编制（谁干什么）：')
-    for (const role of this.roles()) {
-      lines.push(`- ${role.name}（${role.id}，${role.tier}）${role.reportsTo ? `→ 向 ${role.reportsTo} 汇报` : '（最高指挥）'}`)
+    const orgRoles = this.squad !== undefined && this.squad !== null
+      ? [...this.squad.coreRoles(), ...this.squad.roles()]
+      : this.roles()
+    for (const role of orgRoles) {
+      const isCore = role.core === true || CORE_ROLES.has(role.id)
+      const roleSkills = asList(role.skills).filter((name) => asText(name) !== '')
+      const roleMcp = asMcpList(role.mcp).filter((row) => row.enabled !== false).map((row) => row.name)
+      const detail = [
+        roleSkills.length > 0 ? `技能：${roleSkills.join(', ')}` : '',
+        roleMcp.length > 0 ? `MCP：${roleMcp.join(', ')}` : '',
+      ].filter((line) => line !== '').join('；')
+      lines.push(`- ${role.name}（${role.id}，${role.tier}）${isCore ? '（常设席位，每靶标各一个，不可召唤）' : (role.reportsTo ? `→ 向 ${role.reportsTo} 汇报` : '（最高指挥）')}${detail !== '' ? `｜${detail}` : ''}`)
     }
     lines.push('职责边界：Web 页面操作归 web 手；JS/APK/EXE 逆向归 reverser；内网横向/隧道归 intranet；')
     lines.push('漏洞真伪实测与任务达标判定归 qa；方案与优先级归 staff；commander 只调度不亲自扫。')
-    lines.push('工作闭环：commander 让 staff 出方案 → `recon_task create` 拆任务（写清目标与验收标准）→ 派给角色 →')
-    lines.push('qa 用 `recon_task accept/reject` 判定；reject 会自动生成返工任务回到 commander。')
+    lines.push('指纹 Nday：把指纹交给信息收集手（scout），用 `recon_nday` 查 Exploit-DB/NVD 历史漏洞；只查库，不对目标发包，候选先写看板。')
+    lines.push('强制工作闭环：commander 先让 staff 把整体方案写进看板 kind=hypothesis → commander 读方案后用 `recon_task mission set` 登记目标 →')
+    lines.push('`recon_task create` 拆成可验收任务 → 给每个成员指定模型档位/skills/MCP/上下文并派活 → 成员完成主动回报 →')
+    lines.push('commander 安排 qa 核查上一个角色的命令/范围/证据/结果 → qa 只能 accept/reject；reject 自动生成返工任务回到 commander →')
+    lines.push('全部任务有 verifiedBy=qa 后，qa 提交最终验收报告 → commander 复核并 `mission close` 宣布结束，系统停止并回收非核心队员。')
     lines.push('需要临时兵种（写工具、出报告、做钓鱼页）用 `recon_org recruit` 传新 role 与 rolePrompt 即可开新角色。')
     lines.push('你还能改系统配置：')
     lines.push('- 用户说「每发现一个新资产就让漏洞猎手去探测」→ `recon_watch` add, on=node.created, role=hunter（kinds 默认 subdomain/ip/url/service/endpoint）')
     lines.push('- 用户说「新漏洞自动用浏览器验证」→ `recon_watch` add, on=vuln.created, role=browser, tier=vision')
-    lines.push('- 用户说「每 30 分钟巡检一次」→ `recon_watch` add, on=interval, everyMs=1800000, role=analyst')
+    lines.push('- 用户说「每 30 分钟巡检一次」→ `recon_watch` add, on=interval, everyMs=1800000, role=scout')
     lines.push('- 用户说「把 FOFA key 配成 xxx」→ `recon_config` set, section=keys, values={fofa:"xxx"}（其它 key 同理：github/shodan/virustotal/quake/…）')
     lines.push('- 用户说「高复杂模型换成 …」→ `recon_config` set, section=models, values={deep:{provider,model}}')
     lines.push('配完用一句话确认结果（不要把密钥明文回显给用户）。')
-    lines.push('工作方式：用户在这里用一句话下指令，你直接调用 recon_run / recon_asset / recon_link / recon_vuln / recon_ingest 写同一张图；')
-    lines.push('每条命令都带上 purpose；每发现一个资产就落图并连边；不要反问“要不要继续”，把当前能推进的一步做完再汇报。')
-    return safePromptText(lines.join('\n'))
+    lines.push('工作方式：用户在这里用一句话下指令，你负责拆解、派活、验收和收结果；')
+    lines.push('只有读日志/看图谱这类只读核对可以自己用 recon_run，扫描、爆破、验证、抓页面一律派给队员；')
+    lines.push('派活时写清 purpose、边界和证据要求；不要反问“要不要继续”，把当前能推进的一步做完再汇报。')
+    return safePromptText(withCommonPrompt(this.configStore.get(), lines.join('\n')))
   }
 
   async ensure(engagementId) {
     const existing = this.sessions.get(engagementId)
     if (existing !== undefined && existing.agent !== null) return existing
+    const pending = this.ensuring.get(engagementId)
+    if (pending !== undefined) return pending
+    const promise = this.ensureInner(engagementId).finally(() => { this.ensuring.delete(engagementId) })
+    this.ensuring.set(engagementId, promise)
+    return promise
+  }
+
+  async ensureInner(engagementId) {
     const agents = this.ctx.get('agents')
     if (agents === undefined || agents === null) throw new Error('agents 服务不可用：当前 profile 没有 agent 驱动')
     const eng = await this.store.load(engagementId)
@@ -1984,6 +2534,10 @@ class Cockpit {
       handle: null,
       busy: false,
       buffers: { text: '', reasoning: '' },
+      turnText: '',
+      turnReasoning: '',
+      turnModel: undefined,
+      lastSegment: null,
     }
     const cockpit = this
     const setup = (agentCtx) => {
@@ -2110,7 +2664,7 @@ class Cockpit {
       if (file === null || typeof file !== 'object') continue
       const path = asText(file.path)
       if (path === '') continue
-      const uploadsRoot = resolve(this.cfg.root, 'uploads')
+      const uploadsRoot = resolve(this.cfg.root, 'uploads', engagementId)
       const resolved = resolve(path)
       if (!resolved.startsWith(`${uploadsRoot}${sep}`)) continue
       files.push({ path: resolved, name: asText(file.name, resolved.split(sep).pop()), bytes: Number.isFinite(file.bytes) ? file.bytes : 0 })
@@ -2139,38 +2693,76 @@ class Cockpit {
     return { ok: true, engagementId, sessionId: state.sessionId, tier: state.tier }
   }
 
-  /** 主动催办：任务账本出现返工/待办时，把指挥席从 idle 里叫起来（带冷却与去重）。 */
-  async nudge(engagementId, reason) {
-    const state = this.sessions.get(engagementId)
+  /**
+   * 主动通知指挥席。默认只在有返工/指挥官待办时催办；
+   * options.always=true 允许成员完成回报等场景；
+   * options.final=true 是 QA 全部验收后的强制收尾通知，必须把指挥席叫醒。
+   */
+  async nudge(engagementId, reason, options = {}) {
+    let state = this.sessions.get(engagementId)
+    if ((state === undefined || state.agent === null) && options.final === true) {
+      try { state = await this.ensure(engagementId) } catch { state = undefined }
+    }
     if (state === undefined) return { skipped: 'no-session' }
     if (state.agent === null) return { skipped: 'no-agent' }
-    if (state.busy) return { skipped: 'busy' }
+    const force = options.force === true
+    const final = options.final === true
+    const always = options.always === true
+    /* 指挥官正在跑时不要打断；保留一条待发通知，turn/end 后自动补发。
+       final 通知优先级最高，不能被普通成员完成通知覆盖。 */
+    if (state.busy) {
+      const pending = this.pendingNudges.get(engagementId)
+      if (pending === undefined || pending.options.final !== true || final) {
+        this.pendingNudges.set(engagementId, { reason: asText(reason), options: { ...options } })
+      }
+      return { ok: true, queued: true, reason: 'commander-busy' }
+    }
     const last = this.lastNudge.get(engagementId) || 0
-    if (nowMs() - last < 90000) return { skipped: 'cooldown' }
+    if (!force && nowMs() - last < 90000) return { skipped: 'cooldown' }
     if (this.tasks === undefined || this.tasks === null) return { skipped: 'no-tasks' }
     const rows = await this.tasks.list(engagementId, 200)
+    const allPassed = rows.length > 0 && rows.every((row) => row.status === 'passed')
+    if (final && !allPassed) return { skipped: 'not-ready' }
+    if (final) {
+      const mission = await this.tasks.missionOf(engagementId)
+      if (mission !== null && mission !== undefined && mission.status === 'done') return { skipped: 'already-closed' }
+    }
     const failed = rows.filter((row) => row.status === 'failed')
     const mine = rows.filter((row) => row.role === 'commander' && row.status !== 'passed' && row.status !== 'failed')
     const pending = rows.filter((row) => row.status === 'failed' || (row.role === 'commander' && row.status === 'open'))
-    if (pending.length === 0) return { skipped: 'nothing-to-do' }
+    if (pending.length === 0 && !final && !always) return { skipped: 'nothing-to-do' }
+    if (rows.length === 0 && !always) return { skipped: 'no-tasks' }
     this.lastNudge.set(engagementId, nowMs())
     void this.trace?.push?.(engagementId, {
       kind: 'nudge',
       actor: { role: 'system', name: '调度台' },
-      title: '主动催办总指挥',
+      title: final ? '通知总指挥：QA 已全部验收' : '主动催办总指挥',
       detail: asText(reason),
     })
-    const lines = ['【调度台提醒】任务账本有新情况，先处理这些再继续别的事：']
-    if (failed.length > 0) {
-      lines.push(`被验收驳回 ${failed.length} 条：`)
-      for (const row of failed.slice(-6)) lines.push(`- ${row.id} ${row.title}｜缺口：${shortText(row.note || '未达标', 120)}`)
+    const lines = []
+    if (final) {
+      lines.push('【QA 终验完成 · 等总指挥宣布结束】')
+      lines.push(`验收员已完成全部 ${rows.length} 条任务的核查，任务账本全部为 passed。现在必须由你（总指挥）做最终决定：`)
+      for (const row of rows.slice(-12)) {
+        lines.push(`- ${row.id} ${row.title}｜${row.status}${row.verifiedBy && row.verifiedBy.role ? `｜验收：${row.verifiedBy.name || row.verifiedBy.role}` : ''}`)
+      }
+      lines.push('① 先用 `recon_task action=list` 复核每条任务和证据；')
+      lines.push('② 若确认目标达成，立即执行 `recon_task action=mission missionAction=close`；close 会停止并回收所有非核心队员，只保留总指挥/参谋常设席位；')
+      lines.push('③ 若仍有缺口，明确说明并重新拆任务或让 QA 驳回，绝对不要口头宣布完成。')
+      lines.push('不要在收尾前继续扫描，也不要自己冒充 QA。')
+    } else {
+      lines.push('【调度台提醒】任务账本有新情况，先处理这些再继续别的事：')
+      if (failed.length > 0) {
+        lines.push(`被验收驳回 ${failed.length} 条：`)
+        for (const row of failed.slice(-6)) lines.push(`- ${row.id} ${row.title}｜缺口：${shortText(row.note || '未达标', 120)}`)
+      }
+      if (mine.length > 0) {
+        lines.push('等你重新拆解/分派：')
+        for (const row of mine.slice(-6)) lines.push(`- ${row.id} ${row.title}｜目标：${shortText(row.goal || '-', 100)}`)
+      }
+      lines.push('要求：读 `recon_task list` 确认状态；有返工就重新拆成可验收小任务并派给合适角色；')
+      lines.push('成员完成后先安排 QA 核验证据，再决定是否通过；不要自己下场扫。')
     }
-    if (mine.length > 0) {
-      lines.push(`等你重新拆解/分派：`)
-      for (const row of mine.slice(-6)) lines.push(`- ${row.id} ${row.title}｜目标：${shortText(row.goal || '-', 100)}`)
-    }
-    lines.push('要求：读 `recon_task list` 确认状态，把返工任务重新拆成可验收的小任务派给合适角色；')
-    lines.push('派完用一句话汇报你派了谁、做什么；不要自己下场扫。')
     if (asText(reason) !== '') lines.push(`触发原因：${reason}`)
     const text = lines.join('\n')
     await this.refreshPrompt(engagementId)
@@ -2185,7 +2777,17 @@ class Cockpit {
       source: { kind: 'user' },
     })
     this.hub.broadcast({ type: 'chat.status', engagementId, status: 'running' })
-    return { ok: true, nudged: pending.length }
+    return { ok: true, nudged: pending.length, final }
+  }
+
+  /** turn/end 或 agent error 后补发被 busy 挡住的指挥席通知。 */
+  flushPendingNudge(engagementId) {
+    const pending = this.pendingNudges.get(engagementId)
+    if (pending === undefined) return
+    this.pendingNudges.delete(engagementId)
+    setTimeout(() => {
+      void this.nudge(engagementId, pending.reason, pending.options).catch(() => {})
+    }, 0)
   }
 
   async stop(engagementId) {
@@ -2197,8 +2799,25 @@ class Cockpit {
   }
 
   async clear(engagementId) {
+    const state = this.sessions.get(engagementId)
+    if (state !== undefined) {
+      try { state.agent?.cancel?.({ kind: 'user', reason: 'clear' }) } catch { /* 没在跑 */ }
+      try { await state.handle?.dispose?.() } catch { /* 已释放 */ }
+      this.sessions.delete(engagementId)
+      if (typeof state.sessionId === 'string') COMMANDER_SESSIONS.delete(state.sessionId)
+    }
+    const timer = this.saveTimers.get(engagementId)
+    if (timer !== undefined) clearTimeout(timer)
+    this.saveTimers.delete(engagementId)
+    this.ensuring.delete(engagementId)
     this.transcripts.set(engagementId, [])
-    this.scheduleSave(engagementId)
+    this.usage.set(engagementId, { input: 0, output: 0, total: 0, turns: 0 })
+    this.lastNudge.delete(engagementId)
+    this.pendingNudges.delete(engagementId)
+    try {
+      await ensureDir(this.chatDir())
+      await writeFile(this.chatFile(engagementId), '[]\n', 'utf8')
+    } catch { /* 落盘失败不影响清空界面 */ }
     this.hub.broadcast({ type: 'chat.cleared', engagementId })
     return { ok: true }
   }
@@ -2341,6 +2960,7 @@ class Cockpit {
             })
           }
           state.lastSegment = undefined
+          this.flushPendingNudge(engagementId)
           this.hub.broadcast({
             type: 'chat.turn-end',
             engagementId,
@@ -2355,7 +2975,10 @@ class Cockpit {
         if (state === undefined) return
         state.busy = payload.status === 'running'
         this.hub.broadcast({ type: 'chat.status', engagementId: state.engagementId, status: payload.status })
-        if (payload.status === 'idle') this.refreshPrompt(state.engagementId)
+        if (payload.status === 'idle') {
+          this.refreshPrompt(state.engagementId)
+          this.flushPendingNudge(state.engagementId)
+        }
       } catch { /* 同上 */ }
     })
     const offError = ctx.on('agent/error', (payload) => {
@@ -2363,6 +2986,8 @@ class Cockpit {
         const state = this.stateForAgent(payload.agent)
         if (state === undefined) return
         const error = payload.error
+        state.busy = false
+        this.flushPendingNudge(state.engagementId)
         this.hub.broadcast({
           type: 'chat.error',
           engagementId: state.engagementId,
@@ -2389,9 +3014,14 @@ class Cockpit {
   async dropEngagement(engagementId) {
     const state = this.sessions.get(engagementId)
     if (state !== undefined) {
+      if (typeof state.sessionId === 'string') COMMANDER_SESSIONS.delete(state.sessionId)
       try { await state.handle.dispose() } catch { /* 已释放 */ }
       this.sessions.delete(engagementId)
     }
+    const timer = this.saveTimers.get(engagementId)
+    if (timer !== undefined) clearTimeout(timer)
+    this.saveTimers.delete(engagementId)
+    this.ensuring.delete(engagementId)
     this.transcripts.delete(engagementId)
     try { await unlink(this.chatFile(engagementId)) } catch { /* 没有记录 */ }
   }
@@ -2426,6 +3056,7 @@ class Brief {
     this.audit = deps.audit
     this.sessions = new Map()
     this.history = new Map()
+    this.ensuring = new Map()
   }
 
   dir() { return join(this.cfg.root, 'brief') }
@@ -2448,7 +3079,7 @@ class Brief {
     this.history.set(engagementId, kept)
     try {
       await mkdir(this.dir(), { recursive: true })
-      await writeFile(this.file(engagementId), JSON.stringify(kept, null, 2), 'utf8')
+      await writeJsonAtomic(this.file(engagementId), kept)
     } catch { /* 落盘失败不影响当轮回答 */ }
   }
 
@@ -2468,7 +3099,7 @@ class Brief {
     lines.push('- 先结论，后依据，三到八行。')
     lines.push('- 讲进展就讲「已经拿下什么 / 正在打什么 / 卡在哪 / 下一步建议」。')
     lines.push('- 有返工、有被驳回、有 stalled，就直说，不要粉饰。')
-    return lines.join('\n')
+    return safePromptText(withCommonPrompt(this.configStore.get(), lines.join('\n')))
   }
 
   /** 现场快照：每次提问都重新算，保证「时刻」拥有总指挥的最新状态 */
@@ -2500,7 +3131,7 @@ class Brief {
 
     /* 作战目标 */
     try {
-      const mission = await this.tasks?.mission?.(engagementId)
+      const mission = await this.tasks?.missionOf?.(engagementId)
       if (mission !== undefined && mission !== null && asText(mission.goal) !== '') {
         lines.push(`作战目标：${asText(mission.goal)}（${asText(mission.status, 'open')}）`)
       }
@@ -2514,9 +3145,11 @@ class Brief {
         const open = rows.filter((row) => row.status === 'open')
         const failed = rows.filter((row) => row.status === 'failed')
         const passed = rows.filter((row) => row.status === 'passed')
-        lines.push(`任务账本：共 ${rows.length} · 进行中 ${doing.length} · 待领 ${open.length} · 被驳回 ${failed.length} · 已通过 ${passed.length}`)
+        const blocked = rows.filter((row) => row.status === 'blocked')
+        lines.push(`任务账本：共 ${rows.length} · 进行中 ${doing.length} · 待领 ${open.length} · 受阻 ${blocked.length} · 被驳回 ${failed.length} · 已通过 ${passed.length}`)
         for (const row of doing.slice(-6)) lines.push(`  · [doing] ${row.id} ${row.title}（${asText(row.assignee || row.role, '-')}）`)
         for (const row of open.slice(-5)) lines.push(`  · [open] ${row.id} ${row.title}（${asText(row.role, '-')}）`)
+        for (const row of blocked.slice(-4)) lines.push(`  · [blocked] ${row.id} ${row.title}｜${shortText(row.note || '-', 90)}`)
         for (const row of failed.slice(-4)) lines.push(`  · [被驳回] ${row.id} ${row.title}｜缺口：${shortText(row.note || '-', 90)}`)
         for (const row of passed.slice(-4)) lines.push(`  · [通过] ${row.id} ${row.title}`)
       }
@@ -2526,12 +3159,13 @@ class Brief {
     try {
       const members = this.squad?.list?.(engagementId)
       if (Array.isArray(members) && members.length > 0) {
-        lines.push(`在岗：${members.map((m) => `${asText(m.name || m.key, '-')}(${asText(m.roleLabel || m.role, '-')}${m.busy ? '·忙' : ''})`).join(' , ')}`)
+        lines.push(`在岗：${members.map((m) => `${asText(m.name || m.key, '-')}(${asText(m.role, '-')}${m.status === 'running' ? '·忙' : ''})`).join(' , ')}`)
       }
     } catch { /* 同上 */ }
 
     /* 未闭环漏洞 */
-    const openVulns = eng.vulns.filter((v) => v.status !== 'false-positive' && v.status !== 'fixed')
+    const briefActiveNodeIds = new Set(eng.nodes.filter((node) => node.archived !== true).map((node) => node.id))
+    const openVulns = eng.vulns.filter((v) => briefActiveNodeIds.has(v.nodeId) && v.status !== 'false-positive' && v.status !== 'fixed')
     if (openVulns.length > 0) {
       const rank = { critical: 0, high: 1, medium: 2, low: 3, info: 4 }
       const sorted = openVulns.slice().sort((a, b) => (rank[a.severity] === undefined ? 9 : rank[a.severity]) - (rank[b.severity] === undefined ? 9 : rank[b.severity]))
@@ -2541,25 +3175,12 @@ class Brief {
       }
     }
 
-    /* 指挥席本人的看板发言：与 agent 提示词同一份全量（带长度保护） */
+    /* 完整看板：用户发言全文 + 全部 agent 条目全文 */
     try {
-      const directives = this.board === undefined || this.board === null
-        ? ''
-        : (await this.board.raw(engagementId), this.board.directivesForPrompt(engagementId, 12000))
-      if (directives !== '') {
+      const boardText = await boardPromptText(this.board, engagementId)
+      if (boardText !== '') {
         lines.push('')
-        lines.push(directives)
-      }
-    } catch { /* 同上 */ }
-
-    /* 看板 */
-    try {
-      const entries = await this.board?.list?.(engagementId, 40)
-      if (Array.isArray(entries) && entries.length > 0) {
-        lines.push('看板最近：')
-        for (const entry of entries.slice(-10)) {
-          lines.push(`  · [${asText(entry.kind, 'note')}] ${shortText(asText(entry.text).replace(/\s+/g, ' '), 130)}`)
-        }
+        lines.push(boardText)
       }
     } catch { /* 同上 */ }
 
@@ -2569,16 +3190,18 @@ class Brief {
       if (commands.length > 0) {
         lines.push('最近命令：')
         for (const cmd of commands) {
-          const who = asText(cmd.actor && cmd.actor.name, '总指挥')
-          const tail = shortText(asText(cmd.output).replace(/\s+/g, ' '), 90)
-          lines.push(`  · ${who}｜${shortText(asText(cmd.command), 70)}｜${asText(cmd.status, '-')}${tail !== '' ? `｜${tail}` : ''}`)
+          const member = cmd.sessionId ? this.squad?.memberBySessionId?.(cmd.sessionId) : undefined
+          const who = member !== undefined ? member.name : '总指挥'
+          const tail = shortText((asText(cmd.tail) || asText(cmd.stderrTail)).replace(/\s+/g, ' '), 90)
+          const status = cmd.timedOut === true ? 'timeout' : (cmd.exitCode === null ? 'running' : `exit=${cmd.exitCode}`)
+          lines.push(`  · ${who}｜${shortText(asText(cmd.command), 70)}｜${status}${tail !== '' ? `｜${tail}` : ''}`)
         }
       }
     } catch { /* 同上 */ }
 
     /* 轨迹（派活 / 验收 / 开会） */
     try {
-      const rows = this.trace?.list?.(engagementId, 12)
+      const rows = await this.trace?.list?.(engagementId, 12)
       if (Array.isArray(rows) && rows.length > 0) {
         lines.push('最近动作：')
         for (const row of rows.slice(-8)) {
@@ -2589,11 +3212,24 @@ class Brief {
 
     /* 停滞判定 */
     try {
-      const status = await this.meeting?.status?.(engagementId)
+      const status = await this.meeting?.verdict?.(eng)
       if (status !== undefined && status !== null && status.stalled === true) {
         lines.push(`停滞告警：${Array.isArray(status.reasons) ? status.reasons.join('；') : '任务已派完但无新进展'}`)
       }
     } catch { /* 同上 */ }
+
+    try {
+      const config = this.configStore.get()
+      const memory = Array.isArray(config.memory) ? config.memory : []
+      if (memory.length > 0) {
+        lines.push('')
+        lines.push('## 长期记忆（全局强制阅读，全部条目）')
+        for (const item of memory) {
+          const entry = memoryEntryOf(item)
+          if (entry.content !== '') lines.push(`- [${entry.category || 'other'}] ${entry.title}：${entry.content}`)
+        }
+      }
+    } catch { /* 取不到记忆就不带 */ }
 
     lines.push('</situation>')
     return lines.join('\n')
@@ -2602,6 +3238,14 @@ class Brief {
   async ensure(engagementId) {
     const existing = this.sessions.get(engagementId)
     if (existing !== undefined && existing.agent !== null) return existing
+    const pending = this.ensuring.get(engagementId)
+    if (pending !== undefined) return pending
+    const promise = this.ensureInner(engagementId).finally(() => { this.ensuring.delete(engagementId) })
+    this.ensuring.set(engagementId, promise)
+    return promise
+  }
+
+  async ensureInner(engagementId) {
     const agents = this.ctx.get('agents')
     if (agents === undefined || agents === null) throw new Error('agent 服务不可用')
     const config = this.configStore.get()
@@ -2634,6 +3278,7 @@ class Brief {
               'recon_start', 'recon_run', 'recon_asset', 'recon_asset_remove', 'recon_link', 'recon_ingest',
               'recon_vuln', 'recon_update', 'recon_watch', 'recon_browser', 'recon_squad', 'recon_org',
               'recon_task', 'recon_checkpoint', 'recon_config', 'recon_meeting',
+              'recon_board', 'recon_audit',
               'bash', 'write', 'edit', 'terminal_open', 'terminal_send', 'subagent',
             ],
           })
@@ -2669,22 +3314,9 @@ class Brief {
     return state
   }
 
-  /** 模型档位解析：与驾驶舱同一套逻辑，取不到就回落到宿主默认模型 */
+  /** 模型档位解析：与驾驶舱同一套逻辑，dsh / 未配置时回落到宿主默认模型 */
   modelForTier(tier) {
-    const models = (this.configStore.get().models || {})
-    const wanted = MODEL_TIERS.includes(tier) ? tier : 'deep'
-    const pick = models[wanted] || {}
-    if (asText(pick.provider) !== '' && asText(pick.model) !== '') {
-      const selection = { provider: asText(pick.provider), model: asText(pick.model) }
-      if (asText(pick.reasoning) !== '') selection.reasoningEffort = asText(pick.reasoning)
-      return selection
-    }
-    const fallback = this.ctx.get('agentDefaultModel')
-    if (fallback !== undefined && fallback !== null && typeof fallback.currentSelection === 'function') {
-      const selection = fallback.currentSelection()
-      if (selection !== undefined && selection !== null && asText(selection.provider) !== '') return { ...selection }
-    }
-    return {}
+    return modelSelectionFor(this.ctx, this.configStore, tier)
   }
 
   workDirOf() {
@@ -2720,10 +3352,17 @@ class Brief {
     if (state.fresh === true) {
       state.fresh = false
       const rows = await this.readHistory(engagementId)
-      const pairs = rows.filter((row) => row.role === 'assistant').slice(-8)
+      const pairs = []
+      for (let i = 0; i < rows.length; i += 1) {
+        const user = rows[i]
+        if (user === null || user.role !== 'user') continue
+        const answer = rows.slice(i + 1).find((row) => row && row.role === 'assistant')
+        if (answer === undefined) continue
+        pairs.push(`Q：${shortText(asText(user.text).replace(/\s+/g, ' '), 180)}\nA：${shortText(asText(answer.text).replace(/\s+/g, ' '), 240)}`)
+      }
       if (pairs.length > 0) {
         history = '\n\n<history>\n下面是你和指挥席之前的问答（上下文已换新会话，仅供你接续，不要复述）：\n'
-          + pairs.map((row) => `Q/A：${shortText(asText(row.text).replace(/\s+/g, ' '), 240)}`).join('\n')
+          + pairs.slice(-8).join('\n')
           + '\n</history>'
       }
     }
@@ -2755,6 +3394,7 @@ class Brief {
       try { await state.handle?.dispose?.() } catch { /* 已释放 */ }
       this.sessions.delete(engagementId)
     }
+    this.ensuring.delete(engagementId)
     await this.writeHistory(engagementId, [])
     this.hub.broadcast({ type: 'brief.cleared', engagementId })
     return { ok: true }
@@ -2767,6 +3407,7 @@ class Brief {
       this.sessions.delete(engagementId)
     }
     this.history.delete(engagementId)
+    this.ensuring.delete(engagementId)
   }
 
   stateForAgent(agent) {
@@ -2820,6 +3461,7 @@ class Brief {
           this.hub.broadcast({ type: 'brief.status', engagementId, status: 'running' })
         } else if (event.type === 'turn/end') {
           state.busy = false
+          state.busySince = 0
           const fullText = (state.turnText || '').trim()
           const fullReasoning = (state.turnReasoning || '').trim()
           state.turnText = ''
@@ -2835,12 +3477,7 @@ class Brief {
             /* 只进汇报席自己的历史文件，不进 cockpit transcript */
             void (async () => {
               const rows = await this.readHistory(engagementId)
-              const lastUser = [...rows].reverse().find((row) => row.role === 'user')
-              const next = rows.concat([
-                ...(lastUser === undefined || lastUser.answered === true ? [] : []),
-                { ...record, role: 'assistant', answered: true },
-              ])
-              await this.writeHistory(engagementId, next)
+              await this.writeHistory(engagementId, rows.concat([{ ...record, role: 'assistant', answered: true }]))
             })()
             this.hub.broadcast({ type: 'brief.message', engagementId, message: record })
           }
@@ -2862,6 +3499,8 @@ class Brief {
         const state = this.stateForAgent(payload.agent)
         if (state === undefined) return
         const error = payload.error
+        state.busy = false
+        state.busySince = 0
         this.hub.broadcast({
           type: 'brief.error',
           engagementId: state.engagementId,
@@ -2911,6 +3550,17 @@ function normalizeMcpEntry(row) {
     url: asText(row.url),
     headers: row.headers && typeof row.headers === 'object' && !Array.isArray(row.headers) ? row.headers : {},
   }
+}
+
+function redactMcpSecrets(row) {
+  if (row === null || typeof row !== 'object') return row
+  const next = { ...row }
+  for (const field of ['env', 'headers']) {
+    if (next[field] !== null && typeof next[field] === 'object' && !Array.isArray(next[field])) {
+      next[field] = Object.fromEntries(Object.keys(next[field]).map((key) => [key, '••••••••']))
+    }
+  }
+  return next
 }
 
 class McpBinder {
@@ -2976,6 +3626,104 @@ class McpBinder {
 
 /* ────────────────────────── 协作层：看板 / 队伍 / 浏览器 / 自动化 ────────────────────────── */
 
+/** 信息收集手的固定 Nday 检索职能；现有配置缺失时会自动补进 scout 提示词。 */
+/** 旧版 Nday 段落：用于把已有 scout 提示词升级成「探测到指纹后主动查」的版本。 */
+const SCOUT_NDAY_PROMPT_LEGACY = '**指纹 Nday 检索（固定职能，只查历史漏洞，不对目标发包）**：总指挥给你一个指纹/产品/版本时，调用 `recon_nday fingerprint="..."` 查 Exploit-DB 与 NVD，产出候选 CVE/EDB、受影响版本与来源链接，写进看板 kind=hypothesis；需要实测的交 Web 手或 QA。没有指纹时不要主动扫目标。'
+const SCOUT_NDAY_PROMPT = '**指纹 Nday 检索**：一旦确认产品/中间件/服务/版本指纹，立刻用 `recon_nday fingerprint="产品 版本"` 查 Exploit-DB 与 NVD；每个指纹至少查一次，把候选 CVE/EDB、受影响版本、来源链接和可信度写进看板 kind=hypothesis；需要实测的交 Web 手或 QA。只查公开历史漏洞库，不对目标发包；没有指纹时不要主动扫目标。'
+
+/** 旧版默认 scout 提示词，仅用于自动升级；用户自定义内容不会被覆盖。 */
+const SCOUT_PROMPT_LEGACY = '你是信息收集手（Scout）。只做测绘：子域、端口、指纹、目录、接口、证书、泄露面。'
+  + '每条发现立刻 `recon_asset` / `recon_ingest` 上图并连边，note 写清判断依据；'
+  + '不做破坏性验证，也不做漏洞结论——发现交互点就写进看板点名 Web 手或逆向手。'
+  + SCOUT_NDAY_PROMPT
+
+const SCOUT_PROMPT = [
+  '你是信息收集手（Scout）。你负责在授权范围内扩大并整理攻击面，不负责漏洞利用和最终漏洞定性。',
+  '',
+  '## 工作边界',
+  '- 开始前先读作战目标、看板和授权范围；不确定目标或范围时先报告总指挥，不得越界。',
+  '- 只做信息收集：DNS/子域、端口、服务版本、Web 指纹、目录/接口、证书、公开泄露面、源码地图。',
+  '- 不做破坏性验证、不爆破登录、不执行 DoS、不手工利用漏洞；发现疑似漏洞只报告并交给 Web/QA。',
+  '- 主动扫描前先确认速率和影响；全端口扫描必须分段、限速、记录进度，不能一次性把目标打崩。',
+  '',
+  '## 标准工作顺序',
+  '1. 读 `recon_view`、任务账本和看板，确认已有资产、历史结论和未覆盖区域，禁止重复扫同一范围。',
+  '2. 先做 DNS/子域/证书/ASN 等外部发现，再用 `recon_asset` 或 `recon_ingest` 记录资产并连边。',
+  '3. 对每个存活主机尽可能做全端口扫描（TCP 1-65535；先确认 nmap/masscan/naabu 等工具可用，再分段完成），并做服务版本识别；确认协议、版本、响应特征和异常服务，不要只扫常见端口。',
+  '4. 对 Web/API 做技术指纹、目录/路由和公开接口发现；把框架、中间件、组件版本、隐藏接口和源码片段落到指纹/接口/源码节点。',
+  '5. 对每个确认的产品/版本指纹调用 `recon_nday` 查历史漏洞库，候选结论写看板 kind=hypothesis，不要把候选当已验证漏洞。',
+  '6. 一轮结束后汇总新增资产、高价值攻击面、证据命令、未覆盖范围和下一步建议。',
+  '',
+  '## 证据与图谱',
+  '- 每条外发命令必须走 `recon_run`，保留 commandId、原始输出和失败原因；不要用记忆代替命令结果。',
+  '- 每个资产/接口/证书/指纹/密钥/源码都要上图；用 parent + edge 说明来源关系，孤立节点视为没做完。',
+  '- note 至少写清：发现来源、命令 commandId、判断依据、可信度和下一步。',
+  '- 事实用 finding/资产节点；未验证猜测用 hypothesis；不要把猜测写成已确认漏洞。',
+  '- 发现注入点、接口、上传点、认证/授权逻辑时，写进看板点名 Web 手；发现 JS/APK/EXE 逆向需求时点名逆向手；需要跨角色直接协作时用 `recon_group action=request` 请求总指挥编组。',
+  '',
+  '## 交接与汇报',
+  '- 成员完成后总指挥会收到通知；你的汇报必须能被下一个角色直接接手：目标资产、入口、参数、复现命令、已知限制。',
+  '- 默认按「新增资产 / 高价值发现 / 指纹与 Nday / 未覆盖 / 建议下一步」五段输出。',
+  '- 发现范围外资产或业务影响风险，立即停止并对总指挥报告。',
+  '',
+  SCOUT_NDAY_PROMPT,
+].join('\n')
+
+const WEB_PROMPT_LEGACY = '你是 Web 渗透手（Web）。负责 Web 相关的发现与验证：注入、越权/IDOR、上传、SSRF、XSS、逻辑漏洞、未授权接口。'
+  + '**浏览器操作归你**：用 `recon_browser` 真开页面、登录、点按钮、填表单、截图存证（截图写进看板 shots）。'
+  + '每个漏洞必须 `recon_run` 复现一次并带 commandId；拿不准的写看板当猜想，别当结论。'
+  + '前端 JS 里的接口/密钥自己提取；需要还原混淆/逆向 JS 逻辑时，交回看板点名逆向手。'
+  + '页面里看到的指纹、框架、隐藏接口、源码片段都要上图（kind=fingerprint / source），别只写在回复里。'
+
+const WEB_PROMPT = [
+  '你是 Web 渗透手（Web）。负责 Web/API 的攻击面发现、验证和证据固化：注入、越权/IDOR、上传、SSRF、XSS、逻辑漏洞、未授权接口。',
+  '',
+  '## 标准工作流程',
+  '1. 先读任务、看板、完整记忆、授权范围和已有资产；确认目标域名/URL、账号、角色、入口和禁止边界。',
+  '2. 对每个 Web 根路径和关键入口必须做目录/路由扫描（优先 ffuf/gobuster/dirsearch/feroxbuster，按工具实际可用性选择），不能只手工访问首页或只试几个常见路径；记录命令、字典、状态码、响应长度和结果。',
+  '3. 对发现的目录、接口、参数和 JS 入口继续做指纹与路由提取；把接口、参数、框架、组件版本、源码片段落到图谱节点。',
+  '4. 每个可疑点必须用 `recon_run` 复现一次，保留 commandId、请求/响应摘要、影响和前置条件；不能复现的只能写 hypothesis，不能当漏洞结论。',
+  '5. 需要登录、会话、验证码、前端交互或可视化证据时，调用 `recon_browser`：打开页面、登录、点击、填表、执行步骤并截图；截图路径写进看板 shots。',
+  '6. 发现 JS 混淆、签名算法、APK/客户端协议等逆向需求时，先在任务/看板点名逆向手，或用 `recon_group action=request` 请总指挥编组；不要自己假装完成逆向。',
+  '7. 完成后输出：目标入口 / 目录与接口发现 / 可复现漏洞与 commandId / 浏览器截图 / 影响与限制 / 建议 QA 如何验收。',
+  '',
+  '## 纪律',
+  '- 所有外发请求和扫描走 `recon_run`，浏览器操作走 `recon_browser`；不要只在回复里说“测过了”。',
+  '- 目录扫描和参数测试要限速、分段、避免破坏性方法；越界或高风险操作先报告总指挥。',
+  '- 事实与猜测分开；漏洞必须有复现证据和范围，不能把 scanner 输出直接当结论。',
+  '- 页面看到的指纹、接口、隐藏参数、源码片段都要上图并写看板，别只留在上下文里。',
+].join('\n')
+
+const STAFF_PROMPT_LEGACY = '你是参谋（Staff）。只出谋划策，不执行扫描、不写漏洞。'
+  + '吃透图谱现状与看板，给出：攻击面优先级、最可能的突破点（含依据）、被忽略了什么、'
+  + '以及一份可执行的任务拆解建议（每条：目标 / 建议角色 / 验收标准）。'
+  + '先把整体方案写到 `recon_board`（kind=hypothesis）：攻击面、优先级、每步派谁、需要什么模型/skills/MCP、上下文边界和验收标准。'
+  + '方案写完后明确 @总指挥 请其拆任务；不要直接派发 Agent，也不要自己动手扫描。'
+  + '返工模式：当验收驳回时，你会收到缺口说明；这时给出 3 条可执行改进方案（怎么做 / 派给谁 / 验收标准），让总指挥直接挑一条重排。'
+
+const STAFF_PROMPT = [
+      '你是参谋（Staff）。负责方案、优先级、攻击路径和环境评估；不要冒充执行手做漏洞验证。',
+      '',
+      '## 每次进入项目先做环境检查',
+      '当你第一次为项目出方案，或环境/工具状态可能变化时，必须在规划前做一次只读环境检查：',
+      '1. 用 `recon_run` 检查操作系统、内核、当前用户、权限、工作目录、网络/代理：例如 `uname -a`、`cat /etc/os-release`、`id`、`pwd`、`env`。',
+      '2. 检查各角色实际可用的工具：web 手所需的浏览器/HTTP/目录与漏洞工具，逆向手所需的反编译/调试/脚本工具，内网手所需的隧道/横向工具；逐项记录有/没有、版本、路径。',
+      '3. 查看 `recon_config get` 里当前 skills、MCP、角色配置，以及 `recon_squad list` 的在岗成员；确认哪些能力是真实可用，哪些只是配置了但未验证。',
+      '4. 把环境结论写入记忆：`recon_memory action=add category=environment importance=high`，标题写清环境范围，正文写清 OS、可用/缺失工具、角色能力、MCP/技能和限制。',
+      '环境检查只做只读命令，不扫描目标、不扩大攻击面；检查完再把方案交给总指挥。',
+      '',
+      '## 方案职责',
+      '吃透图谱现状、完整看板和记忆，给出：攻击面优先级、最可能的突破点（含依据）、被忽略了什么，以及可执行的任务拆解建议（目标 / 建议角色 / 模型档位 / skills / MCP / 验收标准）。',
+      '整体方案写到 `recon_board`（kind=hypothesis），写完后明确 @总指挥 请其拆任务；不要直接派发 Agent，不要自己扫描目标。',
+      '需要跨角色能力时，建议总指挥用 `recon_squad action=group` 编组；组内由成员用 `recon_group ask` 串行协作。',
+      '',
+      '## 记忆规则',
+      '记忆是所有 agent 强制完整阅读的全局事实库；只有总指挥和参谋可以写入。',
+      '只写最重要、最全局、可复用的事实：项目概况、总体目标、环境/工具结论、特殊攻击手法、已确认漏洞、账号密码/凭据。不要把过程流水账、普通汇报或离职交接写进记忆；离职交接只写看板。',
+      '',
+      '返工模式：当验收驳回时，根据缺口给出 3 条可执行改进方案（怎么做 / 派给谁 / 验收标准），让总指挥直接挑一条重排。',
+    ].join('\n')
+
 const DEFAULT_ROLES = [
   {
     id: 'commander', name: '总指挥', tier: 'deep', reportsTo: null, model: null, skills: [],
@@ -2988,29 +3736,20 @@ const DEFAULT_ROLES = [
       + '用 `recon_org recruit` 传 role 名与职责说明即时开一个新角色，不必等内置编制。'
       + '收官协议（必须走完，不许半途宣布成功）：① 每条任务都要有 qa 的 accept；② 全部通过后你宣布完成（`recon_task action=mission missionAction=close`）；'
       + '③ close 会自动回收空闲队员，正在跑的可保留；④ 只要有 reject，就拉参谋出方案 → 重排任务 → 再验收，循环到全部通过为止。'
+      + '记忆规则：记忆是全局强制阅读的事实库，所有成员都必须完整看；只有你和参谋可以写入，只写项目概况、总体目标、环境/工具结论、特殊攻击手法、已确认漏洞、账号密码/凭据，不写过程流水账和离职交接。'
       + '纪律：同一资产不要重复派两个人；并发满了先回收空闲；对外输出只给结论与证据引用。',
   },
   {
     id: 'staff', name: '参谋', tier: 'deep', reportsTo: 'commander', model: null, skills: [],
-    prompt: '你是参谋（Staff）。只出谋划策，不执行扫描、不写漏洞。'
-      + '吃透图谱现状与看板，给出：攻击面优先级、最可能的突破点（含依据）、被忽略了什么、'
-      + '以及一份可执行的任务拆解建议（每条：目标 / 建议角色 / 验收标准）。'
-      + '结论写进 `recon_board`（kind=hypothesis 或 task），等总指挥采纳。不要直接派发 Agent。'
-      + '返工模式：当验收驳回时，你会收到缺口说明；这时给出 3 条可执行改进方案（怎么做 / 派给谁 / 验收标准），让总指挥直接挑一条重排。',
+    prompt: STAFF_PROMPT,
   },
   {
     id: 'scout', name: '信息收集', tier: 'fast', reportsTo: 'commander', model: null, skills: [],
-    prompt: '你是信息收集手（Scout）。只做测绘：子域、端口、指纹、目录、接口、证书、泄露面。'
-      + '每条发现立刻 `recon_asset` / `recon_ingest` 上图并连边，note 写清判断依据；'
-      + '不做破坏性验证，也不做漏洞结论——发现交互点就写进看板点名 Web 手或逆向手。',
+    prompt: SCOUT_PROMPT,
   },
   {
     id: 'web', name: 'Web 手', tier: 'deep', reportsTo: 'commander', model: null, skills: [],
-    prompt: '你是 Web 渗透手（Web）。负责 Web 相关的发现与验证：注入、越权/IDOR、上传、SSRF、XSS、逻辑漏洞、未授权接口。'
-      + '**浏览器操作归你**：用 `recon_browser` 真开页面、登录、点按钮、填表单、截图存证（截图写进看板 shots）。'
-      + '每个漏洞必须 `recon_run` 复现一次并带 commandId；拿不准的写看板当猜想，别当结论。'
-      + '前端 JS 里的接口/密钥自己提取；需要还原混淆/逆向 JS 逻辑时，交回看板点名逆向手。'
-      + '页面里看到的指纹、框架、隐藏接口、源码片段都要上图（kind=fingerprint / source），别只写在回复里。',
+    prompt: WEB_PROMPT,
   },
   {
     id: 'reverser', name: '逆向手', tier: 'deep', reportsTo: 'commander', model: null, skills: [],
@@ -3051,7 +3790,7 @@ const DEFAULT_ROLES = [
 const ROLE_ALIASES = {
   hunter: 'web',
   browser: 'web',
-  analyst: 'staff',
+  analyst: 'scout',
   recon: 'scout',
   pentest: 'web',
   reverse: 'reverser',
@@ -3061,9 +3800,91 @@ const ROLE_ALIASES = {
   temp: 'staff',
 }
 
+/** 本机技能目录：DSH 用户技能、红队技能、用户提供的成熟技能包。 */
+function skillRoots() {
+  const roots = []
+  const add = (dir) => { if (asText(dir) !== '' && roots.includes(dir) === false) roots.push(dir) }
+  add(join(dshHome(), 'skills'))
+  add(join(dshHome(), 'redteam', 'skills'))
+  const extra = asText(process.env.DSH_SKILL_DIRS)
+  if (extra !== '') for (const dir of extra.split(',')) add(dir.trim())
+  const publicSkills = process.env.DSH_PUBLIC_SKILLS || join(homedir(), 'Public', 'skills')
+  add(join(publicSkills, 'hack-skills', 'skills'))
+  add(join(publicSkills, 'Anthropic-Cybersecurity-Skills', 'skills'))
+  return roots
+}
+
+function parseSkillMeta(text, fallbackName) {
+  const raw = String(text || '')
+  const fm = /^---\s*\n([\s\S]*?)\n---/.exec(raw)
+  const head = fm === null ? '' : fm[1]
+  const field = (key) => {
+    const hit = new RegExp(`^${key}:\\s*(.+)$`, 'm').exec(head)
+    return hit === null ? '' : hit[1].trim().replace(/^['"]|['"]$/g, '')
+  }
+  return {
+    name: field('name') || fallbackName,
+    description: field('description') || '',
+    whenToUse: field('whenToUse') || '',
+  }
+}
+
+async function discoverSkills() {
+  const out = []
+  const seen = new Set()
+  for (const root of skillRoots()) {
+    let entries = []
+    try { entries = await readdir(root, { withFileTypes: true }) } catch { continue }
+    for (const entry of entries) {
+      const path = entry.isDirectory()
+        ? join(root, entry.name, 'SKILL.md')
+        : (entry.name.endsWith('.md') ? join(root, entry.name) : '')
+      if (path === '') continue
+      let text = ''
+      try { text = await readFile(path, 'utf8') } catch { continue }
+      const meta = parseSkillMeta(text, entry.name.replace(/\.md$/i, ''))
+      if (seen.has(meta.name)) continue
+      seen.add(meta.name)
+      out.push({ ...meta, path })
+    }
+  }
+  return out.sort((a, b) => a.name.localeCompare(b.name))
+}
+
+async function loadSkill(name) {
+  const wanted = asText(name)
+  if (wanted === '') return undefined
+  const all = await discoverSkills()
+  return all.find((item) => item.name === wanted)
+}
+
+function canonicalRoleId(squad, value, fallback = 'web') {
+  const wanted = asText(value, fallback)
+  if (squad === undefined || squad === null) return wanted
+  const direct = squad.roles().find((role) => role.id === wanted || role.name === wanted)
+  if (direct !== undefined) return direct.id
+  const core = squad.coreRoleIdOf(wanted)
+  if (core !== '') return core
+  const alias = ROLE_ALIASES[wanted]
+  if (alias !== undefined) return squad.roleOf(alias).id
+  throw new Error(`未知角色：${wanted}。可用角色：${squad.roles().map((role) => `${role.id}(${role.name})`).join(', ')}`)
+}
+
+async function latestStaffPlan(board, engagementId, since = 0) {
+  if (board === undefined || board === null) return undefined
+  const rows = await board.list(engagementId, 500)
+  return rows
+    .filter((row) => row && row.author && row.author.role === 'staff'
+      && ['hypothesis', 'finding', 'note', 'task', 'conclusion'].includes(row.kind)
+      && (Number(row.ts) || 0) > (Number(since) || 0))
+    .sort((a, b) => (Number(a.ts) || 0) - (Number(b.ts) || 0))
+    .slice(-1)[0]
+}
+
 const DEFAULT_AUTOMATION = {
   enabled: true,
-  maxAgents: 3,
+  maxAgents: 8,
+  maxAutomationAgents: 3,
   rules: [
     {
       id: 'asset-hunt', on: 'node.created', enabled: true, role: 'web', tier: 'deep',
@@ -3073,7 +3894,7 @@ const DEFAULT_AUTOMATION = {
         + '每条结论用 recon_run 复现并把 commandId 写进 recon_vuln；过程中把猜想写进 recon_board。',
     },
     {
-      id: 'vuln-verify', on: 'vuln.created', enabled: true, role: 'qa', tier: 'deep',
+      id: 'vuln-verify', on: 'vuln.created', enabled: true, role: 'web', tier: 'vision',
       whenSeverity: ['critical', 'high', 'medium'],
       cooldownMs: 30000,
       task: '看板新漏洞 {{title}}（{{severity}}，节点 {{nodeId}}，位置 {{endpoint}}）。用 recon_browser 打开相关页面做一次真实复现：'
@@ -3090,6 +3911,14 @@ function nowMs() {
 /** 看板上限与合并策略：到 100 条就把最早的 50 条压成一条摘要，避免无限增长也很难翻。 */
 /** 轨迹面板保留/下发的条数上限。 */
 const TRACE_LIMIT = 500
+/** 轨迹显示上限：控制台可覆盖，范围 100–5000（轨迹本身最多保留 5000 条）。 */
+function traceLimitOf(configStore) {
+  const raw = configStore !== undefined && configStore !== null && typeof configStore.get === 'function'
+    ? (configStore.get().trace || {})
+    : {}
+  const value = Number(raw.limit)
+  return Number.isFinite(value) ? Math.max(100, Math.min(5000, Math.floor(value))) : TRACE_LIMIT
+}
 
 const BOARD_LIMIT = 100
 const BOARD_MERGE_COUNT = 50
@@ -3113,6 +3942,17 @@ class Board {
     this.dir = join(root, 'board')
     this.cache = new Map()
     this.seq = 0
+    this.locks = new Map()
+  }
+
+  withLock(id, operation) {
+    const key = String(id)
+    const previous = this.locks.get(key) || Promise.resolve()
+    const next = previous.then(operation, operation)
+    const tail = next.then(() => undefined, () => undefined)
+    this.locks.set(key, tail)
+    void tail.finally(() => { if (this.locks.get(key) === tail) this.locks.delete(key) })
+    return next
   }
 
   fileOf(engagementId) {
@@ -3138,36 +3978,73 @@ class Board {
     return Array.isArray(rows) ? rows.length : 0
   }
 
-  /** 用户在上下文中能承受的全量发言：按总量截断，优先保留最新的（早期条目只留索引） */
-  directivesForPrompt(engagementId, maxChars = 24000) {
-    const rows = this.cache.get(engagementId)
+  /** 用户发言全量：永不合并、永不截断，单独按用户条数计算。 */
+  directivesForPrompt(engagementId) {
+    const rows = this.rawSync(engagementId)
     const mine = Array.isArray(rows) ? rows.filter((row) => this.isUserEntry(row)) : []
     if (mine.length === 0) return ''
     const lines = []
-    lines.push('## 【指挥席指令】用户在看板上的发言（最高优先级，永不合并）')
-    lines.push('下面每一条都是用户本人写的，你必须在行动中遵守；与其它看板条目冲突时以此为准。')
-    const kept = []
-    let used = lines.join('\n').length
-    let skipped = 0
-    for (let i = mine.length - 1; i >= 0; i -= 1) {
-      const row = mine[i]
+    lines.push('## 【用户看板发言 · 最高优先级】')
+    lines.push('下面所有文字都是用户本人写的，必须完整阅读并遵守；用户发言永不压缩、无上限、不参与 agent 看板条数计算。')
+    for (const row of mine) {
       const when = new Date(Number(row.ts) || Date.now()).toLocaleString('zh-CN')
-      const text = String(row.text || '').trim()
-      const line = `- （${when}）${text}`
-      if (used + line.length > maxChars && kept.length > 0) { skipped = i + 1; break }
-      kept.push(line)
-      used += line.length + 1
+      lines.push(`- （${when}）${safePromptText(asText(row.text))}`)
     }
-    kept.reverse()
-    if (skipped > 0) {
-      lines.push(`（更早的 ${skipped} 条因长度限制未展开，需要时用 \`recon_board list\` 查看）`)
+    return lines.join('\n')
+  }
+
+  /**
+   * 所有 agent 强制读取的完整看板。
+   * 用户发言单列且全文；agent 条目全文；合并摘要也在其中。图片只给路径由 agent 单独查看。
+   */
+  promptText(engagementId) {
+    const rows = this.rawSync(engagementId)
+    if (!Array.isArray(rows) || rows.length === 0) return ''
+    const userRows = rows.filter((row) => this.isUserEntry(row))
+    const agentRows = rows.filter((row) => this.isUserEntry(row) === false)
+    const lines = []
+    const options = boardOptions(this.configStore)
+    lines.push('## 团队看板完整内容（强制阅读，不能只看最近几条）')
+    lines.push(`统计：用户 ${userRows.length} 条（无上限、永不压缩、单独计数）· agent ${agentRows.length} 条（上限 ${options.limit}，触顶后最早 ${options.mergeCount} 条压成摘要）。`)
+    lines.push('你必须完整阅读当前看板的全部文字；用户发言优先级最高。图片不在这里展开，按下方截图路径单独查看。')
+    const renderRow = (row) => {
+      const when = new Date(Number(row.ts) || Date.now()).toLocaleString('zh-CN')
+      const who = row.author && row.author.name ? row.author.name : '?'
+      lines.push('')
+      lines.push(`### [${asText(row.kind, 'note')}] ${who} · ${when} · ${asText(row.id, '')}`)
+      lines.push(safePromptText(asText(row.text)))
+      const refs = row.refs && typeof row.refs === 'object' ? row.refs : {}
+      const refParts = []
+      for (const key of ['nodeIds', 'vulnIds', 'commandIds']) {
+        if (Array.isArray(refs[key]) && refs[key].length > 0) refParts.push(`${key}=${refs[key].join(',')}`)
+      }
+      if (refParts.length > 0) lines.push(`引用：${refParts.join('；')}`)
+      const shots = Array.isArray(row.shots) ? row.shots : []
+      if (shots.length > 0) lines.push(`截图（需单独查看）：${shots.join(' | ')}`)
+      if (refs.merged && refs.merged.count !== undefined) lines.push(`本条为压缩摘要：压缩 ${refs.merged.count} 条（${asText(refs.merged.from)} → ${asText(refs.merged.to)}）`)
     }
-    for (const line of kept) lines.push(line)
+    if (userRows.length > 0) {
+      lines.push('')
+      lines.push('### 用户发言（永不压缩 / 无上限 / 单独计数）')
+      for (const row of userRows) renderRow(row)
+    }
+    lines.push('')
+    lines.push('### 团队 agent 看板条目（全部，含已压缩摘要）')
+    if (agentRows.length === 0) lines.push('（暂无 agent 看板条目）')
+    for (const row of agentRows) renderRow(row)
     return lines.join('\n')
   }
 
   /** 同步读缓存（提示词每轮实时渲染用；未预热时返回空数组） */
   rawSync(engagementId) {
+    if (!this.cache.has(engagementId)) {
+      let rows = []
+      try {
+        const raw = JSON.parse(readFileSync(this.fileOf(engagementId), 'utf8'))
+        if (Array.isArray(raw)) rows = raw
+      } catch { /* 没有看板 */ }
+      this.cache.set(engagementId, rows)
+    }
     const rows = this.cache.get(engagementId)
     return Array.isArray(rows) ? rows : []
   }
@@ -3212,6 +4089,10 @@ class Board {
   }
 
   async post(engagementId, entry) {
+    return this.withLock(engagementId, () => this.postInner(engagementId, entry))
+  }
+
+  async postInner(engagementId, entry) {
     const text = asText(entry.text)
     if (text.trim() === '') throw new Error('看板内容不能为空')
     const rows = await this.raw(engagementId)
@@ -3231,7 +4112,7 @@ class Board {
     /* 用户发言不计入上限：只有 agent 条目涨到阈值才合并 */
     if (this.isUserEntry(record) === false) {
       const agentRows = rows.filter((row) => this.isUserEntry(row) === false)
-      if (agentRows.length >= boardOptions(this.configStore).limit) merged = await this.compact(engagementId)
+      if (agentRows.length >= boardOptions(this.configStore).limit) merged = await this.compactInner(engagementId)
     }
     await writeJsonAtomic(this.fileOf(engagementId), rows)
     try { this.hub.broadcast({ type: 'board.post', engagementId, entry: record }) } catch { /* 广播失败 */ }
@@ -3240,6 +4121,10 @@ class Board {
 
   /** 到上限就把最早的 50 条压成一条摘要（保留 kind 统计、时间范围与引用 id）。 */
   async compact(engagementId) {
+    return this.withLock(engagementId, () => this.compactInner(engagementId))
+  }
+
+  async compactInner(engagementId) {
     const rows = await this.raw(engagementId)
     const options = boardOptions(this.configStore)
     /* 用户发言永不参与合并：先把它们摘出来，合并完按原时间顺序放回去 */
@@ -3253,6 +4138,7 @@ class Board {
     const nodeIds = new Set()
     const vulnIds = new Set()
     const commandIds = new Set()
+    const shots = new Set()
     const highlights = []
     /* 按作者留存被压缩条目的计数与少量样本：按队员筛选时仍能看到「他被压缩了多少条」 */
     const authors = new Map()
@@ -3273,6 +4159,7 @@ class Board {
       for (const id of Array.isArray(refs.nodeIds) ? refs.nodeIds : []) nodeIds.add(id)
       for (const id of Array.isArray(refs.vulnIds) ? refs.vulnIds : []) vulnIds.add(id)
       for (const id of Array.isArray(refs.commandIds) ? refs.commandIds : []) commandIds.add(id)
+      for (const shot of Array.isArray(row.shots) ? row.shots : []) shots.add(shot)
       const mergedMeta = refs.merged && Array.isArray(refs.merged.authors) ? refs.merged.authors : null
       if (mergedMeta !== null) {
         /* 压缩摘要被再次压缩：继承里面每个作者的计数，不把「调度台」算成作者 */
@@ -3317,7 +4204,8 @@ class Board {
           authors: Array.from(authors.values()),
         },
       },
-      shots: [],
+      /* 被压缩条目的截图路径不能丢：文字进摘要，图片仍可在页面上单独查看 */
+      shots: Array.from(shots),
       status: 'done',
     }
     const merged = [summary]
@@ -3332,6 +4220,10 @@ class Board {
 
   /** 删除一条看板（用户手动清理）。 */
   async remove(engagementId, id) {
+    return this.withLock(engagementId, () => this.removeInner(engagementId, id))
+  }
+
+  async removeInner(engagementId, id) {
     const rows = await this.raw(engagementId)
     const index = rows.findIndex((item) => item.id === id)
     if (index < 0) return { ok: false, error: `看板条目不存在：${id}` }
@@ -3342,6 +4234,10 @@ class Board {
   }
 
   async update(engagementId, id, patch) {
+    return this.withLock(engagementId, () => this.updateInner(engagementId, id, patch))
+  }
+
+  async updateInner(engagementId, id, patch) {
     const rows = await this.raw(engagementId)
     const row = rows.find((item) => item.id === id)
     if (row === undefined) throw new Error(`看板条目不存在：${id}`)
@@ -3351,6 +4247,10 @@ class Board {
     await writeJsonAtomic(this.fileOf(engagementId), rows)
     try { this.hub.broadcast({ type: 'board.update', engagementId, entry: row }) } catch { /* 同上 */ }
     return row
+  }
+
+  forget(engagementId) {
+    this.cache.delete(engagementId)
   }
 
   async recentText(engagementId, limit = 12) {
@@ -3363,11 +4263,12 @@ class Board {
 }
 
 
-/** 用户（指挥席）在看板上的发言：全量、不截断、不压缩，注入每个 agent 的上下文 */
-async function userDirectives(board, engagementId) {
+/** 给 agent 的完整看板文本：用户发言全文 + 全部 agent 条目全文。 */
+async function boardPromptText(board, engagementId) {
+  if (board === undefined || board === null) return ''
   try {
-    await board.raw(engagementId)            /* 确保缓存里有数据 */
-    return board.directivesForPrompt(engagementId)
+    await board.raw(engagementId)
+    return board.promptText(engagementId)
   } catch { return '' }
 }
 
@@ -3379,6 +4280,7 @@ class Trace {
     this.dir = join(root, 'trace')
     this.cache = new Map()
     this.seq = 0
+    this.writeQueue = Promise.resolve()
   }
 
   fileOf(engagementId) {
@@ -3405,6 +4307,12 @@ class Trace {
   }
 
   async push(engagementId, event) {
+    const run = this.writeQueue.then(() => this.pushInner(engagementId, event))
+    this.writeQueue = run.then(() => undefined, () => undefined)
+    return run
+  }
+
+  async pushInner(engagementId, event) {
     const rows = await this.raw(engagementId)
     this.seq += 1
     const row = {
@@ -3418,8 +4326,12 @@ class Trace {
       meta: event.meta || {},
     }
     rows.push(row)
-    if (rows.length > 5000) rows.splice(0, rows.length - 5000)
-    try { await appendFile(this.fileOf(engagementId), `${JSON.stringify(row)}\n`, 'utf8') } catch { /* 落盘失败不影响 */ }
+    const compacted = rows.length > 5000
+    if (compacted) rows.splice(0, rows.length - 5000)
+    try {
+      if (compacted) await writeJsonLines(this.fileOf(engagementId), rows)
+      else await appendFile(this.fileOf(engagementId), `${JSON.stringify(row)}\n`, 'utf8')
+    } catch { /* 落盘失败不影响 */ }
     try { this.hub.broadcast({ type: 'trace', engagementId, event: row }) } catch { /* 广播失败 */ }
     return row
   }
@@ -3427,6 +4339,10 @@ class Trace {
   async list(engagementId, limit = 400) {
     const rows = await this.raw(engagementId)
     return rows.slice(-limit)
+  }
+
+  forget(engagementId) {
+    this.cache.delete(engagementId)
   }
 }
 
@@ -3439,6 +4355,17 @@ class Tasks {
     this.dir = join(root, 'tasks')
     this.cache = new Map()
     this.seq = 0
+    this.locks = new Map()
+  }
+
+  withLock(id, operation) {
+    const key = String(id)
+    const previous = this.locks.get(key) || Promise.resolve()
+    const next = previous.then(operation, operation)
+    const tail = next.then(() => undefined, () => undefined)
+    this.locks.set(key, tail)
+    void tail.finally(() => { if (this.locks.get(key) === tail) this.locks.delete(key) })
+    return next
   }
 
   fileOf(engagementId) {
@@ -3477,6 +4404,10 @@ class Tasks {
   }
 
   async create(engagementId, input) {
+    return this.withLock(engagementId, () => this.createInner(engagementId, input))
+  }
+
+  async createInner(engagementId, input) {
     const rows = await this.raw(engagementId)
     this.seq += 1
     const task = {
@@ -3492,6 +4423,8 @@ class Tasks {
       evidence: { commandIds: [], vulnIds: [], nodeIds: [], shots: [] },
       note: '',
       followUpOf: asText(input.followUpOf) || null,
+      verifiedBy: null,
+      verifiedAt: null,
     }
     rows.push(task)
     while (rows.length > 600) rows.shift()
@@ -3509,19 +4442,34 @@ class Tasks {
     return task
   }
 
-  async update(engagementId, id, patch) {
+  async update(engagementId, id, patch, actor) {
+    return this.withLock(engagementId, () => this.updateInner(engagementId, id, patch, actor))
+  }
+
+  async updateInner(engagementId, id, patch, actor) {
     const rows = await this.raw(engagementId)
     const task = rows.find((row) => row.id === asText(id))
     if (task === undefined) throw new Error(`任务不存在：${id}`)
-    if (asText(patch.status) !== '') task.status = asText(patch.status)
+    if (asText(patch.status) !== '') {
+      const status = asText(patch.status)
+      if (!TASK_STATUSES.includes(status)) throw new Error(`任务状态非法：${status}`)
+      task.status = status
+    }
     if (asText(patch.assignee) !== '') task.assignee = asText(patch.assignee)
     if (asText(patch.note) !== '') task.note = asText(patch.note)
     if (asText(patch.role) !== '') task.role = asText(patch.role)
     if (asText(patch.title) !== '') task.title = asText(patch.title)
     if (asText(patch.goal) !== '') task.goal = asText(patch.goal)
     if (asText(patch.acceptance) !== '') task.acceptance = asText(patch.acceptance)
+    if (patch.verifiedBy !== null && typeof patch.verifiedBy === 'object' && !Array.isArray(patch.verifiedBy)) {
+      task.verifiedBy = { role: asText(patch.verifiedBy.role), name: asText(patch.verifiedBy.name) }
+      task.verifiedAt = Number(patch.verifiedAt) || nowMs()
+    }
     const evidence = patch.evidence
     if (evidence !== null && typeof evidence === 'object' && !Array.isArray(evidence)) {
+      if (task.evidence === null || typeof task.evidence !== 'object') {
+        task.evidence = { commandIds: [], vulnIds: [], nodeIds: [], shots: [] }
+      }
       for (const key of ['commandIds', 'vulnIds', 'nodeIds', 'shots']) {
         if (!Array.isArray(evidence[key])) continue
         const merged = new Set([...(task.evidence[key] || []), ...evidence[key].map(String)])
@@ -3532,9 +4480,11 @@ class Tasks {
     await this.save(engagementId, rows)
     try { this.hub.broadcast({ type: 'task.updated', engagementId, task }) } catch { /* 广播失败 */ }
     if (this.trace !== undefined && this.trace !== null) {
+      const who = actor !== undefined && actor !== null ? actor : { role: 'system', name: '操作台' }
+      const verdict = task.status === 'passed' || task.status === 'failed'
       await this.trace.push(engagementId, {
-        kind: 'verdict',
-        actor: { role: 'qa', name: '验收' },
+        kind: verdict ? 'verdict' : 'task',
+        actor: who,
         title: `任务 ${task.id} → ${task.status}｜${task.title}`,
         detail: task.note || '',
         refs: { taskId: task.id, role: task.role, ...(task.evidence || {}) },
@@ -3545,6 +4495,10 @@ class Tasks {
 
   /** 驳回 → 生成（或复用）返工任务：标题不嵌套、根任务唯一、已有未闭环返工就合并。 */
   async rework(engagementId, task, reason, createdBy) {
+    return this.withLock(engagementId, () => this.reworkInner(engagementId, task, reason, createdBy))
+  }
+
+  async reworkInner(engagementId, task, reason, createdBy) {
     const rows = await this.raw(engagementId)
     /* 沿 followUpOf 一路回溯到真正的根任务（历史数据里可能存在 A→B→C 的返工套娃） */
     let rootId = task.id
@@ -3578,7 +4532,7 @@ class Tasks {
       try { this.hub.broadcast({ type: 'task.updated', engagementId, task: existing }) } catch { /* 广播失败 */ }
       return existing
     }
-    return this.create(engagementId, {
+    return this.createInner(engagementId, {
       title: `返工：${rootTitle}`,
       goal: `原任务 ${task.id} 未通过验收。缺口：${reason}。请重新拆解并派给合适角色。`,
       acceptance: task.acceptance,
@@ -3607,7 +4561,12 @@ class Tasks {
       status: asText(input.status, prev === null ? 'running' : asText(prev.status, 'running')),
       rounds: (() => {
         const prevRounds = prev === null || prev === undefined ? 0 : Number(prev.rounds)
-        return Number.isFinite(prevRounds) ? prevRounds : 0
+        const fallback = Number.isFinite(prevRounds) ? prevRounds : 0
+        /* 显式传 rounds 时以传入为准（返工/重登记会 +1）；没传就保持上一轮的值 */
+        const wanted = input.rounds === undefined || input.rounds === null || input.rounds === ''
+          ? Number.NaN
+          : Number(input.rounds)
+        return Number.isFinite(wanted) ? wanted : fallback
       })(),
       createdAt: prev === null ? nowMs() : prev.createdAt,
       updatedAt: nowMs(),
@@ -3629,11 +4588,15 @@ class Tasks {
 
   async stats(engagementId) {
     const rows = await this.raw(engagementId)
-    const out = { total: rows.length, open: 0, doing: 0, passed: 0, failed: 0 }
+    const out = { total: rows.length, open: 0, doing: 0, blocked: 0, passed: 0, failed: 0 }
     for (const row of rows) {
       if (out[row.status] !== undefined) out[row.status] += 1
     }
     return out
+  }
+
+  forget(engagementId) {
+    this.cache.delete(engagementId)
   }
 }
 
@@ -3648,7 +4611,7 @@ class BrowserRunner {
   }
 
   async shot(engagementId) {
-    return join(this.dir, engagementId, `shot-${nowMs()}.png`)
+    return join(this.dir, engagementId, `shot-${nowMs()}-${Math.random().toString(36).slice(2, 7)}.png`)
   }
 
   async run(engagementId, request) {
@@ -3664,12 +4627,13 @@ class BrowserRunner {
       expression: asText(request.expression),
       x: Number.isFinite(request.x) ? request.x : null,
       y: Number.isFinite(request.y) ? request.y : null,
+      steps: Array.isArray(request.steps) ? request.steps : [],
+      headless: request.headless !== false,
       statePath,
       outDir: join(this.dir, engagementId),
       shotPath: await this.shot(engagementId),
-      timeoutMs: Number.isFinite(request.timeoutMs) ? request.timeoutMs : 20000,
-      headless: request.headless !== false,
-      maxChars: Number.isFinite(request.maxChars) ? request.maxChars : 6000,
+      timeoutMs: Number.isFinite(request.timeoutMs) ? Math.max(1000, Math.min(30 * 60 * 1000, request.timeoutMs)) : 20000,
+      maxChars: Number.isFinite(request.maxChars) ? Math.max(500, Math.min(200000, request.maxChars)) : 6000,
     }
     const outcome = await new Promise((resolvePromise) => {
       const payloadJson = JSON.stringify(payload)
@@ -3680,9 +4644,11 @@ class BrowserRunner {
       const attempt = () => {
         const python = candidates[index]
         let child
+        let superseded = false
         try {
           child = spawn(python, [this.script, payloadJson], {
-            cwd: this.root, detached: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+            /* POSIX 上建独立进程组，超时才能连同 Chromium 子进程一起杀。 */
+            cwd: this.root, detached: !IS_WIN, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
           })
         } catch (error) {
           next(error)
@@ -3691,16 +4657,24 @@ class BrowserRunner {
         let out = ''
         let err = ''
         const timer = setTimeout(() => { killProcessTree(child) }, payload.timeoutMs + 20000)
-        child.stdout.on('data', (chunk) => { out += chunk.toString('utf8') })
-        child.stderr.on('data', (chunk) => { err += chunk.toString('utf8') })
+        child.stdout.on('data', (chunk) => {
+          if (out.length < 8 * 1024 * 1024) out += chunk.toString('utf8')
+        })
+        child.stderr.on('data', (chunk) => {
+          if (err.length < 2 * 1024 * 1024) err += chunk.toString('utf8')
+        })
         child.on('error', (error) => {
           clearTimeout(timer)
-          if (error && error.code === 'ENOENT') { next(error); return }
+          if (error && error.code === 'ENOENT') {
+            superseded = true
+            next(error)
+            return
+          }
           done({ ok: false, error: `${python} 启动失败：${error.message}` })
         })
         child.on('close', (code) => {
           clearTimeout(timer)
-          if (settled) return
+          if (settled || superseded) return
           const line = out.trim().split('\n').filter((l) => l.trim() !== '').pop() || ''
           let parsed
           try { parsed = JSON.parse(line) } catch { parsed = undefined }
@@ -3752,11 +4726,14 @@ function safePromptText(text) {
     .replace(/\}\}/g, '} }')
 }
 
-/** 常驻核心角色：总指挥与参谋一直挂在编，不参与空闲回收，掉了自动补位 */
-const CORE_ROLES = new Set(['commander', 'staff'])
+/** 常驻核心角色：总指挥与参谋全局各一个，不可召唤、不参与空闲回收，掉了自动补位。 */
+const CORE_ROLE_IDS = ['commander', 'staff']
+const CORE_ROLES = new Set(CORE_ROLE_IDS)
+const DEFAULT_CORE_ROLES = DEFAULT_ROLES.filter((role) => CORE_ROLES.has(role.id))
+const DEFAULT_MEMBER_ROLES = DEFAULT_ROLES.filter((role) => !CORE_ROLES.has(role.id))
 
 class Squad {
-  constructor({ ctx, store, cfg, configStore, hub, board, tasks, trace }) {
+  constructor({ ctx, store, cfg, configStore, hub, board, tasks, trace, browsers, cockpit }) {
     this.ctx = ctx
     this.store = store
     this.cfg = cfg
@@ -3765,8 +4742,13 @@ class Squad {
     this.board = board
     this.tasks = tasks
     this.trace = trace
+    this.browsers = browsers
+    this.cockpit = cockpit
     this.members = new Map()
+    /* 小组：同一任务内多个角色共享上下文，小组整体只算一个并发；成员之间通过 groupAsk 串行协作。 */
+    this.groups = new Map()
     this.seq = 0
+    this.groupSeq = 0
     this.promptCache = new Map()
     /* 花名册 key→名字，永久保存：历史看板/任务正文里写的 a7 也要能翻成「验收#1」 */
     this.roster = new Map()
@@ -3809,18 +4791,28 @@ class Squad {
   /** 用户直接找某个队员说话。 */
   async chat(memberRef, text, options = {}) {
     let member
-    try { member = this.resolveMemberRef(memberRef) } catch { member = undefined }
+    try { member = this.resolveMemberRef(memberRef, asText(options.engagement)) } catch { member = undefined }
     if (member === undefined && asText(options.role) !== '') {
       /* 按角色对话：该角色还没有在岗实例 → 现开一个（fast 档，任务=入列待命） */
       const roleId = asText(options.role)
+      const coreId = this.coreRoleIdOf(roleId)
+      if (coreId !== '') {
+        const core = this.coreRoles().find((role) => role.id === coreId)
+        throw new Error(`${core !== undefined ? core.name : coreId} 是常设席位，不能按角色召唤；请在「对话」里直接找这个席位，或用 recon_squad task 派活`)
+      }
       const engagementId = asText(options.engagement) !== ''
         ? asText(options.engagement)
         : (await this.store.activeEngagement() || {}).id
       if (asText(engagementId) === '') throw new Error('还没有靶标')
+      const resolvedRole = this.roleOf(roleId)
+      const directRole = this.roles().find((role) => role.id === roleId || role.name === roleId)
+      if (directRole === undefined && ROLE_ALIASES[roleId] === undefined && this.coreRoleIdOf(roleId) === '') {
+        throw new Error(`未知角色：${roleId}。可用角色：${this.roles().map((role) => `${role.id}(${role.name})`).join(', ')}`)
+      }
       const spawned = await this.spawn({
         engagementId,
-        roleId: this.roleOf(roleId).id,
-        tier: options.tier || 'fast',
+        roleId: resolvedRole.id,
+        tier: asText(options.tier),
         name: asText(options.name),
         task: '入列待命：等指挥官给指令',
         origin: 'chat',
@@ -3847,14 +4839,46 @@ class Squad {
     return this.view(member)
   }
 
+  /** 可派遣的队员角色：总指挥/参谋已经被移出，只保留普通角色与临时角色。 */
   roles() {
     const configured = this.configStore.get().roles
-    const list = configured && Array.isArray(configured.squad) && configured.squad.length > 0 ? configured.squad : DEFAULT_ROLES
-    return list
+    const raw = configured && Array.isArray(configured.squad) && configured.squad.length > 0 ? configured.squad : DEFAULT_MEMBER_ROLES
+    const list = raw.filter((role) => role !== null && typeof role === 'object' && !CORE_ROLES.has(asText(role.id)))
+    return list.length > 0 ? list : DEFAULT_MEMBER_ROLES
+  }
+
+  /** 常设席位：总指挥/参谋各一个，配置从 config.core 读，缺省用内置人设。 */
+  coreRoles() {
+    const saved = this.configStore.get().core
+    return CORE_ROLE_IDS.map((id) => {
+      const base = DEFAULT_CORE_ROLES.find((role) => role.id === id)
+      const custom = saved !== null && typeof saved === 'object' && saved[id] !== null && typeof saved[id] === 'object' ? saved[id] : {}
+      const role = mergeDeep(cloneJson(base), custom)
+      role.id = id
+      role.name = asText(role.name, base.name)
+      role.tier = MODEL_CHOICES.includes(asText(role.tier)) ? asText(role.tier) : base.tier
+      role.reportsTo = id === 'commander' ? null : 'commander'
+      role.skills = asList(role.skills)
+      role.mcp = asMcpList(role.mcp)
+      role.core = true
+      return role
+    })
+  }
+
+  /** id / 名字 / 别名 → 常设席位 id；不是常设席位返回空串。 */
+  coreRoleIdOf(id) {
+    const wanted = asText(id)
+    if (wanted === '') return ''
+    const resolved = ROLE_ALIASES[wanted] || wanted
+    if (CORE_ROLES.has(resolved)) return resolved
+    const hit = this.coreRoles().find((role) => role.id === wanted || role.name === wanted)
+    return hit !== undefined ? hit.id : ''
   }
 
   roleOf(id) {
     const wanted = asText(id)
+    const coreId = this.coreRoleIdOf(wanted)
+    if (coreId !== '') return this.coreRoles().find((role) => role.id === coreId)
     const roles = this.roles()
     const direct = roles.find((role) => role.id === wanted || role.name === wanted)
     if (direct !== undefined) return direct
@@ -3863,13 +4887,89 @@ class Squad {
       const hit = roles.find((role) => role.id === alias)
       if (hit !== undefined) return hit
     }
-    return roles.find((role) => role.id === 'web') || roles[0] || DEFAULT_ROLES[0]
+    return roles.find((role) => role.id === 'web') || roles[0] || DEFAULT_MEMBER_ROLES[0]
+  }
+
+  /** 老配置迁移：把 roles.squad 里的总指挥/参谋挪到 core，保留用户改过的人设。 */
+  async migrateCoreRoles() {
+    const config = this.configStore.get()
+    const squad = config.roles && Array.isArray(config.roles.squad) ? config.roles.squad : []
+    const legacy = squad.filter((row) => row !== null && typeof row === 'object' && CORE_ROLES.has(asText(row.id)))
+    if (legacy.length === 0) return false
+    const members = squad.filter((row) => row !== null && typeof row === 'object' && !CORE_ROLES.has(asText(row.id)))
+    const core = { ...(config.core !== null && typeof config.core === 'object' ? config.core : {}) }
+    for (const row of legacy) {
+      const id = asText(row.id)
+      core[id] = { ...(core[id] !== null && typeof core[id] === 'object' ? core[id] : {}), ...row, id }
+    }
+    await this.configStore.patch({
+      core,
+      roles: { squad: members.length > 0 ? members : DEFAULT_MEMBER_ROLES.map((role) => ({ ...role })) },
+    })
+    return true
+  }
+
+  /** 老配置的 scout 提示词如果没有 Nday 职能，自动补进去（幂等，保留原有自定义内容）。 */
+  async upgradeScoutPrompt() {
+    const configured = this.configStore.get().roles
+    const squad = configured && Array.isArray(configured.squad) ? configured.squad : []
+    const index = squad.findIndex((role) => role !== null && typeof role === 'object' && asText(role.id) === 'scout')
+    if (index < 0) return false
+    const prompt = String(squad[index].prompt || '')
+    const legacyWithOldNday = SCOUT_PROMPT_LEGACY.replace(SCOUT_NDAY_PROMPT, SCOUT_NDAY_PROMPT_LEGACY)
+    let nextPrompt = prompt
+    /* 只升级旧版内置默认文本；用户自己写过的提示词保持原样。 */
+    if (prompt === SCOUT_PROMPT_LEGACY || prompt === legacyWithOldNday
+      || ((prompt.startsWith('你是信息收集手（Scout）。只做测绘') || prompt.startsWith('你是信息收集手（Scout）。你负责在授权范围内扩大并整理攻击面'))
+        && !prompt.includes('全端口扫描'))) {
+      nextPrompt = SCOUT_PROMPT
+    } else if (nextPrompt.includes(SCOUT_NDAY_PROMPT_LEGACY)) {
+      nextPrompt = nextPrompt.replace(SCOUT_NDAY_PROMPT_LEGACY, SCOUT_NDAY_PROMPT)
+    } else if (!nextPrompt.includes('recon_nday')) {
+      nextPrompt = nextPrompt === '' ? SCOUT_NDAY_PROMPT : `${nextPrompt}\n\n${SCOUT_NDAY_PROMPT}`
+    }
+    if (nextPrompt === prompt) return false
+    const next = squad.slice()
+    next[index] = { ...next[index], prompt: nextPrompt }
+    await this.configStore.patch({ roles: { squad: next } })
+    return true
+  }
+
+  /** 升级旧版内置 Web 手提示词；用户自定义内容不覆盖。 */
+  async upgradeWebPrompt() {
+    const configured = this.configStore.get().roles
+    const squad = configured && Array.isArray(configured.squad) ? configured.squad : []
+    const index = squad.findIndex((role) => role !== null && typeof role === 'object' && asText(role.id) === 'web')
+    if (index < 0) return false
+    if (String(squad[index].prompt || '') !== WEB_PROMPT_LEGACY) return false
+    const next = squad.slice()
+    next[index] = { ...next[index], prompt: WEB_PROMPT }
+    await this.configStore.patch({ roles: { squad: next } })
+    return true
+  }
+
+  /** 升级旧版内置参谋提示词；用户自定义内容不覆盖。 */
+  async upgradeStaffPrompt() {
+    const core = this.configStore.get().core
+    const staff = core && typeof core === 'object' && core.staff && typeof core.staff === 'object' ? core.staff : null
+    if (staff === null) return false
+    const prompt = String(staff.prompt || '')
+    const legacy = prompt === STAFF_PROMPT_LEGACY
+      || (prompt.startsWith('你是参谋（Staff）。只出谋划策') && !prompt.includes('## 每次进入项目先做环境检查'))
+    if (!legacy) return false
+    await this.configStore.patch({ core: { staff: { ...staff, prompt: STAFF_PROMPT } } })
+    return true
   }
 
   /** 临时角色：不在编制里的名字也能开工（写工具、做报告…），并持久化进配置复用。 */
   async ensureRole({ roleId, roleName, rolePrompt, reportsTo, skills, model }) {
     const id = asText(roleId, '').trim()
     if (id === '') return undefined
+    const coreId = this.coreRoleIdOf(id)
+    if (coreId !== '') {
+      const core = this.coreRoles().find((role) => role.id === coreId)
+      throw new Error(`${core !== undefined ? core.name : coreId} 是常设席位，不能作为队员角色新增；请在控制台「常设席位」里改`)
+    }
     const roles = this.roles()
     const hit = roles.find((role) => role.id === id)
     if (hit !== undefined) return hit
@@ -3883,36 +4983,109 @@ class Squad {
       model: model && typeof model === 'object' ? model : null,
       temporary: true,
     }
-    const configured = this.configStore.get().roles
-    const list = configured && Array.isArray(configured.squad) && configured.squad.length > 0 ? configured.squad : roles.map((role) => ({ ...role }))
-    await this.configStore.patch({ roles: { squad: [...list, temp] } })
+    /* 只保存过滤后的队员角色：老配置里残留的常设席位不能跟着写回去 */
+    await this.configStore.patch({ roles: { squad: [...roles.map((role) => ({ ...role })), temp] } })
     return temp
   }
 
   modelFor(tier) {
-    const models = this.configStore.get().models || {}
-    const wanted = MODEL_TIERS.includes(tier) ? tier : 'deep'
-    const pick = models[wanted] || {}
-    if (asText(pick.provider) !== '' && asText(pick.model) !== '') {
-      const selection = { provider: asText(pick.provider), model: asText(pick.model) }
-      if (asText(pick.reasoning) !== '') selection.reasoningEffort = asText(pick.reasoning)
-      return selection
-    }
-    const fallback = this.ctx.get('agentDefaultModel')
-    if (fallback !== undefined && fallback !== null && typeof fallback.currentSelection === 'function') {
-      const selection = fallback.currentSelection()
-      if (selection !== undefined && selection !== null && asText(selection.provider) !== '') return { ...selection }
-    }
-    return {}
+    return modelSelectionFor(this.ctx, this.configStore, tier)
   }
 
   activeCount(engagementId) {
-    let count = 0
+    /* 小组整体算一个并发：组内多个成员同时有活动也只计数一次。 */
+    const groups = new Set()
+    let ungrouped = 0
     for (const member of this.members.values()) {
       if (member.engagementId !== engagementId) continue
-      if (member.status === 'running') count += 1
+      const active = member.status === 'running' || member.status === 'starting' || member.status === 'waiting'
+      if (!active) continue
+      const group = member.groupId ? this.groups.get(member.groupId) : undefined
+      if (group !== undefined) groups.add(group.id)
+      else ungrouped += 1
     }
-    return count
+    return ungrouped + groups.size
+  }
+
+  groupView(group) {
+    if (group === undefined || group === null) return null
+    const members = group.memberKeys.map((key) => {
+      const member = this.members.get(key)
+      return member === undefined ? null : this.view(member)
+    }).filter(Boolean)
+    return {
+      id: group.id,
+      engagementId: group.engagementId,
+      lead: group.leadKey,
+      status: group.status,
+      createdAt: group.createdAt,
+      updatedAt: group.updatedAt,
+      members,
+      messages: group.messages.slice(-200).map((message) => ({ ...message })),
+    }
+  }
+
+  listGroups(engagementId) {
+    return Array.from(this.groups.values())
+      .filter((group) => engagementId === undefined || group.engagementId === engagementId)
+      .map((group) => this.groupView(group))
+  }
+
+  groupPromptText(member) {
+    const group = member && member.groupId ? this.groups.get(member.groupId) : undefined
+    if (group === undefined) return ''
+    const lines = []
+    lines.push('')
+    lines.push('## 你的协作小组（组内串行）')
+    lines.push(`组 id：${group.id}；组内成员：${group.memberKeys.map((key) => {
+      const item = this.members.get(key)
+      return item === undefined ? key : `${item.name}(${this.roleOf(item.role).name}/${item.status})`
+    }).join('、')}`)
+    lines.push('规则：小组整体只算一个并发；同一时间只推进一个成员的步骤；需要别人处理时使用 `recon_group ask`，对方回复后你再继续。')
+    for (const message of group.messages) {
+      const who = asText(message.from, '成员')
+      const to = asText(message.to)
+      lines.push(`- [${asText(message.kind, 'note')}] ${who}${to !== '' ? ` → ${to}` : ''}：${safePromptText(asText(message.text))}`)
+    }
+    return lines.join('\n')
+  }
+
+  groupAddMessage(group, message) {
+    if (group === undefined || group === null) return null
+    group.messages.push({
+      id: `gm${nowMs().toString(36)}${Math.random().toString(36).slice(2, 5)}`,
+      ts: nowMs(),
+      kind: asText(message.kind, 'note'),
+      from: asText(message.from, '成员'),
+      to: asText(message.to),
+      text: asText(message.text),
+    })
+    /* 小组消息是临时协作上下文，保留足够长的历史，防止单个小组无限膨胀 */
+    if (group.messages.length > 500) group.messages.splice(0, group.messages.length - 500)
+    group.updatedAt = nowMs()
+    this.hub.broadcast({ type: 'squad.group', engagementId: group.engagementId, group: this.groupView(group) })
+    return group.messages[group.messages.length - 1]
+  }
+
+  removeMemberFromGroup(member) {
+    if (member === undefined || member === null || member.groupId === undefined || member.groupId === null) return
+    const group = this.groups.get(member.groupId)
+    member.groupId = null
+    if (group === undefined) return
+    group.memberKeys = group.memberKeys.filter((key) => key !== member.key)
+    group.updatedAt = nowMs()
+    if (group.memberKeys.length === 0) this.groups.delete(group.id)
+    else this.hub.broadcast({ type: 'squad.group', engagementId: group.engagementId, group: this.groupView(group) })
+  }
+
+  /** 等待成员空闲；小组协作是串行的，目标还在跑就等它结束。 */
+  async waitMemberIdle(member, timeoutMs = 120000) {
+    const deadline = nowMs() + Math.max(1000, Number(timeoutMs) || 120000)
+    while (nowMs() < deadline) {
+      if (member.status !== 'running' && member.status !== 'starting' && member.status !== 'waiting') return true
+      await sleep(120)
+    }
+    return false
   }
 
   memberCount(engagementId) {
@@ -3923,12 +5096,166 @@ class Squad {
     return count
   }
 
+  /** 创建/扩展一个协作小组。组内成员共享 groupPromptText，整体只算一个并发。 */
+  async createGroup({ engagementId, leadKey, roleId, name, tier, task, promptExtra, skills, mcp }) {
+    const lead = this.resolveMemberRef(leadKey, engagementId)
+    if (lead === undefined) throw new Error(`组长不存在：${leadKey}`)
+    if (CORE_ROLES.has(lead.role)) throw new Error('常设席位不能作为小组的普通成员')
+    let group = lead.groupId ? this.groups.get(lead.groupId) : undefined
+    if (group === undefined) {
+      this.groupSeq += 1
+      group = {
+        id: `g${nowMs().toString(36)}${this.groupSeq}${Math.random().toString(36).slice(2, 5)}`,
+        engagementId,
+        leadKey: lead.key,
+        memberKeys: [lead.key],
+        status: 'active',
+        task: asText(task),
+        createdAt: nowMs(),
+        updatedAt: nowMs(),
+        messages: [],
+        lock: Promise.resolve(),
+      }
+      lead.groupId = group.id
+      this.groups.set(group.id, group)
+      this.groupAddMessage(group, {
+        kind: 'task', from: '总指挥', to: lead.name,
+        text: `建立小组，组长：${lead.name}。小组任务：${asText(task) || '由组长在需要时提出协作请求。'}`,
+      })
+    }
+    const spawned = await this.spawn({
+      engagementId,
+      roleId,
+      tier,
+      task: '',
+      origin: 'group',
+      name,
+      promptExtra: `${asText(promptExtra)}\n\n你当前是协作小组 ${group.id} 的成员；小组内串行协作，只有当前执行者工作。需要组长信息时先看组内消息；收到 recon_group ask 后直接完成并回复，不要把任务转给下一个人。`,
+      skills,
+      mcp,
+    })
+    const member = this.members.get(spawned.key)
+    if (member === undefined) throw new Error('小组成员创建后未落位')
+    member.groupId = group.id
+    group.memberKeys.push(member.key)
+    group.updatedAt = nowMs()
+    this.groupAddMessage(group, {
+      kind: 'member', from: '总指挥', to: member.name,
+      text: `加入小组 ${group.id}，负责角色：${this.roleOf(member.role).name}。模型：${member.model || member.tier}；技能：${(Array.isArray(member.skills) ? member.skills : []).join(', ') || '无'}；MCP：${asMcpList(member.mcp).map((row) => row.name).join(', ') || '无'}。`,
+    })
+    await this.refreshPrompt(lead)
+    await this.refreshPrompt(member)
+    return this.groupView(group)
+  }
+
+  /** 组内串行提问：调用者暂停等待，目标成员完成后再返回结果。 */
+  async groupAsk(groupId, fromKey, targetKey, question, timeoutMs = 300000) {
+    const group = this.groups.get(groupId)
+    if (group === undefined) throw new Error(`小组不存在：${groupId}`)
+    const from = this.resolveMemberRef(fromKey, group.engagementId)
+    const target = this.resolveMemberRef(targetKey, group.engagementId)
+    if (from === undefined || target === undefined) throw new Error('小组提问的成员不存在')
+    if (from.groupId !== group.id || target.groupId !== group.id) throw new Error('提问双方必须属于同一个小组')
+    if (from.key === target.key) throw new Error('不能向自己提问')
+    if (target.agent === null || target.agent === undefined) throw new Error(`目标成员不可用：${target.name}`)
+    const text = asText(question)
+    if (text === '') throw new Error('group ask 需要 question')
+    const run = group.lock.then(async () => {
+      from.status = 'waiting'
+      from.waitingFor = target.name
+      this.hub.broadcast({ type: 'squad.status', engagementId: group.engagementId, member: this.view(from) })
+      try {
+        this.groupAddMessage(group, { kind: 'question', from: from.name, to: target.name, text })
+        const idle = await this.waitMemberIdle(target, Math.max(5000, Number(timeoutMs) || 300000))
+        if (!idle) throw new Error(`小组成员 ${target.name} 仍在执行上一个任务，暂时不能接收新问题`)
+        let answer = ''
+        let timedOut = false
+        await new Promise((resolve) => {
+          let settled = false
+          let timer = 0
+          const done = (value, timeout) => {
+            if (settled) return
+            settled = true
+            clearTimeout(timer)
+            timedOut = timeout
+            answer = value
+            resolve()
+          }
+          target.answerWaiters = Array.isArray(target.answerWaiters) ? target.answerWaiters : []
+          const waiter = (value) => done(asText(value), false)
+          target.answerWaiters.push(waiter)
+          timer = setTimeout(() => {
+            target.answerWaiters = target.answerWaiters.filter((item) => item !== waiter)
+            done('', true)
+          }, Math.max(5000, Number(timeoutMs) || 300000))
+          this.taskByMember(target, `【小组 ${group.id} · ${from.name} 的协作请求】${text}\n完成后直接回复结果，组长会等待你的答复。`, { groupSerial: false }).catch((error) => {
+            target.answerWaiters = target.answerWaiters.filter((item) => item !== waiter)
+            done(`执行出错：${error && error.message ? error.message : String(error)}`, false)
+          })
+        })
+        if (timedOut) {
+          this.groupAddMessage(group, { kind: 'timeout', from: target.name, to: from.name, text: `等待超过 ${Math.round((Number(timeoutMs) || 300000) / 1000)} 秒，未收到结果。` })
+          return { ok: false, timeout: true, error: `等待 ${target.name} 回复超时`, groupId: group.id }
+        }
+        this.groupAddMessage(group, { kind: 'answer', from: target.name, to: from.name, text: answer })
+        try { await this.refreshPrompt(from) } catch { /* 下一轮仍会重新渲染 */ }
+        return { ok: true, groupId: group.id, from: from.name, to: target.name, answer }
+      } finally {
+        from.waitingFor = ''
+        if (from.status === 'waiting') from.status = 'running'
+        this.hub.broadcast({ type: 'squad.status', engagementId: group.engagementId, member: this.view(from) })
+      }
+    })
+    group.lock = run.then(() => undefined, () => undefined)
+    return run
+  }
+
+  async groupPost(groupId, fromKey, text) {
+    const group = this.groups.get(groupId)
+    if (group === undefined) throw new Error(`小组不存在：${groupId}`)
+    const from = this.resolveMemberRef(fromKey, group.engagementId)
+    if (from === undefined || from.groupId !== group.id) throw new Error('只有小组成员可以发组内消息')
+    const body = asText(text)
+    if (body === '') throw new Error('组内消息不能为空')
+    this.groupAddMessage(group, { kind: 'note', from: from.name, text: body })
+    for (const key of group.memberKeys) {
+      const item = this.members.get(key)
+      if (item !== undefined) { try { await this.refreshPrompt(item) } catch { /* 下一轮再更新 */ } }
+    }
+    return this.groupView(group)
+  }
+
+  /** 结束一个小组：组内每个成员各自产出离职交接后一起回收。 */
+  async closeGroup(groupId, engagementId) {
+    const group = this.groups.get(groupId)
+    if (group === undefined) throw new Error(`小组不存在：${groupId}`)
+    if (engagementId !== undefined && group.engagementId !== engagementId) throw new Error('小组不属于当前靶标')
+    group.status = 'closing'
+    const keys = Array.from(group.memberKeys)
+    for (const key of keys) {
+      const member = this.members.get(key)
+      if (member === undefined) continue
+      try { member.agent?.cancel?.({ kind: 'user', reason: 'group-close' }) } catch { /* 已停 */ }
+      member.status = 'idle'
+    }
+    const reclaimed = []
+    for (const key of keys) {
+      try {
+        const result = await this.remove(key, { reason: '小组任务结束', handover: true, engagementId: group.engagementId })
+        if (result !== undefined && result.ok !== false) reclaimed.push(result)
+      } catch { /* 单个交接失败不阻断其它成员 */ }
+    }
+    this.groups.delete(group.id)
+    return { ok: true, groupId: group.id, reclaimed }
+  }
+
   /** 空闲成员回收：默认 15 分钟没人用就 dispose，避免长会话堆积 agent。 */
-  async pruneIdle(ttlMs = 900000) {
+  async pruneIdle(ttlMs = 900000, engagementId) {
     const now = nowMs()
     let removed = 0
     for (const member of Array.from(this.members.values())) {
-      if (member.status === 'running') continue
+      if (asText(engagementId) !== '' && member.engagementId !== asText(engagementId)) continue
+      if (member.status === 'running' || member.status === 'starting' || member.status === 'waiting') continue
       if (CORE_ROLES.has(member.role)) continue /* 总指挥/参谋常驻，不回收 */
       const idleSince = member.idleSince || member.startedAt || now
       if (now - idleSince < ttlMs) continue
@@ -3936,7 +5263,13 @@ class Squad {
       try { await member.handle.dispose() } catch { /* 已释放 */ }
       this.uninstallMemberMcp(member.key)
       this.members.delete(member.key)
+      this.removeMemberFromGroup(member)
       this.promptCache.delete(member.key)
+      this.transcripts.delete(member.key)
+      this.browsers?.drop?.(member.engagementId, member.sessionId)
+      const timer = this.saveTimers.get(member.key)
+      if (timer !== undefined) clearTimeout(timer)
+      this.saveTimers.delete(member.key)
       removed += 1
       this.hub.broadcast({ type: 'squad.remove', engagementId: member.engagementId, key: member.key })
     }
@@ -3956,9 +5289,12 @@ class Squad {
         .sort((a, b) => Number(a.startedAt || 0) - Number(b.startedAt || 0))
       if (rows.length > 1) {
         for (const extra of rows.slice(1)) {
+          this.uninstallMemberMcp(extra.key)
           try { await extra.handle.dispose() } catch { /* 已释放 */ }
           this.members.delete(extra.key)
+          this.removeMemberFromGroup(extra)
           this.promptCache.delete(extra.key)
+          this.refreshToolRestrictions()
           this.hub.broadcast({ type: 'squad.remove', engagementId, key: extra.key })
           removed.push(extra.key)
         }
@@ -3967,7 +5303,7 @@ class Squad {
       if (rows.length === 1) continue
       this.corePending.add(lockKey)
       try {
-        const member = await this.spawn({ engagementId, roleId, tier: 'deep', task: '', origin: 'core' })
+        const member = await this.spawn({ engagementId, roleId, task: '', origin: 'core', allowCore: true })
         if (member !== undefined && member.key !== undefined) added.push(member.key)
       } catch { /* 建不起来下次再试 */ } finally {
         this.corePending.delete(lockKey)
@@ -3981,7 +5317,7 @@ class Squad {
     let removed = 0
     for (const member of Array.from(this.members.values())) {
       if (member.engagementId !== engagementId) continue
-      try { await this.remove(member.key, { reason: '项目删除', handover: false, force: true }) } catch { /* 已释放 */ }
+      try { await this.remove(member.key, { reason: '项目删除', handover: false, force: true, engagementId }) } catch { /* 已释放 */ }
       removed += 1
     }
     return removed
@@ -3991,7 +5327,7 @@ class Squad {
     let stopped = 0
     for (const member of this.members.values()) {
       if (engagementId !== undefined && member.engagementId !== engagementId) continue
-      if (member.status !== 'running') continue
+      if (member.status !== 'running' && member.status !== 'starting' && member.status !== 'waiting') continue
       try { member.agent.cancel({ kind: 'user' }) } catch { /* 已停 */ }
       member.status = 'idle'
       stopped += 1
@@ -4018,6 +5354,9 @@ class Squad {
         mcpError: asText(member.mcpError),
         lastText: shortText(member.lastText, 400),
         lastTool: member.lastTool,
+        groupId: member.groupId || null,
+        waitingFor: asText(member.waitingFor),
+        origin: asText(member.origin),
         lastAt: Number(member.lastAt || member.idleSince || member.startedAt || 0),
         core: CORE_ROLES.has(member.role),
         sessionId: member.sessionId,
@@ -4067,6 +5406,7 @@ class Squad {
       try { row.dispose() } catch { /* 已卸载 */ }
     }
     this.memberMcp.delete(key)
+    this.refreshToolRestrictions()
   }
 
   /**
@@ -4082,6 +5422,15 @@ class Squad {
       }
     }
     return deny
+  }
+
+  /** 成员 MCP 变更后，重新给所有在岗 agent 计算一次私有工具 deny 列表。 */
+  refreshToolRestrictions() {
+    for (const member of this.members.values()) {
+      const tools = member.tools
+      if (tools === undefined || tools === null || typeof tools.restrict !== 'function') continue
+      try { tools.restrict({ deny: this.mcpDenyFor(member.key) }) } catch { /* 单个失败不影响其它成员 */ }
+    }
   }
 
   /** 成员专属 MCP 的说明块（写进它的系统提示）。 */
@@ -4125,13 +5474,20 @@ class Squad {
     lines.push(`- 你是「${role.name}」，汇报对象：${role.reportsTo || '指挥席'}。`)
     lines.push('')
     lines.push(role.prompt)
+    if (role.id === 'scout' && !String(role.prompt || '').includes('recon_nday')) {
+      lines.push('')
+      lines.push('## 指纹 Nday 检索（探测到指纹后立即查，不必等总指挥指派）')
+      lines.push('- 你在测绘中确认服务 / 中间件 / 产品 / 版本指纹后，立刻调用 `recon_nday fingerprint="..."` 查 Exploit-DB 与 NVD；')
+      lines.push('- 每个指纹至少查一次；候选 CVE / EDB / 受影响版本写看板 kind=hypothesis 并附来源，需要实测的交 Web 手 / QA；')
+      lines.push('- 只查历史漏洞库，不对目标发包；不要凭版本猜结论；工具没查到就写「无匹配」，不要编造 CVE。')
+    }
 
     /* —— 技能 / MCP（实时）—— */
     const roleSkills = Array.isArray(role.skills) ? role.skills : []
-    const extraSkills = Array.isArray(member.skills) ? member.skills : []
-    if (roleSkills.length > 0) lines.push(`\n已启用技能：${roleSkills.join(', ')}（需要细节时用 skill 工具加载）。`)
-    if (extraSkills.length > 0) lines.push(`总指挥为你点开的技能：${extraSkills.join(', ')}（先用 skill 工具把它们加载进来再干活）。`)
-    if (role.model && asText(role.model.model) !== '') lines.push(`你的模型：${role.model.provider}/${role.model.model}`)
+    const extraSkills = (Array.isArray(member.skills) ? member.skills : []).filter((name) => roleSkills.includes(name) === false)
+    if (roleSkills.length > 0) lines.push(`\n已启用技能：${roleSkills.join(', ')}（需要细节时用 recon_skill action=load name=技能名 加载完整正文）。`)
+    if (extraSkills.length > 0) lines.push(`总指挥为你点开的技能：${extraSkills.join(', ')}（先用 recon_skill action=load 把它们加载进来再干活）。`)
+    lines.push(`模型档位：${role.tier === 'dsh' ? '跟随 DSH' : (role.tier || 'deep')}`)
     if (asText(member.promptExtra) !== '') {
       lines.push('')
       lines.push('## 总指挥给你的专属指令（最高优先级，必须遵守）')
@@ -4168,19 +5524,36 @@ class Squad {
 
     /* —— 分给我的任务（实时）—— */
     const taskRows = this.tasks === undefined || this.tasks === null ? [] : this.tasks.rawSync(engagementId)
-    const mine = taskRows.filter((row) => row.assignee === member.name)
+    /* 指派到具体人 + 只写了角色（assignee 为空）的任务都算“分给我”的。 */
+    const mine = taskRows.filter((row) => row.assignee === member.name
+      || (asText(row.assignee) === '' && row.role === member.role))
     const openMine = mine.filter((row) => row.status !== 'passed' && row.status !== 'failed')
     if (openMine.length > 0) {
       lines.push('')
       lines.push('## 分给你的未完成任务（实时）')
       for (const row of openMine.slice(-8)) {
-        lines.push(`- ${row.id} ${this.humanize(row.title)}｜目标：${shortText(this.humanize(row.goal) || '-', 90)}｜验收：${shortText(this.humanize(row.acceptance) || '-', 70)}`)
+        const ev = row.evidence || {}
+        const evidence = [
+          Array.isArray(ev.commandIds) && ev.commandIds.length > 0 ? `命令 ${ev.commandIds.join(',')}` : '',
+          Array.isArray(ev.vulnIds) && ev.vulnIds.length > 0 ? `漏洞 ${ev.vulnIds.join(',')}` : '',
+          Array.isArray(ev.nodeIds) && ev.nodeIds.length > 0 ? `节点 ${ev.nodeIds.join(',')}` : '',
+          Array.isArray(ev.shots) && ev.shots.length > 0 ? `截图 ${ev.shots.length}` : '',
+        ].filter((x) => x !== '').join('；')
+        lines.push(`- ${row.id} ${this.humanize(row.title)}｜目标：${shortText(this.humanize(row.goal) || '-', 90)}｜验收：${shortText(this.humanize(row.acceptance) || '-', 70)}${evidence !== '' ? `｜已有证据：${evidence}` : ''}`)
       }
       lines.push('做完用 `recon_task update` 改成 doing/passed 并附证据。')
     }
     const rejected = mine.filter((row) => row.status === 'failed')
     if (rejected.length > 0) {
       lines.push(`有 ${rejected.length} 条被验收驳回，优先返工：${rejected.slice(-3).map((r) => `${r.id}（${shortText(r.note || '未达标', 60)}）`).join('；')}`)
+    }
+    if (role.id === 'qa') {
+      lines.push('')
+      lines.push('## QA 验收流程（必须按顺序）')
+      lines.push('1. 先看 `recon_task list` 的任务目标、验收标准、执行者、commandId/vuln/node/shot 证据。')
+      lines.push('2. 用 `recon_audit action=list member=执行者` 核对真实命令、覆盖范围与结果；证据断了或结果不可复现就 reject。')
+      lines.push('3. 需要复现时自己 `recon_run` / `recon_browser`；通过才 `recon_task accept`，驳回必须写清缺口并 `recon_task reject`。')
+      lines.push('4. 全部任务通过后写最终验收报告到看板（kind=conclusion）；最终只能由总指挥 close，你不要替总指挥宣布结束。')
     }
 
     /* —— 在岗同事（实时，方便直接喊人）—— */
@@ -4192,26 +5565,14 @@ class Squad {
       lines.push(`在岗同事：${peers.join('、')}`)
       lines.push('要找别人接手，直接在看板写「@名字 + 要他做什么」，或让总指挥派。')
     }
+    const groupText = this.groupPromptText(member)
+    if (groupText !== '') lines.push(groupText)
 
-    /* —— 通用看板（实时，排除已点名的）—— */
-    const calledIds = new Set(calledOn.map((row) => row.id))
-    const restBoard = boardRows.filter((row) => calledIds.has(row.id) === false).slice(-14)
-    if (restBoard.length > 0) {
-      lines.push('')
-      lines.push('## 看板最近（实时）')
-      for (const row of restBoard) {
-        const who = row.author && row.author.name ? row.author.name : '?'
-        lines.push(`- [${asText(row.kind, 'note')}] ${who}：${shortText(this.humanize(safePromptText(asText(row.text))), 240)}`)
-      }
+    /* —— 完整看板（强制阅读：用户发言全文 + 全部 agent 条目全文）—— */
+    if (this.board !== undefined && this.board !== null) {
+      const boardText = this.board.promptText(engagementId)
+      if (boardText !== '') { lines.push(''); lines.push(boardText) }
     }
-
-    /* —— 指挥席（用户）的原话，全量 —— */
-    try {
-      const directives = this.board === undefined || this.board === null
-        ? ''
-        : this.board.directivesForPrompt(engagementId, 16000)
-      if (directives !== '') { lines.push(''); lines.push(this.humanize(directives)) }
-    } catch { /* 取不到就不带 */ }
 
     /* —— 靶标现状 —— */
     const eng = this.store && this.store.cache ? this.store.cache.get(engagementId) : undefined
@@ -4219,8 +5580,25 @@ class Squad {
       const stats = statsOf(eng)
       lines.push('')
       lines.push(`当前靶标：${eng.name}（${eng.id}）；节点 ${stats.nodes} · 关系 ${stats.edges} · 漏洞 ${stats.vulns} · 命令 ${stats.commands}`)
-      const recentNodes = eng.nodes.slice(-20).map((node) => `${node.kind}:${node.value}`)
+      const recentNodes = eng.nodes.filter((node) => node.archived !== true).slice(-20).map((node) => `${node.kind}:${node.value}`)
       if (recentNodes.length > 0) lines.push(`最近资产：${recentNodes.join(' , ')}`)
+    }
+
+    /* —— 全局长期记忆（所有 agent 强制阅读，仅参谋/总指挥可写）—— */
+    const dynamicConfig = this.configStore.get()
+    const dynamicMemory = Array.isArray(dynamicConfig.memory) ? dynamicConfig.memory : []
+    if (dynamicMemory.length > 0) {
+      lines.push('')
+      lines.push('## 长期记忆（全局强制阅读，全部条目）')
+      for (const item of dynamicMemory) {
+        const entry = memoryEntryOf(item)
+        if (entry.content !== '') lines.push(`- [${entry.category || 'other'}] ${entry.title}：${entry.content}`)
+      }
+    }
+    const memberPromptGroupText = this.groupPromptText(member)
+    if (memberPromptGroupText !== '') {
+      lines.push('')
+      lines.push(memberPromptGroupText)
     }
 
     /* —— 常设席位的前情 —— */
@@ -4239,11 +5617,12 @@ class Squad {
     lines.push('')
     lines.push('## 团队纪律')
     lines.push('- 你和其它 Agent 并行工作，共享同一份图谱、命令日志和看板；不要重复别人刚写进看板的结论。')
+    lines.push('- 记忆是全局强制阅读的完整事实库；你没有写入权限，重要结论交给总指挥/参谋写记忆，日常过程只写看板。')
     lines.push('- 每次有发现或猜想，立刻 `recon_board` 记一条（kind=finding/hypothesis/task/conclusion），带上节点/漏洞/命令引用。')
-    lines.push('- 你不能派发新 Agent（那是指挥席的事）；需要别人接手时，在看板写一条 kind=task 并点名。')
+    lines.push('- 你不能派发新 Agent（那是指挥席的事）。遇到非自己职责的卡点，先用 `recon_group action=request role=... task=...` 报给总指挥；编组后用 `recon_group action=ask` 串行求助。')
     lines.push('- 命令一律走 `recon_run`（会留痕并上图）；页面操作走 `recon_browser`。')
 
-    return lines.join('\n')
+    return safePromptText(withCommonPrompt(this.configStore.get(), lines.join('\n')))
   }
 
   /** 花名册落盘文件 */
@@ -4327,11 +5706,18 @@ class Squad {
     const lines = []
     lines.push(`## 你是「狩猎 · 协同团队」里的${role.name}（role=${role.id}）`)
     lines.push(role.prompt)
+    if (role.id === 'scout' && !String(role.prompt || '').includes('recon_nday')) {
+      lines.push('')
+      lines.push('## 指纹 Nday 检索（探测到指纹后立即查，不必等总指挥指派）')
+      lines.push('- 你在测绘中确认服务 / 中间件 / 产品 / 版本指纹后，立刻调用 `recon_nday fingerprint="..."` 查 Exploit-DB 与 NVD；')
+      lines.push('- 每个指纹至少查一次；候选 CVE / EDB / 受影响版本写看板 kind=hypothesis 并附来源，需要实测的交 Web 手 / QA；')
+      lines.push('- 只查历史漏洞库，不对目标发包；不要凭版本猜结论；工具没查到就写「无匹配」，不要编造 CVE。')
+    }
     lines.push('')
     lines.push(`你的汇报对象：${role.reportsTo || '无（最高指挥）'}。`)
     const roleSkills = Array.isArray(role.skills) ? role.skills : []
-    if (roleSkills.length > 0) lines.push(`你已启用的技能：${roleSkills.join(', ')}（需要细节时用 skill 工具加载）。`)
-    if (role.model && asText(role.model.model) !== '') lines.push(`你的模型：${role.model.provider}/${role.model.model}`)
+    if (roleSkills.length > 0) lines.push(`你已启用的技能：${roleSkills.join(', ')}（需要细节时用 recon_skill action=load name=技能名 加载完整正文）。`)
+    lines.push(`模型档位：${role.tier === 'dsh' ? '跟随 DSH' : (role.tier || 'deep')}`)
     if (member !== undefined && member !== null) {
       lines.push(`你的代号：${member.name}（key=${member.key}）；总指挥点名派的活，汇报时自报这个代号。`)
       if (asText(member.station) !== '') {
@@ -4342,8 +5728,8 @@ class Squad {
         lines.push('- 要交接给别的队员或 qa 复核的产物，写到同级共享目录 `../shared/`（不存在就先 mkdir -p ../shared），并在看板条目里写清文件名。')
         lines.push('- 你离职后这个目录不会被删除，东西都留着；不要往别人的工位目录里写。')
       }
-      const extraSkills = Array.isArray(member.skills) ? member.skills : []
-      if (extraSkills.length > 0) lines.push(`总指挥为你点开的技能：${extraSkills.join(', ')}（先用 skill 工具把它们加载进来再干活）。`)
+      const extraSkills = (Array.isArray(member.skills) ? member.skills : []).filter((name) => roleSkills.includes(name) === false)
+      if (extraSkills.length > 0) lines.push(`总指挥为你点开的技能：${extraSkills.join(', ')}（先用 recon_skill action=load 把它们加载进来再干活）。`)
       if (asText(member.promptExtra) !== '') {
         lines.push('')
         lines.push('总指挥给你的专属指令（最高优先级，必须遵守）：')
@@ -4365,21 +5751,22 @@ class Squad {
     } catch { /* 忽略 */ }
     lines.push('团队纪律：')
     lines.push('- 你和其它 Agent 并行工作，共享同一份图谱、命令日志和看板；不要重复别人刚写进看板的结论。')
+    lines.push('- 记忆是全局强制阅读的完整事实库；你没有写入权限，重要结论交给总指挥/参谋写记忆，日常过程只写看板。')
     lines.push('- 每次有发现或猜想，立刻 `recon_board` 记一条（kind=finding/hypothesis/task/conclusion），带上节点/漏洞/命令引用。')
-    lines.push('- 你不能派发新 Agent（那是指挥席的事）；需要别人接手时，在看板写一条 kind=task 并点名角色。')
+    lines.push('- 你不能派发新 Agent（那是指挥席的事）。遇到非自己职责的卡点（例如 Web 需要逆向、需要内网隧道），先用 `recon_group action=request role=... task=...` 报给总指挥；等总指挥把你和专业人员编成小组后，用 `recon_group action=ask member=对方 question=...` 串行提问并等待结果，再继续自己的工作。')
     lines.push('- 命令一律走 `recon_run`（会留痕并上图）；页面操作走 `recon_browser`。')
     if (eng !== undefined) {
       const stats = statsOf(eng)
       lines.push('')
       lines.push(`当前靶标：${eng.name}（${eng.id}）；节点 ${stats.nodes} · 关系 ${stats.edges} · 漏洞 ${stats.vulns} · 命令 ${stats.commands}`)
-      const recentNodes = eng.nodes.slice(-20).map((node) => `${node.kind}:${node.value}`)
+      const recentNodes = eng.nodes.filter((node) => node.archived !== true).slice(-20).map((node) => `${node.kind}:${node.value}`)
       if (recentNodes.length > 0) lines.push(`最近资产：${recentNodes.join(' , ')}`)
     }
-    /* 用户发言全量置顶注入：优先级高于任务与其它看板条目 */
-    const directives = await userDirectives(this.board, engagementId)
-    if (directives !== '') {
+    /* 完整看板置顶注入：用户发言全文 + 所有 agent 条目全文 */
+    const boardText = await boardPromptText(this.board, engagementId)
+    if (boardText !== '') {
       lines.push('')
-      lines.push(directives)
+      lines.push(boardText)
       lines.push('')
     }
     /* 常设席位（总指挥/参谋）跨重启保持对话记忆：把最近几轮自己的发言带回来 */
@@ -4395,12 +5782,6 @@ class Squad {
           }
         }
       } catch { /* 读不到就不带 */ }
-    }
-    const boardText = await this.board.recentText(engagementId, 14)
-    if (boardText !== '') {
-      lines.push('')
-      lines.push('看板最近条目（agent 产出，可能已被合并）：')
-      lines.push(boardText)
     }
     try {
       const taskRows = this.tasks === undefined || this.tasks === null ? [] : await this.tasks.list(engagementId, 80)
@@ -4439,10 +5820,13 @@ class Squad {
     const memory = Array.isArray(config.memory) ? config.memory : []
     if (memory.length > 0) {
       lines.push('')
-      lines.push('长期记忆：')
-      for (const item of memory.slice(0, 20)) lines.push(`- ${asText(item.title, '记忆')}：${asText(item.content)}`)
+      lines.push('## 长期记忆（全局强制阅读，全部条目）')
+      for (const item of memory) {
+        const entry = memoryEntryOf(item)
+        if (entry.content !== '') lines.push(`- [${entry.category || 'other'}] ${entry.title}：${entry.content}`)
+      }
     }
-    return safePromptText(lines.join('\n'))
+    return safePromptText(withCommonPrompt(config, lines.join('\n')))
   }
 
   /** 工位目录名：用队员名，去掉文件系统不允许的字符 */
@@ -4471,12 +5855,23 @@ class Squad {
     return dir
   }
 
-  async spawn({ engagementId, roleId, tier, task, origin = 'manual', name: nameWanted, promptExtra, skills, mcp }) {
+  async spawn({ engagementId, roleId, tier, task, origin = 'manual', name: nameWanted, promptExtra, skills, mcp, allowCore = false }) {
     const agents = this.ctx.get('agents')
     if (agents === undefined || agents === null) throw new Error('agents 服务不可用')
     const engagement = await this.store.load(engagementId)
     if (engagement === undefined) throw new Error(`靶标不存在：${engagementId}`)
+    const requestedRole = asText(roleId)
+    if (requestedRole !== '') {
+      const directRole = this.roles().find((role) => role.id === requestedRole || role.name === requestedRole)
+      const coreRole = this.coreRoleIdOf(requestedRole)
+      if (directRole === undefined && coreRole === '' && ROLE_ALIASES[requestedRole] === undefined) {
+        throw new Error(`未知角色：${requestedRole}。可用角色：${this.roles().map((role) => `${role.id}(${role.name})`).join(', ')}`)
+      }
+    }
     const role = this.roleOf(roleId)
+    if (CORE_ROLES.has(role.id) && allowCore !== true) {
+      throw new Error(`${role.name}是常设席位（每靶标各一个、自动在岗），不能召唤为队员；请用 recon_squad task / recon_org brief 给席位派活`)
+    }
     /* 常设席位全局唯一：总指挥 / 参谋已在岗时不再新建，任务直接追加给原席位。
        （全员会议、事件触发、断点续跑都会走 spawn，这里是最后一道闸。） */
     if (CORE_ROLES.has(role.id)) {
@@ -4495,7 +5890,7 @@ class Squad {
       }
       if (seated !== undefined) {
         const text = asText(task)
-        if (text !== '') await this.task(seated.key, text)
+        if (text !== '') await this.taskByMember(seated, text)
         return this.view(seated)
       }
       /* 先占位：后到的并发 spawn 会走上面的等待分支 */
@@ -4503,29 +5898,31 @@ class Squad {
       setTimeout(() => { try { this.coreCreating.delete(lockKey) } catch { /* 已释放 */ } }, 15000)
     }
     const automationConfig = mergeDeep(DEFAULT_AUTOMATION, this.configStore.get().automation || {})
-    const maxMembers = Number.isFinite(automationConfig.maxMembers) ? automationConfig.maxMembers : 6
+    const maxAgents = Number.isFinite(Number(automationConfig.maxAgents))
+      ? Math.max(1, Math.min(50, Math.floor(Number(automationConfig.maxAgents))))
+      : 8
+    const configuredMembers = Number.isFinite(Number(automationConfig.maxMembers))
+      ? Math.max(1, Math.min(50, Math.floor(Number(automationConfig.maxMembers))))
+      : 6
+    /* 最大并发数调大时，成员上限跟随，避免被隐藏的 6 人上限拦住 */
+    const maxMembers = Math.max(maxAgents, configuredMembers)
     const coreCount = () => Array.from(this.members.values())
       .filter((m) => m.engagementId === engagementId && CORE_ROLES.has(m.role)).length
     if (this.memberCount(engagementId) - coreCount() >= maxMembers) {
       const before = this.memberCount(engagementId)
       await this.pruneIdle(60000)
       if (this.memberCount(engagementId) - coreCount() >= maxMembers) {
-        throw new Error(`队员已满（${maxMembers}）：先停掉/移除空闲成员，或在控制台调大「最大成员数」`)
+        throw new Error(`队员已满（${maxMembers}）：先停掉/移除空闲成员，或在控制台调大「最大并发数」`)
       }
       if (before === this.memberCount(engagementId)) {
         /* 没有可回收的，继续走失败分支 */
       }
     }
-    const wantedTier = MODEL_TIERS.includes(asText(tier)) ? asText(tier) : asText(role.tier, 'deep')
-    const roleModel = role.model !== undefined && role.model !== null
-      && asText(role.model.provider) !== '' && asText(role.model.model) !== ''
-      ? {
-        provider: asText(role.model.provider),
-        model: asText(role.model.model),
-        ...(asText(role.model.reasoning) !== '' ? { reasoningEffort: asText(role.model.reasoning) } : {}),
-      }
-      : undefined
-    const selection = roleModel || this.modelFor(wantedTier)
+    /* 角色只选档位（deep / fast / vision / dsh），实际 provider/model 由模型页决定 */
+    const wantedTier = MODEL_CHOICES.includes(asText(tier))
+      ? asText(tier)
+      : (MODEL_CHOICES.includes(asText(role.tier)) ? asText(role.tier) : 'dsh')
+    const selection = this.modelFor(wantedTier)
     const workDir = await ensureDir(join(this.store.workDir, engagementId))
     this.seq += 1
     const key = `a${this.seq}`
@@ -4534,14 +5931,19 @@ class Squad {
     const name = customName !== ''
       ? customName
       : (CORE_ROLES.has(role.id) ? role.name : `${role.name}#${this.seq}`)
+    const roleSkills = Array.isArray(role.skills) ? role.skills.map((x) => asText(x)).filter((x) => x !== '') : []
     const extraSkills = asList(skills).map((x) => asText(x)).filter((x) => x !== '')
+    const memberSkills = Array.from(new Set([...roleSkills, ...extraSkills]))
     const extraPrompt = asText(promptExtra).trim()
+    const duplicateName = Array.from(this.members.values()).find((m) => m.engagementId === engagementId
+      && m.name.toLowerCase() === name.toLowerCase())
+    if (duplicateName !== undefined) throw new Error(`成员代号重复：${name}；请换一个代号`)
     const sessionId = `recon-squad-${key}-${nowMs().toString(36)}`
     const member = {
       key,
       role: role.id,
       name,
-      skills: extraSkills,
+      skills: memberSkills,
       promptExtra: extraPrompt,
       mcp: asMcpList(mcp).length > 0 ? asMcpList(mcp) : asMcpList(role.mcp),
       tier: wantedTier,
@@ -4553,9 +5955,14 @@ class Squad {
       task: asText(task),
       startedAt: nowMs(),
       lastText: '',
+      lastAssistantText: '',
       lastTool: '',
       boardPosts: 0,
       origin,
+      groupId: null,
+      answerWaiters: [],
+      waitingFor: '',
+      taskNotified: false,
     }
     const squad = this
     /* 先装专属 MCP：工具注册要在 agent 建立之前完成，restrict 才能看到它们 */
@@ -4569,11 +5976,12 @@ class Squad {
             name: `recon-squad-${key}`,
             order: 4902,
             /* 每轮实时渲染：看板/任务/名字/MCP 变更立刻进上下文，不等任何刷新 */
-            text: () => squad.renderPromptSync(key) || `## 你是${role.name}\n${role.prompt}`,
+            text: () => squad.renderPromptSync(key) || safePromptText(withCommonPrompt(squad.configStore.get(), `## 你是${role.name}\n${role.prompt}`)),
           })
         }
         /* 工具隔离：别人挂的私有 MCP 不给这个成员用 */
         const tools = typeof agentCtx.get === 'function' ? agentCtx.get('tools') : undefined
+        member.tools = tools
         const deny = squad.mcpDenyFor(key)
         if (deny.length > 0 && tools !== undefined && tools !== null && typeof tools.restrict === 'function') {
           tools.restrict({ deny })
@@ -4587,18 +5995,28 @@ class Squad {
       member.station = undefined
     }
     void this.rememberName(key, name)
-    this.promptCache.set(key, await this.memberPrompt(engagementId, role, member))
-    const handle = await agents.create({
-      sessionId,
-      meta: { cwd: member.station || workDir, origin: 'subagent' },
-      agentOptions: selection,
-      setup,
-    })
-    member.agent = handle.agent
-    member.handle = handle
-    member.status = 'idle'
-    member.model = roleModel ? `${selection.provider}/${selection.model}` : `tier:${wantedTier}`
-    this.members.set(key, member)
+    try {
+      this.promptCache.set(key, await this.memberPrompt(engagementId, role, member))
+      const handle = await agents.create({
+        sessionId,
+        meta: { cwd: member.station || workDir, origin: 'subagent' },
+        agentOptions: selection,
+        setup,
+      })
+      member.agent = handle.agent
+      member.handle = handle
+      member.status = 'idle'
+      member.model = asText(selection.provider) !== '' ? `${selection.provider}/${selection.model}` : 'follow-dsh'
+      this.members.set(key, member)
+    } catch (error) {
+      /* agent 没建起来时，把已注册的私有 MCP 和占位状态一并回滚。 */
+      this.uninstallMemberMcp(key)
+      this.promptCache.delete(key)
+      if (CORE_ROLES.has(role.id) && this.coreCreating !== undefined) {
+        this.coreCreating.delete(`${engagementId}:${role.id}`)
+      }
+      throw error
+    }
     /* 席位已落位：放开占位，让并发等待者直接复用这个成员 */
     if (CORE_ROLES.has(role.id) && this.coreCreating !== undefined) {
       this.coreCreating.delete(`${engagementId}:${role.id}`)
@@ -4619,7 +6037,7 @@ class Squad {
         text: `${name}（${role.name} · ${wantedTier} · ${origin === 'trigger' ? '事件触发' : '手动派发'}）开工：${shortText(asText(task), 400)}`,
       })
     }
-    if (asText(task) !== '') await this.task(key, task)
+    if (asText(task) !== '') await this.taskByMember(member, task)
     return this.view(member)
   }
 
@@ -4640,9 +6058,13 @@ class Squad {
       idleSince: member.idleSince || null,
       lastText: shortText(member.lastText, 400),
       lastTool: member.lastTool,
+      core: CORE_ROLES.has(member.role),
       sessionId: member.sessionId,
       engagementId: member.engagementId,
       station: member.station || null,
+      groupId: member.groupId || null,
+      waitingFor: asText(member.waitingFor),
+      origin: asText(member.origin),
     }
   }
 
@@ -4650,10 +6072,14 @@ class Squad {
    * 成员寻址：只认名字。
    * 「Web 手#6」「web手6」「#6」「6」都算名字写法；内部 ID（a6）不再接受 —— 逼所有调用方说人名。
    */
-  resolveMemberRef(ref) {
+  resolveMemberRef(ref, engagementId) {
     const wanted = asText(ref).trim()
     if (wanted === '') return undefined
     const all = Array.from(this.members.values())
+      .filter((m) => asText(engagementId) === '' || m.engagementId === asText(engagementId))
+    /* 内部调用经常直接传 member.key；必须支持，否则 remove/drop 会静默失败。 */
+    const byKey = all.find((m) => m.key === wanted)
+    if (byKey !== undefined) return byKey
     const norm = (v) => asText(v).toLowerCase().replace(/[\s#＃_\-·]/g, '')
     const target = norm(wanted)
     const hits = all.filter((m) => norm(m.name) === target)
@@ -4677,13 +6103,33 @@ class Squad {
     throw new Error(`找不到成员「${wanted}」。在岗成员：${roster}`)
   }
 
-  async task(key, text) {
-    const member = this.resolveMemberRef(key)
+  async task(key, text, engagementId) {
+    const member = this.resolveMemberRef(key, engagementId)
     if (member === undefined) throw new Error('没指定成员')
+    return this.taskByMember(member, text)
+  }
+
+  /** 直接按成员对象派活：内部调用方拿的是 key/对象，不能再去走「只认名字」的 resolveMemberRef。 */
+  async taskByMember(member, text, options = {}) {
+    if (member === undefined || member === null) throw new Error('没指定成员')
+    /* 小组内默认串行：已有其他成员在跑时，不允许再并发派活；组内应使用 recon_group ask。 */
+    if (options.groupSerial !== false && member.groupId) {
+      const group = this.groups.get(member.groupId)
+      const otherActive = group === undefined ? undefined : group.memberKeys
+        .filter((key) => key !== member.key)
+        .map((key) => this.members.get(key))
+        .find((item) => item !== undefined && (item.status === 'running' || item.status === 'starting' || item.status === 'waiting'))
+      if (otherActive !== undefined) {
+        throw new Error(`小组 ${member.groupId} 正在串行执行 ${otherActive.name}；等它完成后再派，或让成员用 recon_group ask 协作`)
+      }
+    }
     /* 双花括号会被 prompt 模板当变量解析，直接把整个会话变成 malformed，这里统一消毒 */
     const message = safePromptText(asText(text))
     if (message === '') throw new Error('任务内容不能为空')
     member.task = message
+    member.taskNotified = false
+    member.lastText = ''
+    member.lastAssistantText = ''
     member.status = 'running'
     member.startedAt = nowMs()
     void this.trace?.push?.(member.engagementId, {
@@ -4711,10 +6157,13 @@ class Squad {
     } catch { /* 用旧提示 */ }
   }
 
-  async stop(key) {
+  async stop(key, engagementId) {
     let member
-    try { member = this.resolveMemberRef(key) } catch { member = undefined }
+    try { member = this.resolveMemberRef(key, engagementId) } catch { member = undefined }
     if (member === undefined) return { ok: true, stopped: false }
+    if (CORE_ROLES.has(member.role)) {
+      return { ok: false, stopped: false, error: `${member.name} 是常设席位；请派空任务或使用「暂停/继续」，不要直接停止` }
+    }
     try { member.agent.cancel({ kind: 'user' }) } catch { /* 已停 */ }
     member.status = 'done'
     void this.trace?.push?.(member.engagementId, {
@@ -4732,9 +6181,19 @@ class Squad {
     const reclaimed = []
     for (const member of Array.from(this.members.values())) {
       if (member.engagementId !== engagementId) continue
-      if (member.status === 'running') continue
+      if (member.status === 'running' || member.status === 'starting' || member.status === 'waiting') continue
+      if (CORE_ROLES.has(member.role)) continue
+      try { await this.handover(member, '收队') } catch { /* 交接失败照常释放 */ }
+      this.uninstallMemberMcp(member.key)
       try { await member.handle.dispose() } catch { /* 已释放 */ }
       this.members.delete(member.key)
+      this.removeMemberFromGroup(member)
+      this.promptCache.delete(member.key)
+      this.transcripts.delete(member.key)
+      this.browsers?.drop?.(member.engagementId, member.sessionId)
+      const timer = this.saveTimers.get(member.key)
+      if (timer !== undefined) clearTimeout(timer)
+      this.saveTimers.delete(member.key)
       reclaimed.push({ key: member.key, name: member.name, role: member.role })
       try { this.hub.broadcast({ type: 'squad.remove', engagementId, key: member.key }) } catch { /* 广播失败 */ }
     }
@@ -4784,7 +6243,7 @@ class Squad {
     try {
       const beforeAnswer = asText(member.lastAnswer)
       const beforeStream = asText(member.lastText)
-      await this.task(member.key, prompt)
+      await this.taskByMember(member, prompt)
       const deadline = nowMs() + timeoutMs
       while (nowMs() < deadline) {
         await sleep(1500)
@@ -4825,22 +6284,13 @@ class Squad {
       detail: shortText(body, 900),
       refs: { memberName: member.name, role: member.role },
     })
-    /* 沉淀成长期记忆（技能化）：下次同类任务可直接复用 */
-    if (config.keepSkill !== false) {
-      try {
-        const current = this.configStore.get()
-        const memory = Array.isArray(current.memory) ? current.memory.slice() : []
-        const line = `[${roleLabelOf(member.role)}·${member.name}交接] ${shortText(body.replace(/\n+/g, ' '), 400)}`
-        memory.push(line)
-        await this.configStore.patch({ memory: memory.slice(-60) })
-      } catch { /* 忽略 */ }
-    }
     return body
   }
 
-  async remove(key, { reason = '回收', handover = true, force = false } = {}) {
+  async remove(key, { reason = '回收', handover = true, force = false, engagementId } = {}) {
     let member
-    try { member = this.resolveMemberRef(key) } catch (error) { if (asText(key) !== '') throw error }
+    try { member = this.resolveMemberRef(key, engagementId) } catch (error) { if (asText(key) !== '') throw error }
+    if (member === undefined && asText(key) === '') return { ok: false, removed: false, error: '没有指定成员' }
     if (member !== undefined) key = member.key
     /* 总指挥与参谋是常设席位：每场固定各一个，任何常规回收都不动它们；
        只有整个项目被删除（force）时才随项目一起清掉 */
@@ -4851,10 +6301,17 @@ class Squad {
         error: `${member.name} 是常设席位（${member.role}），不能释放；要清掉请删除整个项目`,
       }
     }
-    this.uninstallMemberMcp(key)
     if (handover) { try { await this.handover(member, reason) } catch { /* 交接失败照常释放 */ } }
+    this.uninstallMemberMcp(key)
     try { await member.handle.dispose() } catch { /* 已释放 */ }
     this.members.delete(key)
+    this.removeMemberFromGroup(member)
+    this.promptCache.delete(key)
+    this.transcripts.delete(key)
+    this.browsers?.drop?.(member.engagementId, member.sessionId)
+    const timer = this.saveTimers.get(key)
+    if (timer !== undefined) clearTimeout(timer)
+    this.saveTimers.delete(key)
     void this.trace?.push?.(member.engagementId, {
       kind: 'member',
       actor: { role: 'commander', name: '总指挥' },
@@ -4919,7 +6376,12 @@ class Squad {
             name: event.data.name,
             args: shortText(event.data.arguments, 240),
           })
-          if (event.data.name === 'recon_board') member.boardPosts += 1
+          if (event.data.name === 'recon_board') {
+            try {
+              const parsed = typeof event.data.arguments === 'string' ? JSON.parse(event.data.arguments) : event.data.arguments
+              if (asText(parsed && parsed.action ? parsed.action : 'post') === 'post') member.boardPosts += 1
+            } catch { member.boardPosts += 1 }
+          }
           const isSkill = event.data.name === 'skill'
           let skillName = ''
           if (isSkill) {
@@ -4940,6 +6402,7 @@ class Squad {
           const text = blocks.filter((b) => b && b.type === 'text').map((b) => b.text).join('').trim()
           const reasoning = blocks.filter((b) => b && b.type === 'reasoning').map((b) => b.text).join('').trim()
           if (text !== '' || reasoning !== '') {
+            if (text !== '') member.lastAssistantText = text
             const record = {
               id: `a_${event.seq}_${nowMs().toString(36)}`,
               role: 'assistant',
@@ -4965,9 +6428,17 @@ class Squad {
           member.idleSince = nowMs()
           member.lastAt = nowMs()
           this.hub.broadcast({ type: 'squad.status', engagementId: member.engagementId, member: this.view(member) })
-          const finished = member.lastText
+          const finished = asText(member.lastText) || asText(member.lastAssistantText)
+          const finishedTask = asText(member.task)
           if (asText(finished) !== '') member.lastAnswer = finished
           member.lastText = ''
+          member.lastAssistantText = ''
+          /* 组内 ask 的调用者正在等这一轮结果；turn/end 立即唤醒。 */
+          const answerText = asText(member.lastAnswer) || asText(finished)
+          const waiters = Array.isArray(member.answerWaiters) ? member.answerWaiters.splice(0) : []
+          for (const waiter of waiters) {
+            try { waiter(answerText) } catch { /* 单个等待者失败不影响其它 */ }
+          }
           if (member.boardPosts === 0 && asText(finished) !== '') {
             void this.board.post(member.engagementId, {
               author: { role: member.role, name: member.name },
@@ -4976,6 +6447,15 @@ class Squad {
             })
           }
           member.boardPosts = 0
+          /* 成员完成一轮后主动回报总指挥；否则总指挥常常以为还在跑而卡住。
+             常设总指挥自己不是队员会话；普通成员每次派活只通知一次。 */
+          if (finishedTask !== '' && member.role !== 'commander' && member.taskNotified !== true) {
+            member.taskNotified = true
+            const report = shortText(asText(finished) || asText(member.lastAnswer), 700)
+            void this.cockpit?.nudge?.(member.engagementId,
+              `${member.name}（${member.role}）完成了派发任务：${shortText(finishedTask, 160)}${report !== '' ? `\n成员汇报：${report}` : ''}`,
+              { always: true }).catch(() => {})
+          }
           void this.refreshPrompt(member)
         }
       } catch { /* 同上 */ }
@@ -4996,12 +6476,19 @@ class Squad {
         const member = this.memberByAgent(payload.agent)
         if (member === undefined) return
         const error = payload.error
+        member.status = 'idle'
+        member.lastAt = nowMs()
+        const waiters = Array.isArray(member.answerWaiters) ? member.answerWaiters.splice(0) : []
+        for (const waiter of waiters) {
+          try { waiter(`执行出错：${error && error.message ? error.message : String(error)}`) } catch { /* 忽略 */ }
+        }
         this.hub.broadcast({
           type: 'squad.error',
           engagementId: member.engagementId,
           key: member.key,
           text: error && error.message ? error.message : String(error),
         })
+        this.hub.broadcast({ type: 'squad.status', engagementId: member.engagementId, member: this.view(member) })
         void this.board.post(member.engagementId, {
           author: { role: 'system', name: '调度台' },
           kind: 'note',
@@ -5025,8 +6512,10 @@ class Squad {
     for (const timer of this.saveTimers.values()) clearTimeout(timer)
     this.transcripts.clear()
     for (const member of Array.from(this.members.values())) {
+      this.uninstallMemberMcp(member.key)
       try { await member.handle.dispose() } catch { /* 已释放 */ }
     }
+    for (const key of Array.from(this.memberMcp.keys())) this.uninstallMemberMcp(key)
     this.members.clear()
   }
 }
@@ -5300,7 +6789,7 @@ class Audit {
           goal,
           `验收标准：${acceptance}`,
           '做完把新命令的 commandId 写进任务证据，并在看板留一条结论。',
-        ].join('\n'))
+        ].join('\n'), eng.id)
       } catch { /* 成员不在岗就只留任务 */ }
     }
     await this.trace?.push?.(eng.id, {
@@ -5329,6 +6818,7 @@ class Runner {
     this.dir = join(cfg.root, 'checkpoints')
     this.cache = new Map()
     this.stallMs = 15 * 60 * 1000
+    this.writeQueue = Promise.resolve()
   }
 
   fileOf(engagementId) {
@@ -5347,6 +6837,12 @@ class Runner {
   }
 
   async save(engagementId, patch) {
+    const run = this.writeQueue.then(() => this.saveInner(engagementId, patch))
+    this.writeQueue = run.then(() => undefined, () => undefined)
+    return run
+  }
+
+  async saveInner(engagementId, patch) {
     const previous = (await this.load(engagementId)) || {}
     const next = { ...previous, ...patch, engagementId, updatedAt: nowMs() }
     this.cache.set(engagementId, next)
@@ -5368,7 +6864,7 @@ class Runner {
       reason: asText(reason),
       mission: mission || null,
       stats,
-      tasks: tasks.filter((row) => row.status === 'open' || row.status === 'doing' || row.status === 'failed')
+      tasks: tasks.filter((row) => row.status === 'open' || row.status === 'doing' || row.status === 'failed' || row.status === 'blocked')
         .slice(-40)
         .map((row) => ({ id: row.id, title: row.title, goal: row.goal, acceptance: row.acceptance, role: row.role, status: row.status, assignee: row.assignee || null })),
       done: tasks.filter((row) => row.status === 'passed').length,
@@ -5428,15 +6924,29 @@ class Runner {
     let spawned = 0
     for (const row of pending.slice(0, 4)) {
       const roleId = asText(row.role) || 'scout'
+      const taskText = `【继续未完成任务】${row.title}\n目标：${row.goal || row.title}\n验收标准：${row.acceptance || '按任务标题判定'}${note !== '' ? `\n补充说明：${note}` : ''}\n做完把证据（commandId/节点/漏洞）附到任务上。`
       try {
-        await this.squad.spawn({
-          engagementId: eng.id,
-          roleId,
-          tier: 'deep',
-          task: `【继续未完成任务】${row.title}\n目标：${row.goal || row.title}\n验收标准：${row.acceptance || '按任务标题判定'}${note !== '' ? `\n补充说明：${note}` : ''}\n做完把证据（commandId/节点/漏洞）附到任务上。`,
-          origin: 'resume',
-        })
+        /* 优先复用同角色在岗成员，避免每次 resume 都新建一个重复队员。 */
+        const existing = this.squad.list(eng.id).find((m) => m.role === roleId)
+        let member
+        if (existing !== undefined) {
+          member = await this.squad.task(existing.name, taskText, eng.id)
+        } else {
+          member = await this.squad.spawn({
+            engagementId: eng.id,
+            roleId,
+            task: taskText,
+            origin: 'resume',
+            allowCore: true,
+          })
+        }
         spawned += 1
+        try {
+          await this.tasks.update(eng.id, row.id, {
+            status: 'doing',
+            assignee: member && member.name ? member.name : '',
+          }, { role: 'system', name: '断点续跑' })
+        } catch { /* 任务可能已被删除 */ }
       } catch { /* 成员满了就继续下一条 */ }
     }
 
@@ -5468,12 +6978,13 @@ class Runner {
       }
       return
     }
-    const lastCommandAt = (eng.commands || []).slice(-1).map((c) => Number(c.startedAt) || 0)[0] || 0
-    const lastTraceAt = Number((checkpoint && checkpoint.lastBeat) || 0)
-    const beat = Math.max(lastCommandAt, lastTraceAt)
+    const lastCommandAt = (eng.commands || []).slice(-1).map((c) => toEpoch(c.startedAt))[0] || 0
+    const lastTraceAt = toEpoch(checkpoint && checkpoint.lastBeat)
+    const memberLastAt = members.reduce((max, m) => Math.max(max, Number(m.lastAt) || 0), 0)
+    const beat = Math.max(lastCommandAt, lastTraceAt, memberLastAt)
     if (beat !== 0 && nowMs() - beat > this.stallMs) {
       const fresh = await this.snapshot(eng, 'interrupted', '心跳超时（断网/额度耗尽/卡死）')
-      await this.save(eng.id, { ...fresh, lastBeat: nowMs() })
+      await this.save(eng.id, { ...fresh, lastBeat: beat })
       await this.board.post(eng.id, {
         author: { role: 'system', name: '调度' },
         kind: 'note',
@@ -5482,7 +6993,11 @@ class Runner {
       })
       return
     }
-    await this.save(eng.id, { ...(checkpoint || {}), phase: 'running', lastBeat: nowMs() })
+    /* 只在首次进入 running 或仍有真实活动时落一次基线；不能每轮刷新 lastBeat，
+       否则卡死的 agent 永远看起来“刚刚有活动”。 */
+    if (checkpoint === undefined || checkpoint.phase !== 'running' || toEpoch(checkpoint.lastBeat) === 0) {
+      await this.save(eng.id, { ...(checkpoint || {}), phase: 'running', lastBeat: beat || nowMs() })
+    }
   }
 
   async status(eng) {
@@ -5502,6 +7017,10 @@ class Runner {
         : null,
     }
   }
+
+  forget(engagementId) {
+    this.cache.delete(engagementId)
+  }
 }
 
 class Meeting {
@@ -5518,6 +7037,34 @@ class Meeting {
     this.lastAt = new Map()
     this.counts = new Map()
     this.busy = new Set()
+    this.loaded = new Set()
+  }
+
+  meetingFile(engagementId) {
+    return join(this.store.root, 'meeting', `${String(engagementId).replace(/[^a-zA-Z0-9_-]/g, '_')}.json`)
+  }
+
+  async load(engagementId) {
+    if (this.loaded.has(engagementId)) return
+    this.loaded.add(engagementId)
+    try {
+      const raw = JSON.parse(await readFile(this.meetingFile(engagementId), 'utf8'))
+      if (raw !== null && typeof raw === 'object') {
+        if (Number.isFinite(Number(raw.rounds))) this.counts.set(engagementId, Number(raw.rounds))
+        if (Number.isFinite(Number(raw.lastAt))) this.lastAt.set(engagementId, Number(raw.lastAt))
+      }
+    } catch { /* 第一次没有会议状态 */ }
+  }
+
+  async persist(engagementId) {
+    try {
+      await ensureDir(join(this.store.root, 'meeting'))
+      await writeJsonAtomic(this.meetingFile(engagementId), {
+        rounds: this.counts.get(engagementId) || 0,
+        lastAt: this.lastAt.get(engagementId) || 0,
+        updatedAt: nowMs(),
+      })
+    } catch { /* 会议状态落盘失败不阻断会议 */ }
   }
 
   /** 会议参数全部来自控制台配置（没设就按默认 20/20/3）。 */
@@ -5537,18 +7084,19 @@ class Meeting {
   /* 停滞判定：任务全派完 + 没有人在跑 + 一段时间内没有新进展 */
   async verdict(eng) {
     if (eng === undefined || eng === null) return { stalled: false, reasons: [] }
+    await this.load(eng.id)
     const reasons = []
     const stats = await this.tasks.stats(eng.id)
     const members = this.squad.list(eng.id)
     const running = members.filter((m) => m.status === 'running' || m.status === 'starting').length
-    const pending = stats.open + stats.doing
+    const pending = stats.open + stats.doing + stats.blocked
     if (running > 0) return { stalled: false, reasons: ['有成员在跑'] }
     if (pending > 0) return { stalled: false, reasons: [`还有 ${pending} 个任务没完成`] }
     if (stats.total === 0) {
       const nodeCount = (eng.nodes || []).length
       return { stalled: nodeCount > 0, reasons: [nodeCount > 0 ? '有资产但一个任务都没拆' : '还没有任何资产'] }
     }
-    if (stats.failed === 0 && stats.passed > 0 && stats.open === 0 && stats.doing === 0) {
+    if (stats.failed === 0 && stats.passed > 0 && stats.open === 0 && stats.doing === 0 && stats.blocked === 0) {
       /* 全部通过：那是完成态，不需要开会 */
       return { stalled: false, reasons: ['所有任务已通过验收'] }
     }
@@ -5558,9 +7106,9 @@ class Meeting {
     const options = this.options()
     const windowMs = options.stallMinutes * 60 * 1000
     const since = nowMs() - windowMs
-    const freshCommands = (eng.commands || []).filter((c) => Number(c.startedAt) >= since).length
-    const freshNodes = (eng.nodes || []).filter((n) => Number(n.ts || n.createdAt || 0) >= since).length
-    const freshVulns = (eng.vulns || []).filter((v) => Number(v.ts || v.createdAt || 0) >= since).length
+    const freshCommands = (eng.commands || []).filter((c) => toEpoch(c.startedAt) >= since).length
+    const freshNodes = (eng.nodes || []).filter((n) => toEpoch(n.ts || n.createdAt) >= since).length
+    const freshVulns = (eng.vulns || []).filter((v) => toEpoch(v.ts || v.createdAt) >= since).length
     if (freshCommands === 0 && freshNodes === 0 && freshVulns === 0) {
       reasons.push(`最近 ${Math.round(windowMs / 60000)} 分钟没有新命令/资产/漏洞`)
     } else {
@@ -5577,10 +7125,12 @@ class Meeting {
   async convene(eng, { reason = '自动检测到停滞', manual = false } = {}) {
     if (eng === undefined || eng === null) throw new Error('还没有项目')
     if (this.busy.has(eng.id)) return { ok: false, error: '这个项目正在开会' }
+    await this.load(eng.id)
     this.busy.add(eng.id)
     const round = (this.counts.get(eng.id) || 0) + 1
     this.counts.set(eng.id, round)
     this.lastAt.set(eng.id, nowMs())
+    await this.persist(eng.id)
     try {
       const stats = await this.tasks.stats(eng.id)
       const verified = (eng.vulns || []).filter((v) => v.status === 'verified').length
@@ -5623,7 +7173,7 @@ class Meeting {
       const staffSeat = seatFor('staff')
       if (staffSeat !== null) {
         try {
-          await this.squad.task(staffSeat.name, meetingTask({ name: staffSeat.name, id: 'staff' }, 'staff'))
+          await this.squad.task(staffSeat.name, meetingTask({ name: staffSeat.name, id: 'staff' }, 'staff'), eng.id)
           seated.push({ role: 'staff', name: staffSeat.name })
         } catch { /* 参谋不可用就跳过 */ }
       }
@@ -5632,8 +7182,15 @@ class Meeting {
         const roleId = asText(role.id)
         if (CORE_ROLES.has(roleId)) continue
         try {
-          const member = await this.squad.spawn({ engagementId: eng.id, roleId, tier: asText(role.tier, 'deep'), task: meetingTask(role, roleId), origin: 'meeting' })
-          seated.push({ role: roleId, name: member.name })
+          /* 同角色已有在岗成员时复用，避免每轮会议都新建一批队员。 */
+          const existing = seatFor(roleId)
+          if (existing !== null) {
+            await this.squad.task(existing.name, meetingTask(role, roleId), eng.id)
+            seated.push({ role: roleId, name: existing.name })
+          } else {
+            const member = await this.squad.spawn({ engagementId: eng.id, roleId, tier: asText(role.tier, 'deep'), task: meetingTask(role, roleId), origin: 'meeting' })
+            seated.push({ role: roleId, name: member.name })
+          }
         } catch { /* 成员满了或角色不可用就跳过 */ }
       }
 
@@ -5665,7 +7222,7 @@ class Meeting {
       const commanderSeat = seatFor('commander')
       if (commanderSeat !== null) {
         try {
-          await this.squad.task(commanderSeat.name, commanderTask)
+          await this.squad.task(commanderSeat.name, commanderTask, eng.id)
           seated.push({ role: 'commander', name: commanderSeat.name })
         } catch {
           try { await this.cockpit?.send?.({ engagement: eng.id, text: commanderTask, tier: 'deep' }) } catch { /* 只留看板记录 */ }
@@ -5687,11 +7244,13 @@ class Meeting {
     if (eng === undefined) return
     const verdict = await this.verdict(eng)
     if (!verdict.stalled) return
+    await this.load(eng.id)
     const round = this.counts.get(eng.id) || 0
     const cap = this.options().maxRounds
     if (round >= cap) {
       if (round === cap) {
         this.counts.set(eng.id, round + 1)
+        await this.persist(eng.id)
         await this.board.post(eng.id, {
           author: { role: 'system', name: '会议主持' },
           kind: 'note',
@@ -5715,6 +7274,13 @@ class Meeting {
       busy: this.busy.has(eng.id),
     }
   }
+
+  forget(engagementId) {
+    this.lastAt.delete(engagementId)
+    this.counts.delete(engagementId)
+    this.busy.delete(engagementId)
+    this.loaded.delete(engagementId)
+  }
 }
 
 class Automation {
@@ -5729,12 +7295,24 @@ class Automation {
     this.lastFired = new Map()
     this.seen = new Set()
     this.queue = []
+    this.draining = null
+    this.drainAgain = false
   }
 
   config() {
     const raw = this.configStore.get().automation
     const merged = mergeDeep(cloneJson(DEFAULT_AUTOMATION), raw && typeof raw === 'object' ? raw : {})
-    merged.maxAgents = Number.isFinite(merged.maxAgents) ? merged.maxAgents : 3
+    merged.maxAgents = Number.isFinite(Number(merged.maxAgents))
+      ? Math.max(1, Math.min(50, Math.floor(Number(merged.maxAgents))))
+      : 8
+    merged.maxAutomationAgents = Number.isFinite(Number(merged.maxAutomationAgents))
+      ? Math.max(1, Math.min(50, Math.floor(Number(merged.maxAutomationAgents))))
+      : 3
+    const configuredMembers = Number.isFinite(Number(merged.maxMembers))
+      ? Math.max(1, Math.min(50, Math.floor(Number(merged.maxMembers))))
+      : 6
+    /* 控制台只暴露一个「最大并发数」；成员上限不能低于它，否则调大并发也不会生效 */
+    merged.maxMembers = Math.max(merged.maxAgents, configuredMembers)
     merged.rules = Array.isArray(merged.rules) ? merged.rules : []
     return merged
   }
@@ -5746,7 +7324,98 @@ class Automation {
     })
   }
 
-  /** 周期巡检规则（on=interval）：到点派一个分析员汇总现状。 */
+  /** 自动化自己的并发：只统计 origin=trigger 的成员；小组整体算一个。 */
+  activeAutomationCount(engagementId) {
+    const groups = new Set()
+    let ungrouped = 0
+    for (const member of this.squad.list(engagementId)) {
+      if (asText(member.origin) !== 'trigger') continue
+      if (member.status !== 'running' && member.status !== 'starting' && member.status !== 'waiting') continue
+      if (asText(member.groupId) !== '') groups.add(member.groupId)
+      else ungrouped += 1
+    }
+    return ungrouped + groups.size
+  }
+
+  /** 自动化队列：同一候选/规则只保留一个，避免事件风暴重复排队。 */
+  enqueue(job) {
+    const key = asText(job.dedupeKey) || `${job.engagementId}:${job.ruleId}:${job.task}`
+    if (this.queue.some((item) => item.dedupeKey === key)) return false
+    this.queue.push({ ...job, dedupeKey: key, queuedAt: nowMs() })
+    if (this.queue.length > 1000) this.queue.splice(0, this.queue.length - 1000)
+    this.hub.broadcast({ type: 'automation.queue', queued: this.queue.length })
+    void this.drain()
+    return true
+  }
+
+  /** 有空位就按入队顺序派发；超过 maxAutomationAgents 的任务留在队列里。 */
+  async drain() {
+    if (this.draining !== null) {
+      this.drainAgain = true
+      return this.draining
+    }
+    const run = Promise.resolve().then(async () => {
+      do {
+        this.drainAgain = false
+        const config = this.config()
+        if (!config.enabled) return
+        let progressed = true
+        while (progressed) {
+          progressed = false
+          let index = -1
+          for (let i = 0; i < this.queue.length; i += 1) {
+            if (this.activeAutomationCount(this.queue[i].engagementId) < config.maxAutomationAgents) {
+              index = i
+              break
+            }
+          }
+          if (index < 0) break
+          const [job] = this.queue.splice(index, 1)
+          this.hub.broadcast({ type: 'automation.queue', queued: this.queue.length })
+          try {
+            await this.squad.spawn({
+              engagementId: job.engagementId,
+              roleId: job.roleId,
+              tier: job.tier,
+              task: job.task,
+              origin: 'trigger',
+            })
+            this.lastFired.set(`${job.engagementId}:${job.ruleId}`, nowMs())
+            progressed = true
+          } catch (error) {
+            await this.board.post(job.engagementId, {
+              author: { role: 'system', name: '调度台' },
+              kind: 'note',
+              text: `自动化规则「${job.ruleId}」排队派发失败：${shortText(error && error.message ? error.message : error, 300)}`,
+            })
+          }
+        }
+      } while (this.drainAgain === true)
+    })
+    this.draining = run
+    try {
+      return await run
+    } finally {
+      if (this.draining === run) this.draining = null
+      if (this.drainAgain === true) {
+        this.drainAgain = false
+        void this.drain()
+      }
+    }
+  }
+
+  status(engagementId) {
+    const config = this.config()
+    return {
+      queued: engagementId === undefined
+        ? this.queue.length
+        : this.queue.filter((job) => job.engagementId === engagementId).length,
+      runningAutomation: engagementId === undefined ? 0 : this.activeAutomationCount(engagementId),
+      maxAutomationAgents: config.maxAutomationAgents,
+    }
+  }
+
+  /** 周期巡检规则（on=interval）：到点入队，由 drain 按自动化并发上限派发。 */
   async tick() {
     const config = this.config()
     if (!config.enabled) return
@@ -5760,19 +7429,26 @@ class Automation {
       const key = `${eng.id}:interval:${rule.id}`
       const last = this.lastFired.get(key) || 0
       if (now - last < every) continue
-      if (this.squad.activeCount(eng.id) >= config.maxAgents) continue
-      this.lastFired.set(key, now)
-      if (this.squad.memberCount(eng.id) >= (Number.isFinite(config.maxMembers) ? config.maxMembers : 6)) continue
-      try {
-        await this.squad.spawn({
-          engagementId: eng.id,
-          roleId: asText(rule.role, 'analyst'),
-          tier: asText(rule.tier, 'deep'),
-          task: this.render(rule.task || '做一次巡检：读图谱与看板，指出下一步 3 条高价值任务，写进看板。', {}),
-          origin: 'trigger',
-        })
-      } catch { /* 派发失败下一轮再试 */ }
+      const job = {
+        engagementId: eng.id,
+        ruleId: asText(rule.id, 'interval'),
+        roleId: asText(rule.role, 'scout'),
+        tier: asText(rule.tier),
+        task: this.render(rule.task || '做一次巡检：读图谱与看板，指出下一步 3 条高价值任务，写进看板。', {}),
+        dedupeKey: `${key}:${Math.floor(now / every)}`,
+      }
+      if (this.enqueue(job)) {
+        this.lastFired.set(key, now)
+        if (this.activeAutomationCount(eng.id) >= config.maxAutomationAgents) {
+          await this.board.post(eng.id, {
+            author: { role: 'system', name: '调度台' },
+            kind: 'note',
+            text: `自动化并发已达 ${config.maxAutomationAgents}，巡检规则「${rule.id}」已进入队列（当前队列 ${this.queue.length}）。`,
+          })
+        }
+      }
     }
+    await this.drain()
   }
 
   async onDelta(eng, delta) {
@@ -5833,35 +7509,29 @@ class Automation {
         const last = this.lastFired.get(`${eng.id}:${rule.id}`) || 0
         const cooldown = Number.isFinite(rule.cooldownMs) ? rule.cooldownMs : 30000
         if (now - last < cooldown) continue
-        if (this.squad.activeCount(eng.id) >= config.maxAgents) {
-          await this.board.post(eng.id, {
-            author: { role: 'system', name: '调度台' },
-            kind: 'note',
-            text: `规则「${rule.id}」命中 ${candidate.kind || candidate.ruleType} ${candidate.value}，但并发已满（${config.maxAgents}），本次跳过。`,
-          })
-          continue
-        }
         this.seen.add(dedupeKey)
         if (this.seen.size > 2000) this.seen = new Set(Array.from(this.seen).slice(-1000))
-        this.lastFired.set(`${eng.id}:${rule.id}`, now)
-        const task = this.render(rule.task, candidate)
-        try {
-          await this.squad.spawn({
-            engagementId: eng.id,
-            roleId: asText(rule.role, 'hunter'),
-            tier: asText(rule.tier),
-            task,
-            origin: 'trigger',
-          })
-        } catch (error) {
-          await this.board.post(eng.id, {
-            author: { role: 'system', name: '调度台' },
-            kind: 'note',
-            text: `规则「${rule.id}」派发失败：${shortText(error && error.message ? error.message : error, 300)}`,
-          })
+        const job = {
+          engagementId: eng.id,
+          ruleId: asText(rule.id, 'auto'),
+          roleId: asText(rule.role, 'hunter'),
+          tier: asText(rule.tier),
+          task: this.render(rule.task, candidate),
+          dedupeKey,
+        }
+        if (this.enqueue(job)) {
+          this.lastFired.set(`${eng.id}:${rule.id}`, now)
+          if (this.activeAutomationCount(eng.id) >= config.maxAutomationAgents) {
+            await this.board.post(eng.id, {
+              author: { role: 'system', name: '调度台' },
+              kind: 'note',
+              text: `规则「${rule.id}」命中 ${candidate.kind || candidate.ruleType} ${candidate.value}，自动化并发已达 ${config.maxAutomationAgents}，已进入队列（当前队列 ${this.queue.length}）。`,
+            })
+          }
         }
       }
     }
+    await this.drain()
   }
 }
 
@@ -5877,7 +7547,7 @@ function sendJson(res, status, value) {
   res.end(body)
 }
 
-async function readBody(req, limit = 4 * 1024 * 1024) {
+async function readBody(req, limit = 36 * 1024 * 1024) {
   const chunks = []
   let size = 0
   for await (const chunk of req) {
@@ -5896,11 +7566,16 @@ async function readBody(req, limit = 4 * 1024 * 1024) {
 }
 
 function sameOrigin(req) {
-  const remote = req.socket && req.socket.remoteAddress ? String(req.socket.remoteAddress) : ''
-  if (remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1') return true
   const host = typeof req.headers.host === 'string' ? req.headers.host : ''
   const origin = req.headers.origin
-  if (origin === undefined || origin === '' || origin === 'null') return true
+  /* 缺少 Origin 的命令行/同源图片请求允许通过；浏览器跨站请求会带
+     Sec-Fetch-Site: cross-site，必须拒绝。不能因为请求来自本机回环就放行
+     就放行，否则反向代理场景下所有外部请求都会被当成同源。 */
+  if (origin === undefined || origin === '') {
+    const site = typeof req.headers['sec-fetch-site'] === 'string' ? req.headers['sec-fetch-site'] : ''
+    return site === '' || site === 'same-origin' || site === 'none'
+  }
+  if (origin === 'null') return false
   try {
     return new URL(origin).host === host
   } catch {
@@ -5909,7 +7584,7 @@ function sameOrigin(req) {
 }
 
 function makeHandler(deps) {
-  const { store, cfg, configStore, hub, cockpit, mcp, board, tasks, trace, squad, browser, automation, meeting, runner, audit, ctx, browsers, brief } = deps
+  const { store, cfg, configStore, hub, cockpit, mcp, board, tasks, trace, squad, browser, automation, meeting, runner, audit, ctx, browsers, brief, customModels } = deps
 
   const pick = async (engagementArg) => {
     if (asText(engagementArg) !== '') {
@@ -5918,6 +7593,19 @@ function makeHandler(deps) {
       return eng
     }
     return store.activeEngagement()
+  }
+
+  /** 删除靶标前统一清理它的内存态和附属对象，避免后台 agent/定时器继续写入已删项目。 */
+  const forgetDerived = async (engagementId) => {
+    browsers.clear(engagementId)
+    board.forget?.(engagementId)
+    tasks.forget?.(engagementId)
+    trace.forget?.(engagementId)
+    runner.forget?.(engagementId)
+    meeting.forget?.(engagementId)
+    try { await squad.dropEngagement(engagementId) } catch { /* 已释放 */ }
+    try { await cockpit.forget?.(engagementId) } catch { /* 已释放 */ }
+    try { await brief.forget?.(engagementId) } catch { /* 已释放 */ }
   }
 
   return async (req, res) => {
@@ -5953,7 +7641,7 @@ function makeHandler(deps) {
             engagements: listed,
             engagement: null,
             chat: null,
-            config: { models: config.models, keys: configStore.keyPresence(), ui: config.ui, chat: config.chat, role: config.role },
+            config: { models: config.models, keys: configStore.keyPresence(), ui: config.ui, chat: config.chat, role: config.role, trace: config.trace },
           })
           return
         }
@@ -5974,18 +7662,27 @@ function makeHandler(deps) {
               .slice(-200),
           },
           /* 全量读出来算真实条数，再按显示上限切片：计数永远是真实值，不会在某个数上卡住 */
-          board: boardAll.slice(-boardOptions(configStore).limit).map((row) => ({
-            id: row.id, ts: row.ts, kind: row.kind, status: row.status,
-            author: row.author, text: row.text, refs: row.refs, shots: row.shots,
-          })),
+          /* agent 条目按上限切片；用户发言永不截断，和 agent 条目按时间合并回显。 */
+          board: (() => {
+            const limit = boardOptions(configStore).limit
+            const userRows = boardAll.filter((row) => board.isUserEntry(row))
+            const agentRows = boardAll.filter((row) => board.isUserEntry(row) === false).slice(-limit)
+            return [...userRows, ...agentRows]
+              .sort((a, b) => (Number(a.ts) || 0) - (Number(b.ts) || 0))
+              .map((row) => ({
+                id: row.id, ts: row.ts, kind: row.kind, status: row.status,
+                author: row.author, text: row.text, refs: row.refs, shots: row.shots,
+              }))
+          })(),
           boardLimit: boardOptions(configStore).limit,
+          traceLimit: traceLimitOf(configStore),
           boardTotal: boardAll.length,
           boardAgentCount: boardAll.filter((row) => board.isUserEntry(row) === false).length,
           boardUserCount: boardAll.filter((row) => board.isUserEntry(row)).length,
           squad: { running: squad.activeCount(eng.id), members: squad.list(eng.id) },
           browsers: browsers.list(eng.id),
           tasks: { stats: await tasks.stats(eng.id), items: await tasks.list(eng.id, 120) },
-          trace: await trace.list(eng.id, TRACE_LIMIT),
+          trace: await trace.list(eng.id, traceLimitOf(configStore)),
           delegation: await (async () => {
             const rows = await trace.list(eng.id, 2000)
             let own = 0
@@ -5999,16 +7696,17 @@ function makeHandler(deps) {
             const total = own + delegated
             return { own, delegated, total, rate: total === 0 ? 0 : Math.round((delegated / total) * 100) }
           })(),
-          roles: squad.roles().map((role) => ({
+          roles: [...squad.coreRoles(), ...squad.roles()].map((role) => ({
             id: role.id, name: role.name, tier: role.tier, reportsTo: role.reportsTo || null,
-            temporary: role.temporary === true, skills: Array.isArray(role.skills) ? role.skills : [],
-            model: role.model || null,
+            temporary: role.temporary === true, core: role.core === true || CORE_ROLES.has(role.id),
+            skills: Array.isArray(role.skills) ? role.skills : [],
           })),
           automation: (() => {
             const conf = automation.config()
-            return { enabled: conf.enabled, maxAgents: conf.maxAgents, rules: conf.rules.length }
+            const status = automation.status(eng.id)
+            return { enabled: conf.enabled, maxAgents: conf.maxAgents, maxAutomationAgents: conf.maxAutomationAgents, queued: status.queued, runningAutomation: status.runningAutomation, rules: conf.rules.length }
           })(),
-          config: { models: config.models, keys: configStore.keyPresence(), ui: config.ui, chat: config.chat, role: config.role },
+          config: { models: config.models, keys: configStore.keyPresence(), ui: config.ui, chat: config.chat, role: config.role, trace: config.trace },
           engagement: {
             id: eng.id,
             name: eng.name,
@@ -6121,10 +7819,8 @@ function makeHandler(deps) {
         if (id === '') throw new Error('缺少项目 id')
         const existed = await store.load(id)
         if (existed === undefined) { sendJson(res, 200, { ok: false, error: `项目不存在：${id}` }); return }
-        try { await squad.dropEngagement(id) } catch { /* 忽略 */ }
+        await forgetDerived(id)
         await store.remove(id)
-        try { cockpit.forget?.(id) } catch { /* 忽略 */ }
-        try { await brief.forget(id) } catch { /* 忽略 */ }
         const rest = await store.list()
         sendJson(res, 200, {
           ok: true,
@@ -6137,6 +7833,10 @@ function makeHandler(deps) {
 
       if (op === 'deleteAll') {
         if (body.confirm !== true) { sendJson(res, 200, { ok: false, error: '需要 confirm:true 才执行清空' }); return }
+        const before = await store.list()
+        for (const row of before) {
+          try { await forgetDerived(row.id) } catch { /* 单个清理失败不影响继续 */ }
+        }
         const result = await store.removeAll()
         sendJson(res, 200, { ok: true, ...result, engagements: [] })
         return
@@ -6245,9 +7945,7 @@ function makeHandler(deps) {
         if (id === '') throw new Error('缺少 engagement')
         const eng = await store.load(id)
         if (eng === undefined) throw new Error(`靶标不存在：${id}`)
-        await cockpit.dropEngagement(id)
-        try { await brief.forget(id) } catch { /* 忽略 */ }
-        try { await squad.dropEngagement(id) } catch { /* 忽略 */ }
+        await forgetDerived(id)
         await store.remove(id)
         sendJson(res, 200, { ok: true, removed: id })
         return
@@ -6256,9 +7954,11 @@ function makeHandler(deps) {
       /* ── 配置中心 ── */
 
       if (op === 'config.get') {
+        const config = configStore.redacted()
+        config.models = { ...(config.models || {}), custom: await customModels.list() }
         sendJson(res, 200, {
           ok: true,
-          config: configStore.redacted(),
+          config,
           keys: configStore.keyPresence(),
           mcp: mcp.last,
         })
@@ -6273,10 +7973,17 @@ function makeHandler(deps) {
           const wanted = [25, 50, 100].includes(Number(patch.board.mergeCount)) ? Number(patch.board.mergeCount) : 50
           patch.board = { limit, mergeCount: Math.min(wanted, Math.max(10, Math.floor(limit / 2))) }
         }
+        if (patch.models !== undefined && patch.models !== null && typeof patch.models === 'object' && Array.isArray(patch.models.custom)) {
+          const prepared = await customModels.prepare(patch.models.custom)
+          await customModels.apply(prepared.next, prepared.removed, prepared.keyUpdates)
+          patch.models = { ...patch.models, custom: prepared.next }
+        }
         const next = await configStore.patch(patch)
         const mcpState = mcp.sync(next)
         hub.broadcast({ type: 'config', keys: configStore.keyPresence(), models: next.models })
-        sendJson(res, 200, { ok: true, config: configStore.redacted(), keys: configStore.keyPresence(), mcp: mcpState })
+        const config = configStore.redacted()
+        config.models = { ...(config.models || {}), custom: await customModels.list() }
+        sendJson(res, 200, { ok: true, config, keys: configStore.keyPresence(), mcp: mcpState })
         return
       }
 
@@ -6295,6 +8002,14 @@ function makeHandler(deps) {
           } catch {
             models[provider.id] = []
           }
+        }
+        for (const row of customModels.current()) {
+          const provider = asText(row.provider)
+          if (provider === '') continue
+          if (!providers.some((item) => item.id === provider)) {
+            providers.push({ id: provider, name: asText(row.name, provider), custom: true })
+          }
+          models[provider] = [{ id: asText(row.model), name: asText(row.name, asText(row.model)), modalities: ['text'] }]
         }
         let configurable = []
         try { configurable = await llm.listConfigurableProviders() } catch { configurable = [] }
@@ -6326,13 +8041,18 @@ function makeHandler(deps) {
       if (op === 'squad.mcp') {
         const eng = await pick(engagementArg)
         if (eng === undefined) { sendJson(res, 200, { ok: false, error: '还没有靶标' }); return }
-        const key = asText(body.member)
-        const member = squad.members.get(key)
+        let member = squad.members.get(asText(body.member))
+        let key = asText(body.member)
+        if (member === undefined) {
+          try { member = squad.resolveMemberRef(key, eng.id) } catch { member = undefined }
+        }
         if (member === undefined) { sendJson(res, 200, { ok: false, error: `成员不存在：${key}` }); return }
+        key = member.key
         squad.uninstallMemberMcp(key)
         member.mcp = asMcpList(body.mcp)
         const state = squad.installMemberMcp(member)
         member.mcpError = state.error === undefined ? '' : state.error
+        squad.refreshToolRestrictions()
         try { squad.promptCache.set(key, await squad.memberPrompt(eng.id, squad.roleOf(member.role), member)) } catch { /* 提示词重建失败 */ }
         const view = squad.view(member)
         hub.broadcast({ type: 'squad.status', engagementId: eng.id, member: view })
@@ -6343,7 +8063,10 @@ function makeHandler(deps) {
         const manager = ctx.get('mcpManager')
         let servers = []
         if (manager !== undefined && manager !== null) {
-          try { servers = manager.list() } catch { servers = [] }
+          try {
+            const listed = manager.list()
+            servers = Array.isArray(listed) ? listed.map((row) => redactMcpSecrets(row)) : listed
+          } catch { servers = [] }
         }
         sendJson(res, 200, { ok: true, available: manager !== undefined && manager !== null, servers, bindings: mcp.last })
         return
@@ -6415,6 +8138,13 @@ function makeHandler(deps) {
           sessionId: state === undefined ? null : state.sessionId,
           busy: state === undefined ? false : state.busy,
         })
+        return
+      }
+
+      if (op === 'brief.history') {
+        const eng = await pick(engagementArg)
+        if (eng === undefined) { sendJson(res, 200, { ok: true, messages: [] }); return }
+        sendJson(res, 200, { ok: true, messages: await brief.readHistory(eng.id) })
         return
       }
 
@@ -6519,6 +8249,7 @@ function makeHandler(deps) {
           running: squad.activeCount(eng.id),
           members: squad.list(eng.id),
           roles: squad.roles().map((role) => ({ id: role.id, name: role.name, tier: role.tier })),
+          core: squad.coreRoles().map((role) => ({ id: role.id, name: role.name, tier: role.tier })),
         })
         return
       }
@@ -6542,21 +8273,28 @@ function makeHandler(deps) {
       }
 
       if (op === 'squad.task') {
-        const member = await squad.task(asText(body.member), asText(body.task))
+        const eng = await pick(engagementArg)
+        if (eng === undefined) throw new Error('还没有靶标')
+        const member = await squad.task(asText(body.member), asText(body.task), eng.id)
         sendJson(res, 200, { ok: true, member })
         return
       }
 
       if (op === 'squad.stop') {
-        sendJson(res, 200, await squad.stop(asText(body.member)))
+        const eng = await pick(engagementArg)
+        if (eng === undefined) throw new Error('还没有靶标')
+        sendJson(res, 200, await squad.stop(asText(body.member), eng.id))
         return
       }
 
       if (op === 'squad.remove') {
+        const eng = await pick(engagementArg)
+        if (eng === undefined) throw new Error('还没有靶标')
         /* 释放前先做离职交接（body.handover === false 可跳过，用于强制清理） */
         sendJson(res, 200, await squad.remove(asText(body.member), {
           reason: asText(body.reason, '回收'),
           handover: body.handover !== false,
+          engagementId: eng.id,
         }))
         return
       }
@@ -6564,14 +8302,16 @@ function makeHandler(deps) {
       /* ── 自动化规则 ── */
 
       if (op === 'automation.get') {
-        sendJson(res, 200, { ok: true, config: automation.config(), roles: squad.roles() })
+        const eng = await pick(engagementArg)
+        sendJson(res, 200, { ok: true, config: automation.config(), roles: squad.roles(), status: automation.status(eng === undefined ? undefined : eng.id) })
         return
       }
 
       if (op === 'automation.set') {
         const patch = body.patch && typeof body.patch === 'object' ? body.patch : {}
         const next = await configStore.patch({ automation: patch })
-        sendJson(res, 200, { ok: true, config: automation.config() })
+        const eng = await pick(engagementArg)
+        sendJson(res, 200, { ok: true, config: automation.config(), status: automation.status(eng === undefined ? undefined : eng.id) })
         return
       }
 
@@ -6587,7 +8327,7 @@ function makeHandler(deps) {
         const safeName = asText(body.name, 'upload.bin').replace(/[^\w.\-\u4e00-\u9fa5]+/g, '_').slice(0, 120)
         const dir = await ensureDir(join(cfg.root, 'uploads', eng.id))
         const path = join(dir, `${Date.now().toString(36)}-${safeName}`)
-        await writeFile(path, data)
+        await writeFile(path, data, { mode: 0o600 })
         sendJson(res, 200, {
           ok: true,
           file: { name: safeName, bytes: data.length, path, url: `/recon/asset?p=${encodeURIComponent(path)}` },
@@ -6602,7 +8342,7 @@ function makeHandler(deps) {
         if (record === undefined) throw new Error(`命令不存在：${body.commandId}`)
         const workRoot = await ensureDir(join(store.workDir, eng.id))
         const keyEnv = configStore.keyEnv()
-        const cmdId = `r${Date.now().toString(36)}`
+        const cmdId = `r${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
         const outcome = await runShell(record.command, {
           cwd: asText(record.cwd) || workRoot,
           timeoutMs: cfg.defaultTimeoutMs,
@@ -6696,7 +8436,7 @@ function makeHandler(deps) {
       if (op === 'trace.list') {
         const eng = await pick(engagementArg)
         if (eng === undefined) { sendJson(res, 200, { ok: true, events: [] }); return }
-        const limit = Number.isFinite(Number(body.limit)) ? Math.max(20, Math.min(2000, Number(body.limit))) : TRACE_LIMIT
+        const limit = Number.isFinite(Number(body.limit)) ? Math.max(20, Math.min(5000, Number(body.limit))) : traceLimitOf(configStore)
         sendJson(res, 200, { ok: true, events: await trace.list(eng.id, limit) })
         return
       }
@@ -6711,15 +8451,26 @@ function makeHandler(deps) {
       if (op === 'task.create') {
         const eng = await pick(engagementArg)
         if (eng === undefined) throw new Error('还没有靶标')
+        const mission = await tasks.missionOf(eng.id)
+        if (mission === null || mission.status !== 'running') {
+          sendJson(res, 200, {
+            ok: false,
+            error: '还没有进行中的作战目标，不能拆任务',
+            hint: '先让参谋出整体方案并写看板，再由总指挥登记目标。',
+          })
+          return
+        }
         const task = await tasks.create(eng.id, {
           title: asText(body.title, 'UI 任务'),
           goal: asText(body.goal),
           acceptance: asText(body.acceptance),
-          role: asText(body.role, 'web'),
+          role: canonicalRoleId(squad, body.role),
           assignee: (() => {
             const ref = asText(body.assignee)
             if (ref === '') return ''
-            try { return squad.resolveMemberRef(ref)?.name || '' } catch { return '' }
+            const hit = squad.resolveMemberRef(ref, eng.id)
+            if (hit === undefined) throw new Error(`指定成员不存在：${ref}`)
+            return hit.name
           })(),
           createdBy: { role: 'user', name: '你' },
         })
@@ -6741,7 +8492,7 @@ function makeHandler(deps) {
           const hit = squad.resolveMemberRef(ref)
           who = hit === undefined ? '' : hit.name
         }
-        const task = await tasks.update(eng.id, asText(body.id), { assignee: who, status: 'doing' })
+        const task = await tasks.update(eng.id, asText(body.id), { assignee: who, status: 'doing' }, { role: 'user', name: '你' })
         sendJson(res, 200, { ok: true, task: { id: task.id, assignee: task.assignee, status: task.status } })
         return
       }
@@ -6770,7 +8521,10 @@ function makeHandler(deps) {
       if (op === 'meeting.status') {
         const eng = await pick(engagementArg)
         if (eng === undefined) sendJson(res, 200, { ok: true, meeting: null, verdict: { stalled: false, reasons: [] } })
-        else sendJson(res, 200, { ok: true, meeting: meeting.status(eng), verdict: await meeting.verdict(eng) })
+        else {
+          await meeting.load(eng.id)
+          sendJson(res, 200, { ok: true, meeting: meeting.status(eng), verdict: await meeting.verdict(eng) })
+        }
         return
       }
 
@@ -6806,10 +8560,21 @@ function makeHandler(deps) {
       if (op === 'mission.set') {
         const eng = await pick(engagementArg)
         if (eng === undefined) throw new Error('还没有靶标')
+        const prev = await tasks.missionOf(eng.id)
+        const plan = await latestStaffPlan(board, eng.id, prev === null ? 0 : prev.updatedAt)
+        if (plan === undefined) {
+          sendJson(res, 200, {
+            ok: false,
+            error: '还没有本轮参谋方案，不能登记作战目标',
+            hint: '先让参谋把整体方案写进看板（kind=hypothesis），总指挥读方案后再拆任务。',
+          })
+          return
+        }
         const mission = await tasks.setMission(eng.id, {
           goal: asText(body.goal),
           done: asText(body.done),
           status: 'running',
+          rounds: (prev === null ? 0 : Number(prev.rounds) || 0) + 1,
         })
         sendJson(res, 200, { ok: true, mission })
         return
@@ -6820,8 +8585,15 @@ function makeHandler(deps) {
         if (eng === undefined) throw new Error('还没有靶标')
         const rows = await tasks.list(eng.id, 400)
         const pending = rows.filter((r) => r.status !== 'passed')
-        if (pending.length > 0 && body.force !== true) {
-          sendJson(res, 200, { ok: false, error: `还有 ${pending.length} 条任务未通过验收`, pending: pending.slice(-8).map((r) => `${r.id} ${r.title}`) })
+        const unverified = rows.filter((r) => r.status === 'passed'
+          && (!r.verifiedBy || r.verifiedBy.role !== 'qa'))
+        if ((pending.length > 0 || unverified.length > 0) && body.force !== true) {
+          sendJson(res, 200, {
+            ok: false,
+            error: pending.length > 0 ? `还有 ${pending.length} 条任务未通过验收` : `还有 ${unverified.length} 条任务没有 QA 验收记录`,
+            pending: (pending.length > 0 ? pending : unverified).slice(-8).map((r) => `${r.id} ${r.title}`),
+            hint: '先让 QA 对每条任务执行 accept/reject；全部通过后再由总指挥 close。',
+          })
           return
         }
         const prev = await tasks.missionOf(eng.id)
@@ -6830,13 +8602,15 @@ function makeHandler(deps) {
           done: prev === null ? '' : asText(prev.done),
           status: 'done',
         })
+        cockpit.pendingNudges?.delete?.(eng.id)
+        const stopped = await squad.stopAll(eng.id)
         await board.post(eng.id, {
-          author: { role: 'system', name: '操作台' },
+          author: { role: 'commander', name: '总指挥' },
           kind: 'conclusion',
-          text: `【任务完成】${mission.goal !== '' ? mission.goal : '本轮作战目标'} 已全部通过验收，收队。`,
+          text: `【任务完成】${mission.goal !== '' ? mission.goal : '本轮作战目标'} 已由 QA 全部验收通过（${rows.filter((r) => r.status === 'passed').length} 条任务），总指挥宣布结束，收队。`,
         })
         const reclaimed = await squad.reclaimIdle(eng.id)
-        sendJson(res, 200, { ok: true, mission, reclaimed })
+        sendJson(res, 200, { ok: true, mission, stopped, reclaimed })
         return
       }
 
@@ -6845,7 +8619,10 @@ function makeHandler(deps) {
         if (eng === undefined) throw new Error('还没有靶标')
         const id = asText(body.id)
         const note = asText(body.note)
-        const task = await tasks.update(eng.id, id, { status: op === 'task.accept' ? 'passed' : 'failed', note })
+        const task = await tasks.update(eng.id, id, {
+          status: op === 'task.accept' ? 'passed' : 'failed', note,
+          verifiedBy: { role: 'qa', name: '验收' }, verifiedAt: nowMs(),
+        }, { role: 'qa', name: '验收' })
         if (op === 'task.reject') {
           const followUp = await tasks.rework(eng.id, task, note || '未达到验收标准', { role: 'qa', name: '验收' })
           await board.post(eng.id, {
@@ -6857,12 +8634,13 @@ function makeHandler(deps) {
           const staffMember = squad.list(eng.id).find((m) => m.role === 'staff' && m.status !== 'running')
           const ask = `验收驳回 ${id}（${note || '未达到验收标准'}）。请给出 3 条改进方案（怎么做 / 派给谁 / 验收标准），写进看板 kind=hypothesis。`
           if (staffMember !== undefined) {
-            await squad.task(staffMember.key, ask)
+            await squad.task(staffMember.name, ask, eng.id)
             staffCall = { member: staffMember.key, name: staffMember.name, mode: 'task' }
           } else {
             const invited = await squad.spawn({
-              engagementId: eng.id, roleId: 'staff', tier: 'deep', name: '参谋（返工）',
-              prompt: '你只出方案不执行；针对验收缺口给可执行、可验收的改进方案。', task: ask, origin: 'rework',
+              engagementId: eng.id, roleId: 'staff', name: '参谋（返工）',
+              promptExtra: '你只出方案不执行；针对验收缺口给可执行、可验收的改进方案。', task: ask, origin: 'rework',
+              allowCore: true,
             })
             staffCall = { member: invited.key, name: invited.name, mode: 'spawn' }
           }
@@ -6885,10 +8663,21 @@ function makeHandler(deps) {
         const rows = await tasks.list(eng.id, 400)
         const pending = rows.filter((r) => r.status !== 'passed' && r.status !== 'failed')
         const failed = rows.filter((r) => r.status === 'failed')
+        const unverified = rows.filter((r) => r.status === 'passed'
+          && (!r.verifiedBy || r.verifiedBy.role !== 'qa'))
         if (pending.length === 0 && failed.length === 0) {
           const mission = await tasks.missionOf(eng.id)
           if (mission === null || mission.status !== 'done') {
-            settle = await cockpit.nudge(eng.id, '所有任务已通过验收：请宣布任务完成并决定收队还是继续')
+            await board.post(eng.id, {
+              author: { role: 'qa', name: '验收' },
+              kind: 'conclusion',
+              text: unverified.length === 0
+                ? `【QA 终验报告】${eng.name} 共 ${rows.length} 条任务全部通过 QA 核查，交总指挥做最终收尾决定。`
+                : `【QA 终验报告】仍有 ${unverified.length} 条已通过任务缺少 QA 验收记录，暂不能收尾。`,
+            })
+            settle = unverified.length === 0
+              ? await cockpit.nudge(eng.id, 'QA 已对全部任务完成最终验收，请立即复核并宣布作战结束', { force: true, final: true, always: true })
+              : await cockpit.nudge(eng.id, `仍有 ${unverified.length} 条已通过任务缺少 QA 验收记录，请安排 QA 重新核查`, { force: true, always: true })
           }
         }
         sendJson(res, 200, { ok: true, settle })
@@ -6918,13 +8707,20 @@ function makeHandler(deps) {
       }
 
       if (op === 'roles.get') {
+        const coreView = (role) => ({
+          id: role.id, name: role.name, tier: role.tier, reportsTo: role.reportsTo || null,
+          prompt: role.prompt || '', skills: Array.isArray(role.skills) ? role.skills : [],
+          mcp: asMcpList(role.mcp), core: true,
+        })
         sendJson(res, 200, {
           ok: true,
           roles: squad.roles().map((role) => ({
             id: role.id, name: role.name, tier: role.tier, reportsTo: role.reportsTo || null,
             prompt: role.prompt || '', skills: Array.isArray(role.skills) ? role.skills : [],
-            model: role.model || null, temporary: role.temporary === true,
+            mcp: asMcpList(role.mcp),
+            temporary: role.temporary === true,
           })),
+          core: squad.coreRoles().map(coreView),
         })
         return
       }
@@ -6933,22 +8729,50 @@ function makeHandler(deps) {
         const rows = Array.isArray(body.roles) ? body.roles : null
         if (rows === null) throw new Error('roles 需要数组')
         const cleaned = rows
-          .filter((row) => row !== null && typeof row === 'object' && asText(row.id) !== '')
+          .filter((row) => row !== null && typeof row === 'object' && asText(row.id) !== '' && !CORE_ROLES.has(asText(row.id)))
           .map((row) => ({
             id: asText(row.id),
             name: asText(row.name, asText(row.id)),
-            tier: MODEL_TIERS.includes(asText(row.tier)) ? asText(row.tier) : 'deep',
+            tier: MODEL_CHOICES.includes(asText(row.tier)) ? asText(row.tier) : 'dsh',
             reportsTo: asText(row.reportsTo) === '' ? null : asText(row.reportsTo),
             prompt: asText(row.prompt),
             skills: asList(row.skills),
-            model: row.model !== null && typeof row.model === 'object' && asText(row.model.provider) !== '' && asText(row.model.model) !== ''
-              ? { provider: asText(row.model.provider), model: asText(row.model.model), reasoning: asText(row.model.reasoning) }
-              : null,
+            /* 角色级专属 MCP 也要保留：控制台里填了却在保存时丢掉，等于这个功能一直没生效 */
+            mcp: asMcpList(row.mcp),
             temporary: row.temporary === true,
           }))
-        if (cleaned.length === 0) throw new Error('至少保留一个角色')
-        await configStore.patch({ roles: { squad: cleaned } })
-        sendJson(res, 200, { ok: true, roles: cleaned })
+        if (cleaned.length === 0) throw new Error('至少保留一个队员角色（总指挥/参谋在「常设席位」里配置）')
+        const roleIds = new Set()
+        for (const role of cleaned) {
+          if (roleIds.has(role.id)) throw new Error(`角色 id 重复：${role.id}`)
+          roleIds.add(role.id)
+        }
+        const patch = { roles: { squad: cleaned } }
+        if (Array.isArray(body.core)) {
+          const core = {}
+          for (const id of CORE_ROLE_IDS) {
+            const row = body.core.find((item) => item !== null && typeof item === 'object' && asText(item.id) === id)
+            if (row === undefined) continue
+            core[id] = {
+              id,
+              name: asText(row.name, id === 'commander' ? '总指挥' : '参谋'),
+              tier: MODEL_CHOICES.includes(asText(row.tier)) ? asText(row.tier) : 'dsh',
+              reportsTo: id === 'commander' ? null : 'commander',
+              prompt: asText(row.prompt),
+              skills: asList(row.skills),
+              mcp: asMcpList(row.mcp),
+              core: true,
+            }
+          }
+          if (Object.keys(core).length > 0) patch.core = core
+        }
+        await configStore.patch(patch)
+        const coreView = squad.coreRoles().map((role) => ({
+          id: role.id, name: role.name, tier: role.tier, reportsTo: role.reportsTo || null,
+          prompt: role.prompt || '', skills: Array.isArray(role.skills) ? role.skills : [],
+          mcp: asMcpList(role.mcp), core: true,
+        }))
+        sendJson(res, 200, { ok: true, roles: cleaned, core: coreView })
         return
       }
 
@@ -6960,7 +8784,9 @@ function makeHandler(deps) {
       }
 
       if (op === 'squad.prune') {
-        const removed = await squad.pruneIdle(Number.isFinite(body.ttlMs) ? body.ttlMs : 900000)
+        const eng = await pick(engagementArg)
+        if (eng === undefined) throw new Error('还没有靶标')
+        const removed = await squad.pruneIdle(Number.isFinite(body.ttlMs) ? body.ttlMs : 900000, eng.id)
         sendJson(res, 200, { ok: true, removed })
         return
       }
@@ -6975,7 +8801,7 @@ function makeHandler(deps) {
 /* ────────────────────────── 协作工具（看板 / 编队 / 浏览器 / 卸载节点） ────────────────────────── */
 
 function registerCollabTools(ctx, deps) {
-  const { store, cfg, configStore, hub, board, squad, browser, automation, tasks, cockpit, bindings, browsers, meeting, runner, audit } = deps
+  const { store, cfg, configStore, hub, board, squad, browser, automation, tasks, cockpit, bindings, browsers, meeting, runner, audit, trace } = deps
 
   const resolveEngagement = async (exec, explicit) => {
     if (asText(explicit) !== '') {
@@ -7040,12 +8866,14 @@ function registerCollabTools(ctx, deps) {
         const eng = await resolveEngagement(exec, args.engagement)
         const caller = callerOf(exec)
         if (asText(args.action, 'post') === 'list') {
-          const rows = await board.list(eng.id, Number.isFinite(args.limit) ? args.limit : 40)
+          /* 默认返回当前看板的全部条目；agent 必须能看到完整文字，不能只给最近 40 条摘要。 */
+          const asked = Number.isFinite(args.limit) ? Math.max(1, Math.min(10000, Math.floor(args.limit))) : 0
+          const rows = asked > 0 ? await board.list(eng.id, asked) : await board.list(eng.id, 1000000)
           return json({
             ok: true,
             entries: rows.map((row) => ({
               id: row.id, kind: row.kind, status: row.status,
-              author: row.author, text: shortText(row.text, 500), refs: row.refs, shots: row.shots,
+              author: row.author, text: asText(row.text), refs: row.refs, shots: row.shots,
             })),
           })
         }
@@ -7070,6 +8898,13 @@ function registerCollabTools(ctx, deps) {
           text: asText(args.text),
           refs,
           shots: asList(args.shots),
+        })
+        void trace?.push?.(eng.id, {
+          kind: 'chat',
+          actor: caller,
+          title: `看板 +1（${entry.kind}）｜${shortText(entry.text, 90)}`,
+          detail: entry.text,
+          refs: entry.refs || {},
         })
         return json({ ok: true, id: entry.id, kind: entry.kind, author: caller.name })
       } catch (error) {
@@ -7104,6 +8939,8 @@ function registerCollabTools(ctx, deps) {
           if (node === undefined) throw new Error(`节点不存在：${args.node}。候选：${candidateHint(draft, args.node).join(' ; ')}`)
           if (mode === 'restore') {
             node.archived = false
+            delete node.archivedAt
+            delete node.archiveReason
             return { node, removed: 0, archived: false }
           }
           if (mode === 'delete') {
@@ -7111,6 +8948,7 @@ function registerCollabTools(ctx, deps) {
             draft.nodes = draft.nodes.filter((n) => n.id !== node.id)
             draft.edges = draft.edges.filter((e) => e.from !== node.id && e.to !== node.id)
             draft.vulns = draft.vulns.filter((v) => v.nodeId !== node.id)
+            draft.commands = draft.commands.map((c) => ({ ...c, nodeIds: (c.nodeIds || []).filter((n) => n !== node.id) }))
             return { node, removed: before - draft.nodes.length, archived: false }
           }
           node.archived = true
@@ -7126,6 +8964,14 @@ function registerCollabTools(ctx, deps) {
             + (asText(args.reason) !== '' ? `；原因：${asText(args.reason)}` : ''),
           refs: { nodeIds: [result.node.id], nodeValue: result.node.value },
         })
+        void trace?.push?.(eng.id, {
+          kind: 'graph',
+          actor: caller,
+          title: `${mode === 'delete' ? '删除' : (mode === 'restore' ? '恢复' : '归档')}节点 ${result.node.kind}:${result.node.value}`,
+          detail: asText(args.reason),
+          refs: { nodeIds: [result.node.id] },
+          meta: { op: mode },
+        })
         return json({ ok: true, mode, node: { id: result.node.id, value: result.node.value }, removed: result.removed })
       } catch (error) {
         return fail(error)
@@ -7136,13 +8982,14 @@ function registerCollabTools(ctx, deps) {
   ctx.tools.register({
     name: 'recon_squad',
     description:
-      '多智能体编队：派一个独立 Agent 并行干活（不等当前任务结束），或给已有成员追加任务、看队伍、停成员。'
+      '多智能体编队：派独立 Agent 并行干活，或给已有成员追加任务、看队伍、停成员；'
+      + 'action=group 可把专业角色加入某个成员的小组（指定模型档位/skills/MCP），小组整体只算一个并发。'
       + '每个成员有自己的角色与视野（图谱/命令/漏洞/看板共享）。只有指挥席能派发（成员不能递归派发）。',
     parameters: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['spawn', 'task', 'list', 'stop', 'remove'], description: '默认 list' },
-        role: { type: 'string', description: '角色 id：commander / staff / scout / web / reverser / intranet / qa，或配置里的自定义/临时角色；也可先用 asRole+roleName+rolePrompt 临时开一个新角色' },
+        action: { type: 'string', enum: ['spawn', 'group', 'task', 'list', 'stop', 'remove'], description: '默认 list；group 用于把专业角色加入现有成员的小组' },
+        role: { type: 'string', description: '队员角色 id：scout / web / reverser / intranet / qa，或配置里的自定义/临时角色。总指挥/参谋是常设席位，不能 spawn；要给他们派活用 action=task' },
         asRole: { type: 'string', description: '（可选）临时新角色 id，例如 developer / reporter / fuzzer；不存在时自动创建' },
         roleName: { type: 'string', description: '（可选）临时角色的显示名，例如「工具开发」「报告员」' },
         rolePrompt: { type: 'string', description: '（可选）临时角色的职责说明（会写进它的系统提示）' },
@@ -7154,7 +9001,7 @@ function registerCollabTools(ctx, deps) {
           description: '（可选）这名队员的专属 MCP 服务：每项 { name, transport, command, args, env, url }。只对该队员生效，别人调不到。',
           items: { type: 'object' },
         },
-        tier: { type: 'string', enum: MODEL_TIERS, description: '模型档位，默认取角色默认' },
+        tier: { type: 'string', enum: [...MODEL_TIERS, 'dsh'], description: '模型档位：deep / fast / vision / dsh（跟随 DSH），默认取角色默认' },
         task: { type: 'string', description: '任务描述（spawn/task 必填）' },
         member: { type: 'string', description: '成员名字，例如「Web 手#6」（task/stop/remove 用，也接受 #6 这种序号）' },
         engagement: { type: 'string', description: '靶标 id 或名称' },
@@ -7167,65 +9014,16 @@ function registerCollabTools(ctx, deps) {
         const eng = await resolveEngagement(exec, args.engagement)
         const caller = callerOf(exec)
         const action = asText(args.action, 'list')
-        if (action === 'mission') {
-          const sub = asText(args.missionAction, 'get')
-          if (sub === 'get') {
-            const mission = await tasks.missionOf(eng.id)
-            const rows = await tasks.list(eng.id, 400)
-            const passed = rows.filter((row) => row.status === 'passed').length
-            const open = rows.filter((row) => row.status !== 'passed' && row.status !== 'failed').length
-            const failed = rows.filter((row) => row.status === 'failed').length
-            return json({ ok: true, mission, progress: { total: rows.length, passed, open, failed } })
-          }
-          if (sub === 'set') {
-            if (asText(args.goal) === '') throw new Error('set 需要 goal（本轮作战目标）')
-            const prev = await tasks.missionOf(eng.id)
-            const mission = await tasks.setMission(eng.id, {
-              goal: asText(args.goal),
-              done: asText(args.acceptance, args.done),
-              status: 'running',
-            })
-            await tasks.setMission(eng.id, { goal: mission.goal, done: mission.done, status: 'running', rounds: (prev === null ? 0 : Number(prev.rounds) || 0) + 1 })
-            await board.post(eng.id, {
-              author: caller, kind: 'task',
-              text: `本轮作战目标：${asText(args.goal)}${asText(args.acceptance) !== '' ? `\n完成判据：${asText(args.acceptance)}` : ''}`,
-            })
-            return json({ ok: true, mission: await tasks.missionOf(eng.id) })
-          }
-          if (sub === 'close') {
-            const rows = await tasks.list(eng.id, 400)
-            const notPassed = rows.filter((row) => row.status !== 'passed')
-            const force = args.status === 'passed' || asText(args.note) === 'force'
-            if (notPassed.length > 0 && !force) {
-              return json({
-                ok: false,
-                error: `还有 ${notPassed.length} 条任务没通过验收，不能宣布完成`,
-                pending: notPassed.slice(-8).map((row) => `${row.id} [${row.status}] ${row.title}`),
-                hint: '让验收继续判定，或确认这些任务可以放弃后再 close',
-              })
-            }
-            const mission = await tasks.setMission(eng.id, {
-              goal: (await tasks.missionOf(eng.id) || {}).goal || '',
-              done: (await tasks.missionOf(eng.id) || {}).done || '',
-              status: 'done',
-            })
-            await board.post(eng.id, {
-              author: caller, kind: 'conclusion',
-              text: `【任务完成】${mission.goal !== '' ? mission.goal : '本轮作战目标'} 已通过验收（${rows.filter((r) => r.status === 'passed').length} 条任务），收队。`,
-            })
-            const reclaimed = await squad.reclaimIdle(eng.id)
-            return json({ ok: true, mission, reclaimed })
-          }
-          throw new Error(`未知 missionAction：${sub}`)
-        }
 
         if (action === 'list') {
+          try { await squad.ensureCore(eng.id) } catch { /* 核心席位补位失败不阻断列表 */ }
           return json({
             ok: true,
             caller: caller.name,
             running: squad.activeCount(eng.id),
             members: squad.list(eng.id),
-            roles: squad.roles().map((role) => ({ id: role.id, name: role.name, tier: role.tier })),
+            roles: squad.roles().map((role) => ({ id: role.id, name: role.name, tier: role.tier, skills: asList(role.skills), mcp: asMcpList(role.mcp) })),
+            core: squad.coreRoles().map((role) => ({ id: role.id, name: role.name, tier: role.tier, skills: asList(role.skills), mcp: asMcpList(role.mcp) })),
           })
         }
         if (action === 'spawn') {
@@ -7234,6 +9032,11 @@ function registerCollabTools(ctx, deps) {
           }
           if (asText(args.task) === '') throw new Error('spawn 需要 task')
           let roleId = asText(args.role, 'web')
+          const coreWanted = squad.coreRoleIdOf(roleId)
+          if (coreWanted !== '') {
+            const core = squad.coreRoles().find((role) => role.id === coreWanted)
+            throw new Error(`${core !== undefined ? core.name : coreWanted} 是常设席位（每靶标各一个、自动在岗），不能 spawn；请用 recon_squad task 给席位派活`)
+          }
           /* 临时角色：不存在就现开一个（名字+职责由总指挥指定） */
           const asRole = asText(args.asRole).trim()
           if (asRole !== '') {
@@ -7258,20 +9061,154 @@ function registerCollabTools(ctx, deps) {
           })
           return json({ ok: true, member })
         }
+        if (action === 'group') {
+          if (caller.kind === 'member') throw new Error('只有指挥席可以建立/扩展小组；成员请先 recon_group request')
+          const lead = asText(args.member)
+          if (lead === '') throw new Error('group 需要 member（组长名字）')
+          let roleId = asText(args.role, '')
+          if (roleId === '') throw new Error('group 需要 role（要加入的专业角色）')
+          const asRole = asText(args.asRole).trim()
+          if (asRole !== '') {
+            await squad.ensureRole({ roleId: asRole, roleName: args.roleName, rolePrompt: args.rolePrompt, skills: asList(args.skills) })
+            roleId = asRole
+          }
+          const group = await squad.createGroup({
+            engagementId: eng.id,
+            leadKey: lead,
+            roleId,
+            name: asText(args.name),
+            tier: asText(args.tier),
+            task: asText(args.task),
+            promptExtra: asText(args.prompt),
+            skills: asList(args.skills),
+            mcp: asMcpList(args.mcp),
+          })
+          return json({ ok: true, group })
+        }
         if (action === 'task') {
-          const member = await squad.task(asText(args.member), asText(args.task))
+          if (caller.kind === 'member') throw new Error('你是编队成员，不能给其他成员派活；请写看板由指挥席派发')
+          try { await squad.ensureCore(eng.id) } catch { /* 目标若为普通成员则不需要核心席位 */ }
+          const member = await squad.task(asText(args.member), asText(args.task), eng.id)
           return json({ ok: true, member })
         }
         if (action === 'stop') {
-          return json(await squad.stop(asText(args.member)))
+          if (caller.kind === 'member') throw new Error('你是编队成员，不能叫停其他成员')
+          return json(await squad.stop(asText(args.member), eng.id))
         }
         if (action === 'remove') {
-          return json(await squad.remove(asText(args.member)))
+          if (caller.kind === 'member') throw new Error('你是编队成员，不能回收其他成员')
+          return json(await squad.remove(asText(args.member), { engagementId: eng.id }))
         }
         throw new Error(`未知 action：${action}`)
       } catch (error) {
         return fail(error)
       }
+    },
+  })
+
+  ctx.tools.register({
+    name: 'recon_group',
+    description:
+      '协作小组：当执行成员遇到非自己职责的卡点（如 Web 需要逆向）时，用 action=request 请求总指挥派专业角色；'
+      + '总指挥用 recon_squad action=group 把专业角色加入该成员的小组。组内用 action=ask 串行提问并等待对方回答，'
+      + '组内消息互相可见，整个小组只算一个并发；action=close 由总指挥让全组各自交接后一起回收。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['request', 'ask', 'post', 'list', 'close'], description: '默认 list' },
+        groupId: { type: 'string', description: '小组 id；成员默认使用自己所在小组' },
+        member: { type: 'string', description: 'ask 的目标成员名字/序号' },
+        role: { type: 'string', description: 'request 需要总指挥派来的专业角色，如 reverser / web / intranet' },
+        task: { type: 'string', description: 'request 的卡点说明 / 希望对方处理的任务' },
+        question: { type: 'string', description: 'ask 给对方的问题或要求' },
+        text: { type: 'string', description: 'post 的组内消息' },
+        timeoutMs: { type: 'number', description: 'ask 等待对方回复的毫秒数，默认 300000' },
+        skills: { type: 'array', items: { type: 'string' }, description: 'request 建议的技能，供总指挥分派时参考' },
+        tier: { type: 'string', enum: [...MODEL_TIERS, 'dsh'], description: 'request 建议的模型档位' },
+        engagement: { type: 'string', description: '靶标 id 或名称' },
+      },
+      additionalProperties: false,
+    },
+    output: { schema: { type: 'string' }, render: (_a, v) => textBlocks(v) },
+    async execute(args, exec) {
+      try {
+        const eng = await resolveEngagement(exec, args.engagement)
+        const caller = callerOf(exec)
+        const action = asText(args.action, 'list')
+        const member = caller.kind === 'member' ? squad.members.get(caller.key) : undefined
+        if (action === 'request') {
+          if (member === undefined) throw new Error('request 只能由编队成员发起')
+          const role = asText(args.role)
+          if (role === '') throw new Error('request 需要 role（需要什么专业角色）')
+          const need = asText(args.task) || '需要专业角色协作'
+          const skillNote = asList(args.skills).map((item) => asText(item)).filter((item) => item !== '')
+          const requestText = `【协作请求】${member.name}（${member.role}）遇到卡点，需要 ${role}：${need}${skillNote.length > 0 ? `\n建议技能：${skillNote.join(', ')}` : ''}${asText(args.tier) !== '' ? `\n建议档位：${asText(args.tier)}` : ''}`
+          await board.post(eng.id, { author: caller, kind: 'task', text: requestText, refs: { groupRequest: true, memberName: member.name, role } })
+          let nudged = null
+          try { nudged = await cockpit?.nudge?.(eng.id, requestText, { always: true, force: true }) } catch { /* 看板已留请求 */ }
+          return json({ ok: true, requested: role, request: requestText, nudged })
+        }
+        if (action === 'ask') {
+          if (member === undefined) throw new Error('ask 只能由编队成员发起')
+          const groupId = asText(args.groupId) || asText(member.groupId)
+          if (groupId === '') throw new Error('你还没有小组')
+          const question = asText(args.question) || asText(args.task) || asText(args.text)
+          const result = await squad.groupAsk(groupId, member.key, asText(args.member), question, args.timeoutMs)
+          return json(result)
+        }
+        if (action === 'post') {
+          if (member === undefined) throw new Error('post 只能由编队成员发起')
+          const groupId = asText(args.groupId) || asText(member.groupId)
+          if (groupId === '') throw new Error('你还没有小组')
+          return json({ ok: true, group: await squad.groupPost(groupId, member.key, asText(args.text)) })
+        }
+        if (action === 'list') {
+          const groups = member !== undefined
+            ? (member.groupId ? [squad.groupView(squad.groups.get(member.groupId))].filter(Boolean) : [])
+            : squad.listGroups(eng.id)
+          return json({ ok: true, groups })
+        }
+        if (action === 'close') {
+          if (caller.kind === 'member') throw new Error('只有指挥席可以结束并回收整个小组')
+          const groupId = asText(args.groupId)
+          if (groupId === '') throw new Error('close 需要 groupId')
+          return json(await squad.closeGroup(groupId, eng.id))
+        }
+        throw new Error(`未知 action：${action}`)
+      } catch (error) {
+        return fail(error)
+      }
+    },
+  })
+
+  ctx.tools.register({
+    name: 'recon_skill',
+    description: '加载本机成熟技能（$DSH_HOME/skills、$DSH_HOME/redteam/skills、$DSH_PUBLIC_SKILLS/...）。先 list 看目录，再 load 读取完整技能正文；不要凭记忆猜技能内容。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['list', 'load'], description: '默认 list' },
+        name: { type: 'string', description: 'load 时的技能 name（如 dir-bruteforce）' },
+        query: { type: 'string', description: 'list 时按名称/描述过滤' },
+      },
+      additionalProperties: false,
+    },
+    output: { schema: { type: 'string' }, render: (_a, v) => textBlocks(v) },
+    async execute(args, exec) {
+      try {
+        const action = asText(args.action, 'list')
+        if (action === 'list') {
+          const query = asText(args.query).toLowerCase()
+          const items = (await discoverSkills()).filter((item) => query === ''
+            || `${item.name} ${item.description} ${item.whenToUse}`.toLowerCase().includes(query))
+          return json({ ok: true, count: items.length, skills: items.map((item) => ({ name: item.name, description: shortText(item.description, 180), whenToUse: shortText(item.whenToUse, 120) })) })
+        }
+        if (action !== 'load') throw new Error(`未知 action：${action}`)
+        const hit = await loadSkill(args.name)
+        if (hit === undefined) throw new Error(`技能不存在：${asText(args.name)}`)
+        const text = await readFile(hit.path, 'utf8')
+        return json({ ok: true, name: hit.name, path: hit.path, content: text })
+      } catch (error) { return fail(error) }
     },
   })
 
@@ -7286,7 +9223,7 @@ function registerCollabTools(ctx, deps) {
       properties: {
         action: {
           type: 'string',
-          enum: ['goto', 'click', 'fill', 'press', 'text', 'html', 'eval', 'screenshot', 'links', 'forms'],
+          enum: ['goto', 'click', 'fill', 'press', 'text', 'html', 'eval', 'screenshot', 'links', 'forms', 'steps'],
           description: '要做的动作，默认 goto',
         },
         url: { type: 'string', description: '目标 URL（goto 必填；其它动作给了就先打开再操作）' },
@@ -7297,6 +9234,13 @@ function registerCollabTools(ctx, deps) {
         x: { type: 'number', description: '坐标点击 x（无 selector 时用）' },
         y: { type: 'number', description: '坐标点击 y' },
         timeoutMs: { type: 'number', description: '动作超时，默认 20000' },
+        steps: {
+          type: 'array',
+          description: '可选多步动作（action=steps 时使用）：每步 {action,url,selector,value,text,x,y,waitMs,expression}',
+          items: { type: 'object' },
+        },
+        headless: { type: 'boolean', description: '是否无头模式，默认 true' },
+        maxChars: { type: 'number', description: '页面文本/HTML 返回上限，默认 6000' },
         engagement: { type: 'string', description: '靶标 id 或名称' },
       },
       additionalProperties: false,
@@ -7317,6 +9261,14 @@ function registerCollabTools(ctx, deps) {
           /* 无论成败都要结束"正在操作浏览器"状态，失败时保留最后一次画面 */
           browsers.end(eng.id, sessionKey, outcome)
         }
+        void trace?.push?.(eng.id, {
+          kind: 'tool',
+          actor: caller,
+          title: `浏览器 ${asText(args.action, 'goto')} ${shortText(asText(args.url), 80)}`,
+          detail: [asText(args.selector), asText(args.value), asText(args.text), asText(args.expression)].filter((x) => x !== '').join(' · '),
+          refs: { tool: 'recon_browser' },
+          meta: { ok: outcome !== null && outcome.ok === true, url: outcome && outcome.url ? outcome.url : asText(args.url) },
+        })
         if (outcome === null || typeof outcome !== 'object') {
           void trace?.push?.(eng.id, {
             kind: 'tool',
@@ -7356,8 +9308,8 @@ function registerCollabTools(ctx, deps) {
         action: { type: 'string', enum: ['list', 'add', 'remove', 'enable', 'disable'], description: '默认 list' },
         ruleId: { type: 'string', description: '规则 id（remove/enable/disable 用）' },
         on: { type: 'string', enum: ['node.created', 'vuln.created', 'command.finished', 'interval'], description: '触发事件' },
-        role: { type: 'string', description: '派哪个角色：commander / staff / scout / web / reverser / intranet / qa，或自定义临时角色' },
-        tier: { type: 'string', enum: MODEL_TIERS, description: '模型档位' },
+        role: { type: 'string', description: '派哪个队员角色：scout / web / reverser / intranet / qa，或自定义临时角色；总指挥/参谋是常设席位，不能作为触发角色' },
+        tier: { type: 'string', enum: [...MODEL_TIERS, 'dsh'], description: '模型档位：deep / fast / vision / dsh（跟随 DSH）' },
         kinds: { type: 'array', items: { type: 'string' }, description: '只在出现这些资产类型时触发（node.created 有效）' },
         severity: { type: 'array', items: { type: 'string' }, description: '只在出现这些等级时触发（vuln.created 有效）' },
         cooldownMs: { type: 'number', description: '冷却毫秒，默认 45000' },
@@ -7376,63 +9328,14 @@ function registerCollabTools(ctx, deps) {
           : {}
         const rules = Array.isArray(effective.rules) ? effective.rules.map((rule) => ({ ...rule })) : []
         const action = asText(args.action, 'list')
-        if (action === 'mission') {
-          const sub = asText(args.missionAction, 'get')
-          if (sub === 'get') {
-            const mission = await tasks.missionOf(eng.id)
-            const rows = await tasks.list(eng.id, 400)
-            const passed = rows.filter((row) => row.status === 'passed').length
-            const open = rows.filter((row) => row.status !== 'passed' && row.status !== 'failed').length
-            const failed = rows.filter((row) => row.status === 'failed').length
-            return json({ ok: true, mission, progress: { total: rows.length, passed, open, failed } })
-          }
-          if (sub === 'set') {
-            if (asText(args.goal) === '') throw new Error('set 需要 goal（本轮作战目标）')
-            const prev = await tasks.missionOf(eng.id)
-            const mission = await tasks.setMission(eng.id, {
-              goal: asText(args.goal),
-              done: asText(args.acceptance, args.done),
-              status: 'running',
-            })
-            await tasks.setMission(eng.id, { goal: mission.goal, done: mission.done, status: 'running', rounds: (prev === null ? 0 : Number(prev.rounds) || 0) + 1 })
-            await board.post(eng.id, {
-              author: caller, kind: 'task',
-              text: `本轮作战目标：${asText(args.goal)}${asText(args.acceptance) !== '' ? `\n完成判据：${asText(args.acceptance)}` : ''}`,
-            })
-            return json({ ok: true, mission: await tasks.missionOf(eng.id) })
-          }
-          if (sub === 'close') {
-            const rows = await tasks.list(eng.id, 400)
-            const notPassed = rows.filter((row) => row.status !== 'passed')
-            const force = args.status === 'passed' || asText(args.note) === 'force'
-            if (notPassed.length > 0 && !force) {
-              return json({
-                ok: false,
-                error: `还有 ${notPassed.length} 条任务没通过验收，不能宣布完成`,
-                pending: notPassed.slice(-8).map((row) => `${row.id} [${row.status}] ${row.title}`),
-                hint: '让验收继续判定，或确认这些任务可以放弃后再 close',
-              })
-            }
-            const mission = await tasks.setMission(eng.id, {
-              goal: (await tasks.missionOf(eng.id) || {}).goal || '',
-              done: (await tasks.missionOf(eng.id) || {}).done || '',
-              status: 'done',
-            })
-            await board.post(eng.id, {
-              author: caller, kind: 'conclusion',
-              text: `【任务完成】${mission.goal !== '' ? mission.goal : '本轮作战目标'} 已通过验收（${rows.filter((r) => r.status === 'passed').length} 条任务），收队。`,
-            })
-            const reclaimed = await squad.reclaimIdle(eng.id)
-            return json({ ok: true, mission, reclaimed })
-          }
-          throw new Error(`未知 missionAction：${sub}`)
-        }
 
         if (action === 'list') {
           return json({
             ok: true,
             enabled: effective.enabled !== false,
-            maxAgents: Number.isFinite(effective.maxAgents) ? effective.maxAgents : 3,
+            maxAgents: Number.isFinite(effective.maxAgents) ? effective.maxAgents : 8,
+            maxAutomationAgents: Number.isFinite(effective.maxAutomationAgents) ? effective.maxAutomationAgents : 3,
+            queued: automation.status().queued,
             rules: rules.map((rule) => ({
               id: rule.id, on: rule.on, role: rule.role, tier: rule.tier || '',
               kinds: rule.whenKinds || [], severity: rule.whenSeverity || [],
@@ -7443,9 +9346,21 @@ function registerCollabTools(ctx, deps) {
         }
         if (action === 'add') {
           const on = asText(args.on, 'node.created')
-          const roleWanted = asText(args.role, on === 'vuln.created' ? 'browser' : 'hunter')
-          /* 同类规则已存在就不再叠加，避免同一事件派两个 Agent 抢同一个资产 */
-          const duplicate = rules.find((rule) => rule.on === on && rule.role === roleWanted && rule.enabled !== false)
+          const roleWanted = asText(args.role, on === 'vuln.created' ? 'web' : (on === 'interval' ? 'scout' : 'web'))
+          const coreWanted = squad.coreRoleIdOf(roleWanted)
+          if (coreWanted !== '') throw new Error('总指挥/参谋是常设席位，不能作为事件触发角色')
+          const wantedKinds = asList(args.kinds).slice().sort()
+          const wantedSeverity = asList(args.severity).slice().sort()
+          const resolvedRole = canonicalRoleId(squad, roleWanted)
+          /* 同类规则已存在就不再叠加；按别名解析后的角色、kinds、severity 一起比较。 */
+          const duplicate = rules.find((rule) => {
+            if (rule.on !== on || rule.enabled === false) return false
+            if (squad.roleOf(rule.role).id !== resolvedRole) return false
+            const ruleKinds = asList(rule.whenKinds).slice().sort()
+            const ruleSeverity = asList(rule.whenSeverity).slice().sort()
+            return JSON.stringify(ruleKinds) === JSON.stringify(wantedKinds)
+              && JSON.stringify(ruleSeverity) === JSON.stringify(wantedSeverity)
+          })
           if (duplicate !== undefined) {
             return json({
               ok: true,
@@ -7458,13 +9373,13 @@ function registerCollabTools(ctx, deps) {
             })
           }
           const rule = {
-            id: asText(args.ruleId, `watch-${Date.now().toString(36).slice(-4)}`),
+            id: asText(args.ruleId, `watch-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`),
             on,
             enabled: args.enabled !== false,
-            role: roleWanted,
-            tier: MODEL_TIERS.includes(asText(args.tier)) ? asText(args.tier) : (on === 'vuln.created' ? 'vision' : 'deep'),
-            whenKinds: asList(args.kinds),
-            whenSeverity: asList(args.severity),
+            role: resolvedRole,
+            tier: MODEL_CHOICES.includes(asText(args.tier)) ? asText(args.tier) : (on === 'vuln.created' ? 'vision' : 'deep'),
+            whenKinds: wantedKinds,
+            whenSeverity: wantedSeverity,
             cooldownMs: Number.isFinite(args.cooldownMs) ? args.cooldownMs : 45000,
             task: asText(args.task, on === 'node.created'
               ? '新资产 {{kind}}:{{value}}（{{nodeId}}）刚进图谱，做一轮针对性探测，结论用 recon_vuln 登记并写进看板。'
@@ -7523,6 +9438,8 @@ function registerCollabTools(ctx, deps) {
       try {
         const eng = await resolveEngagement(exec, args.engagement)
         if (eng === undefined) return json({ ok: false, error: '还没有靶标' })
+        const caller = callerOf(exec)
+        if (caller.kind === 'member' && caller.role !== 'qa') throw new Error('命令审计是验收员专用工具')
         const action = asText(args.action, 'inspect')
         if (action === 'members') {
           const rows = await audit.members(eng)
@@ -7634,6 +9551,64 @@ function registerCollabTools(ctx, deps) {
   })
 
   ctx.tools.register({
+    name: 'recon_memory',
+    description:
+      '全局长期记忆：所有 agent 必须完整读取；只有总指挥、参谋可以写入。'
+      + '只允许写入最重要、最全局的信息：项目概况、总体目标、特殊攻击手法、已确认漏洞、凭据/账号、环境与工具结论等。'
+      + '日常过程、普通汇报、离职交接不要写记忆；离职交接只写看板。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['add', 'list'], description: '默认 list' },
+        title: { type: 'string', description: '记忆标题' },
+        content: { type: 'string', description: '记忆内容（完整、可复用的事实）' },
+        category: { type: 'string', enum: ['project', 'goal', 'technique', 'vulnerability', 'credential', 'environment', 'other'], description: '记忆类别' },
+        importance: { type: 'string', enum: ['high', 'critical'], description: '只有重要/关键信息才允许写入' },
+        limit: { type: 'number', description: 'list 返回条数，默认全部' },
+      },
+      additionalProperties: false,
+    },
+    output: { schema: { type: 'string' }, render: (_a, v) => textBlocks(v) },
+    async execute(args, exec) {
+      try {
+        const caller = callerOf(exec)
+        const action = asText(args.action, 'list')
+        const current = configStore.get()
+        const currentMemory = Array.isArray(current.memory) ? current.memory : []
+        const rows = currentMemory.map((item) => memoryEntryOf(item))
+        if (action === 'list') {
+          const limit = Number.isFinite(Number(args.limit)) ? Math.max(1, Math.floor(Number(args.limit))) : 0
+          return json({ ok: true, memory: limit > 0 ? rows.slice(-limit) : rows })
+        }
+        if (action !== 'add') throw new Error(`未知 action：${action}`)
+        if (!(caller.kind === 'leader' || caller.role === 'commander' || caller.role === 'staff')) {
+          throw new Error('只有总指挥或参谋可以写入长期记忆；其他角色请把结论报告给总指挥/参谋')
+        }
+        const title = asText(args.title)
+        const content = asText(args.content)
+        if (title === '' || content === '') throw new Error('add 需要 title 和 content')
+        const category = ['project', 'goal', 'technique', 'vulnerability', 'credential', 'environment', 'other'].includes(asText(args.category))
+          ? asText(args.category) : 'other'
+        const importance = asText(args.importance, 'high')
+        if (importance !== 'high' && importance !== 'critical') throw new Error('importance 必须是 high 或 critical')
+        const entry = {
+          id: `m${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`,
+          title,
+          content,
+          category,
+          importance,
+          author: { role: caller.role, name: caller.name },
+          createdAt: nowMs(),
+        }
+        await configStore.patch({ memory: [...currentMemory, entry] })
+        return json({ ok: true, memory: entry })
+      } catch (error) {
+        return fail(error)
+      }
+    },
+  })
+
+  ctx.tools.register({
     name: 'recon_config',
     description:
       '读写驾驶舱配置（等价于页面的「控制台」）。用户说「把 FOFA key 配成 xxx」就用 section=keys, values={fofa:"xxx"}；'
@@ -7644,8 +9619,8 @@ function registerCollabTools(ctx, deps) {
         action: { type: 'string', enum: ['get', 'set'], description: '默认 get' },
         section: {
           type: 'string',
-          enum: ['keys', 'models', 'role', 'prompt', 'memory', 'skills', 'mcp', 'env', 'chat', 'automation', 'meeting', 'board', 'handover'],
-          description: '要读写的配置段',
+          enum: ['keys', 'models', 'role', 'core', 'prompt', 'memory', 'skills', 'mcp', 'env', 'chat', 'automation', 'meeting', 'board', 'trace', 'handover'],
+          description: '要读写的配置段（core=常设席位总指挥/参谋；prompt.common=注入所有 Agent 的通用提示词。旧的 role/prompt.extra 驾驶舱人设已由 core.commander 取代）',
         },
         values: { description: 'set 时的新值：对象（keys/models/role/prompt/chat）、数组（memory/skills.enabled/env/mcp）或字符串' },
         field: { type: 'string', description: '只改单个字段时用，如 fofa / deep.model' },
@@ -7653,12 +9628,18 @@ function registerCollabTools(ctx, deps) {
       additionalProperties: false,
     },
     output: { schema: { type: 'string' }, render: (_a, v) => textBlocks(v) },
-    async execute(args) {
+    async execute(args, exec) {
       try {
         const action = asText(args.action, 'get')
         const section = asText(args.section, '')
+        if (action === 'set' && section === 'memory') {
+          const caller = callerOf(exec)
+          if (!(caller.kind === 'leader' || caller.role === 'commander' || caller.role === 'staff')) {
+            throw new Error('只有总指挥或参谋可以写入长期记忆；其他角色请报告结论')
+          }
+        }
         if (action === 'get') {
-          const redacted = configStore.redacted()
+          const redacted = configStore.redacted({ redactEnv: true })
           if (section === '') {
             return json({
               ok: true,
@@ -7699,9 +9680,12 @@ function registerCollabTools(ctx, deps) {
         } else if (section === 'role' || section === 'prompt' || section === 'chat') {
           if (typeof values !== 'object' || Array.isArray(values)) throw new Error(`${section} 需要对象`)
           patch[section] = values
+        } else if (section === 'core') {
+          if (typeof values !== 'object' || Array.isArray(values)) throw new Error('core 需要对象，如 {commander:{prompt:"…"}, staff:{prompt:"…"}}')
+          patch.core = values
         } else if (section === 'memory' || section === 'mcp' || section === 'env') {
           if (!Array.isArray(values)) throw new Error(`${section} 需要数组`)
-          patch[section] = values
+          patch[section] = section === 'memory' ? values.map((item) => memoryEntryOf(item)) : values
         } else if (section === 'skills') {
           const enabled = Array.isArray(values) ? values : (values && Array.isArray(values.enabled) ? values.enabled : null)
           if (enabled === null) throw new Error('skills 需要数组或 {enabled:[...]}')
@@ -7727,13 +9711,18 @@ function registerCollabTools(ctx, deps) {
           const limit = [50, 100, 200].includes(Number(values.limit)) ? Number(values.limit) : (Number(current.limit) || 100)
           const wantedMerge = [25, 50, 100].includes(Number(values.mergeCount)) ? Number(values.mergeCount) : (Number(current.mergeCount) || 50)
           patch.board = { limit, mergeCount: Math.min(wantedMerge, Math.max(10, Math.floor(limit / 2))) }
+        } else if (section === 'trace') {
+          if (typeof values !== 'object' || Array.isArray(values)) throw new Error('trace 需要对象，如 {limit:1000}')
+          const current = configStore.get().trace || {}
+          const wanted = Number(values.limit)
+          patch.trace = { limit: Number.isFinite(wanted) ? Math.max(100, Math.min(5000, Math.floor(wanted))) : (Number(current.limit) || 500) }
         } else if (section === 'handover') {
           if (typeof values !== 'object' || Array.isArray(values)) throw new Error('handover 需要对象')
           const current = configStore.get().handover || {}
           patch.handover = {
             enabled: values.enabled === undefined ? current.enabled !== false : values.enabled !== false,
             timeoutMs: Number(values.timeoutMs) >= 15000 ? Number(values.timeoutMs) : (Number(current.timeoutMs) || 90000),
-            keepSkill: values.keepSkill === undefined ? current.keepSkill !== false : values.keepSkill !== false,
+            keepSkill: false,
           }
         } else {
           throw new Error(`未知 section：${section}`)
@@ -7759,21 +9748,23 @@ function registerCollabTools(ctx, deps) {
   ctx.tools.register({
     name: 'recon_task',
     description:
-      '任务账本（组织的工单系统）。总指挥用它把方案拆成可验收的任务并派给角色；执行者领任务、附证据；'
-      + '验收员 accept（达标）或 reject（不达标，系统会把意见作为新任务回给总指挥）。'
+      '任务账本（组织的工单系统）。总指挥先读参谋方案，再登记 mission 并拆成可验收任务派给角色；'
+      + '执行者领任务、附证据；只有 QA 能 accept（达标）或 reject（不达标，系统会把意见作为新任务回给总指挥）；'
+      + '全部任务通过 QA 验收后，总指挥用 mission close 宣布结束并回收队员。'
       + '一条任务 = 标题 + 目标 + 验收标准 + 负责角色 + 状态。',
     parameters: {
       type: 'object',
       properties: {
         action: { type: 'string', enum: ['create', 'list', 'update', 'accept', 'reject', 'mission'], description: '默认 list；mission 用来登记/查看/关闭作战目标' },
-        missionAction: { type: 'string', enum: ['set', 'get', 'close'], description: 'mission 动作：set 登记目标、get 查看、close 宣布完成（会回收空闲队员）' },
+        missionAction: { type: 'string', enum: ['set', 'get', 'close'], description: 'mission 动作：set 登记目标（需先有参谋方案）、get 查看、close 由总指挥宣布结束（停止并回收非核心队员）' },
         id: { type: 'string', description: '任务 id（update/accept/reject 用）' },
         title: { type: 'string', description: '任务标题' },
         goal: { type: 'string', description: '要达成什么（具体到资产/接口）' },
+        done: { type: 'string', description: '完成判据（mission set 时的 acceptance 别名）' },
         acceptance: { type: 'string', description: '验收标准：怎样算完成（谁看都能判）' },
-        role: { type: 'string', description: '负责角色：commander/staff/scout/web/reverser/intranet/qa 或临时角色 id' },
+        role: { type: 'string', description: '负责角色：scout/web/reverser/intranet/qa 或临时角色 id；commander/staff 仅用于返工/收官等常设席位任务' },
         assignee: { type: 'string', description: '指定成员名字（可选，如「Web 手#6」；不填按角色派）' },
-        status: { type: 'string', enum: ['open', 'doing', 'passed', 'failed', 'blocked'], description: 'update 用' },
+        status: { type: 'string', enum: TASK_STATUSES, description: 'update 用' },
         note: { type: 'string', description: '补充说明 / 驳回原因' },
         commandIds: { type: 'array', items: { type: 'string' }, description: '证据命令 id' },
         vulnIds: { type: 'array', items: { type: 'string' }, description: '证据漏洞 id' },
@@ -7800,30 +9791,49 @@ function registerCollabTools(ctx, deps) {
             return json({ ok: true, mission, progress: { total: rows.length, passed, open, failed } })
           }
           if (sub === 'set') {
+            if (caller.kind === 'member' && caller.role !== 'commander') {
+              return json({ ok: false, error: '只有总指挥可以登记/调整作战目标' })
+            }
             if (asText(args.goal) === '') throw new Error('set 需要 goal（本轮作战目标）')
             const prev = await tasks.missionOf(eng.id)
+            const plan = await latestStaffPlan(board, eng.id, prev === null ? 0 : prev.updatedAt)
+            if (plan === undefined) {
+              return json({
+                ok: false,
+                error: '还没有本轮参谋方案，不能登记作战目标',
+                hint: '先把任务和上下文派给参谋（recon_squad task role=staff 或常设参谋席位），让参谋把整体方案写进看板 kind=hypothesis；总指挥读方案后再拆任务。',
+              })
+            }
+            const acceptanceText = asText(args.acceptance, args.done)
             const mission = await tasks.setMission(eng.id, {
               goal: asText(args.goal),
-              done: asText(args.acceptance, args.done),
+              done: acceptanceText,
               status: 'running',
+              rounds: (prev === null ? 0 : Number(prev.rounds) || 0) + 1,
             })
-            await tasks.setMission(eng.id, { goal: mission.goal, done: mission.done, status: 'running', rounds: (prev === null ? 0 : Number(prev.rounds) || 0) + 1 })
             await board.post(eng.id, {
               author: caller, kind: 'task',
-              text: `本轮作战目标：${asText(args.goal)}${asText(args.acceptance) !== '' ? `\n完成判据：${asText(args.acceptance)}` : ''}`,
+              text: `本轮作战目标：${asText(args.goal)}${acceptanceText !== '' ? `\n完成判据：${acceptanceText}` : ''}`,
             })
             return json({ ok: true, mission: await tasks.missionOf(eng.id) })
           }
           if (sub === 'close') {
+            if (caller.kind === 'member' && caller.role !== 'commander') {
+              return json({ ok: false, error: '只有总指挥可以宣布作战结束；QA 只能提交验收报告' })
+            }
             const rows = await tasks.list(eng.id, 400)
             const notPassed = rows.filter((row) => row.status !== 'passed')
+            const unverified = rows.filter((row) => row.status === 'passed'
+              && (!row.verifiedBy || row.verifiedBy.role !== 'qa'))
             const force = args.status === 'passed' || asText(args.note) === 'force'
-            if (notPassed.length > 0 && !force) {
+            if ((notPassed.length > 0 || unverified.length > 0) && !force) {
               return json({
                 ok: false,
-                error: `还有 ${notPassed.length} 条任务没通过验收，不能宣布完成`,
-                pending: notPassed.slice(-8).map((row) => `${row.id} [${row.status}] ${row.title}`),
-                hint: '让验收继续判定，或确认这些任务可以放弃后再 close',
+                error: notPassed.length > 0
+                  ? `还有 ${notPassed.length} 条任务没通过验收，不能宣布完成`
+                  : `还有 ${unverified.length} 条任务没有 QA 验收记录，不能宣布完成`,
+                pending: (notPassed.length > 0 ? notPassed : unverified).slice(-8).map((row) => `${row.id} [${row.status}] ${row.title}`),
+                hint: '先让 QA 对每条任务执行 accept/reject；全部通过并被 QA 复核后，再由总指挥 close。',
               })
             }
             const mission = await tasks.setMission(eng.id, {
@@ -7831,12 +9841,14 @@ function registerCollabTools(ctx, deps) {
               done: (await tasks.missionOf(eng.id) || {}).done || '',
               status: 'done',
             })
+            cockpit.pendingNudges?.delete?.(eng.id)
+            const stopped = await squad.stopAll(eng.id)
             await board.post(eng.id, {
-              author: caller, kind: 'conclusion',
-              text: `【任务完成】${mission.goal !== '' ? mission.goal : '本轮作战目标'} 已通过验收（${rows.filter((r) => r.status === 'passed').length} 条任务），收队。`,
+              author: { role: 'commander', name: '总指挥' }, kind: 'conclusion',
+              text: `【任务完成】${mission.goal !== '' ? mission.goal : '本轮作战目标'} 已由 QA 全部验收通过（${rows.filter((r) => r.status === 'passed').length} 条任务），总指挥宣布结束，收队。`,
             })
             const reclaimed = await squad.reclaimIdle(eng.id)
-            return json({ ok: true, mission, reclaimed })
+            return json({ ok: true, mission, stopped, reclaimed })
           }
           throw new Error(`未知 missionAction：${sub}`)
         }
@@ -7854,24 +9866,35 @@ function registerCollabTools(ctx, deps) {
               id: row.id, title: row.title, role: row.role, assignee: row.assignee || null,
               status: row.status, goal: shortText(row.goal, 160), acceptance: shortText(row.acceptance, 160),
               evidence: row.evidence, note: shortText(row.note, 200),
+              verifiedBy: row.verifiedBy || null, verifiedAt: row.verifiedAt || null,
             })),
           })
         }
         if (action === 'create') {
+          if (caller.kind === 'member' && caller.role !== 'commander') {
+            throw new Error('只有总指挥可以拆解并创建任务；执行者请更新自己任务的状态和证据')
+          }
+          const mission = await tasks.missionOf(eng.id)
+          if (mission === null || mission.status !== 'running') {
+            return json({
+              ok: false,
+              error: '还没有进行中的作战目标，不能拆任务',
+              hint: '先让参谋出整体方案并写看板，再由总指挥 recon_task action=mission missionAction=set 登记目标。',
+            })
+          }
           if (asText(args.title) === '') throw new Error('create 需要 title')
           const task = await tasks.create(eng.id, {
             title: asText(args.title),
             goal: asText(args.goal),
             acceptance: asText(args.acceptance),
-            role: asText(args.role, 'web'),
+            role: canonicalRoleId(squad, args.role),
             /* 任务只登记名字：传啥都换算成在岗成员的名字，换算不到就留空按角色派 */
             assignee: (() => {
               const ref = asText(args.assignee)
               if (ref === '') return ''
-              try {
-                const hit = squad.resolveMemberRef(ref)
-                return hit === undefined ? '' : hit.name
-              } catch { return '' }
+              const hit = squad.resolveMemberRef(ref, eng.id)
+              if (hit === undefined) throw new Error(`指定成员不存在：${ref}`)
+              return hit.name
             })(),
             createdBy: caller.role === 'user' ? { role: 'user', name: '指挥席' } : { role: caller.role, name: caller.name },
           })
@@ -7892,15 +9915,23 @@ function registerCollabTools(ctx, deps) {
           shots: asList(args.shots),
         }
         if (action === 'update') {
-          const task = await tasks.update(eng.id, id, { ...args, evidence })
+          if (caller.kind === 'member' && caller.role !== 'qa' && (args.status === 'passed' || args.status === 'failed')) {
+            throw new Error('只有验收员或指挥席可以直接把任务改成 passed/failed')
+          }
+          const task = await tasks.update(eng.id, id, { ...args, evidence }, caller)
           return json({ ok: true, task })
         }
         if (action === 'accept') {
+          if (caller.kind !== 'member' || caller.role !== 'qa') {
+            throw new Error('验收必须由 QA 角色执行：请先用 recon_squad task 让验收员核查证据并 accept/reject')
+          }
           const task = await tasks.update(eng.id, id, {
             status: 'passed',
             note: asText(args.note),
             evidence,
-          })
+            verifiedBy: { role: caller.role, name: caller.name },
+            verifiedAt: nowMs(),
+          }, caller)
           await board.post(eng.id, {
             author: caller,
             kind: 'conclusion',
@@ -7908,28 +9939,54 @@ function registerCollabTools(ctx, deps) {
             refs: { vulnIds: evidence.vulnIds, commandIds: evidence.commandIds, nodeIds: evidence.nodeIds },
             shots: evidence.shots,
           })
-          /* 闭环：全部任务通过 → 立刻通知总指挥宣布完成 */
+          /* 闭环：全部任务通过且有 QA 记录 → 强制通知总指挥，最后由总指挥 close 收队 */
           let settle = null
           try {
             const rows = await tasks.list(eng.id, 400)
             const pending = rows.filter((row) => row.status !== 'passed' && row.status !== 'failed')
             const failed = rows.filter((row) => row.status === 'failed')
+            const unverified = rows.filter((row) => row.status === 'passed'
+              && (!row.verifiedBy || row.verifiedBy.role !== 'qa'))
             const mission = await tasks.missionOf(eng.id)
             if (pending.length === 0 && failed.length === 0 && (mission === null || mission.status !== 'done')) {
-              const nudgedAll = await cockpit?.nudge?.(eng.id, '所有任务已通过验收：请宣布任务完成，并决定回收还是保留队员')
-              if (nudgedAll !== null && nudgedAll !== undefined && nudgedAll.ok === true) settle = { phase: 'ready-to-close', nudged: nudgedAll }
+              const verified = rows.filter((row) => row.verifiedBy && row.verifiedBy.role === 'qa')
+              const evidenceCount = verified.reduce((sum, row) => {
+                const ev = row.evidence || {}
+                return sum + (Array.isArray(ev.commandIds) ? ev.commandIds.length : 0)
+                  + (Array.isArray(ev.vulnIds) ? ev.vulnIds.length : 0)
+                  + (Array.isArray(ev.nodeIds) ? ev.nodeIds.length : 0)
+                  + (Array.isArray(ev.shots) ? ev.shots.length : 0)
+              }, 0)
               await board.post(eng.id, {
                 author: { role: 'qa', name: caller.name },
                 kind: 'conclusion',
-                text: '全部任务已通过验收，等总指挥宣布完成（recon_task action=mission missionAction=close）。',
+                text: `【QA 终验报告】${eng.name} 共 ${rows.length} 条任务，全部 QA 验收通过；证据引用 ${evidenceCount} 项。${unverified.length > 0 ? `仍有 ${unverified.length} 条任务缺少 QA 验收记录，不能收尾。` : '现在交由总指挥做最终决定。'}`,
               })
+              if (unverified.length === 0) {
+                const nudgedAll = await cockpit?.nudge?.(eng.id,
+                  'QA 已对全部任务完成最终验收，请立即复核任务账本并宣布作战结束',
+                  { force: true, final: true, always: true })
+                settle = { phase: 'ready-to-close', nudged: nudgedAll }
+              } else {
+                const nudgedAll = await cockpit?.nudge?.(eng.id,
+                  `仍有 ${unverified.length} 条已通过任务缺少 QA 验收记录，请安排 QA 重新核查`,
+                  { force: true, always: true })
+                settle = { phase: 'needs-qa', nudged: nudgedAll, unverified: unverified.map((row) => row.id) }
+              }
             }
           } catch { /* 闭环判定失败不影响验收结果 */ }
           return json({ ok: true, task: { id: task.id, status: task.status }, settle })
         }
         if (action === 'reject') {
+          if (caller.kind !== 'member' || caller.role !== 'qa') {
+            throw new Error('验收必须由 QA 角色执行：请先用 recon_squad task 让验收员核查证据并 accept/reject')
+          }
           const reason = asText(args.note, '未达到验收标准')
-          const task = await tasks.update(eng.id, id, { status: 'failed', note: reason, evidence })
+          const task = await tasks.update(eng.id, id, {
+            status: 'failed', note: reason, evidence,
+            verifiedBy: { role: caller.role, name: caller.name },
+            verifiedAt: nowMs(),
+          }, caller)
           const followUp = await tasks.rework(eng.id, task, reason, { role: 'qa', name: caller.name })
           await board.post(eng.id, {
             author: caller,
@@ -7943,13 +10000,14 @@ function registerCollabTools(ctx, deps) {
             const staffMember = squad.list(eng.id).find((m) => m.role === 'staff' && m.status !== 'running')
             const ask = `验收驳回 ${id}（${reason}）。请针对缺口给出 3 条改进方案（每条：怎么做 / 派给谁 / 验收标准），写进看板 kind=hypothesis，供总指挥选择。`
             if (staffMember !== undefined) {
-              await squad.task(staffMember.key, ask)
+              await squad.task(staffMember.name, ask, eng.id)
               staffCall = { member: staffMember.key, name: staffMember.name, mode: 'task' }
             } else if (caller.kind !== 'member') {
               const invited = await squad.spawn({
-                engagementId: eng.id, roleId: 'staff', tier: 'deep',
-                name: '参谋（返工）', prompt: '你只出方案不执行；针对验收缺口给可执行、可验收的改进方案。',
+                engagementId: eng.id, roleId: 'staff',
+                name: '参谋（返工）', promptExtra: '你只出方案不执行；针对验收缺口给可执行、可验收的改进方案。',
                 task: ask, origin: 'rework',
+                allowCore: true,
               })
               staffCall = { member: invited.key, name: invited.name, mode: 'spawn' }
             }
@@ -7978,7 +10036,8 @@ function registerCollabTools(ctx, deps) {
     name: 'recon_org',
     description:
       '组织管理：看编制与在岗成员、招募/回收、生成作战简报。'
-      + '总指挥可以用它开**临时角色**（例如 developer 写工具、reporter 出报告）：传 role=developer 与 rolePrompt 即生效并持久化。',
+      + '总指挥可以用它开**临时角色**（例如 developer 写工具、reporter 出报告）：传 role=developer 与 rolePrompt 即生效并持久化。'
+      + '总指挥/参谋是常设席位（全局各一个、自动在岗、不可召唤/回收），只能配置人设或直接派活，不能 recruit。',
     parameters: {
       type: 'object',
       properties: {
@@ -7986,7 +10045,7 @@ function registerCollabTools(ctx, deps) {
         role: { type: 'string', description: '角色 id（recruit 必填；新名字即临时角色）' },
         roleName: { type: 'string', description: '临时角色的显示名，例如「工具开发」' },
         rolePrompt: { type: 'string', description: '临时角色的职责说明（会进它的系统提示）' },
-        tier: { type: 'string', enum: MODEL_TIERS, description: '模型档位' },
+        tier: { type: 'string', enum: [...MODEL_TIERS, 'dsh'], description: '模型档位：deep / fast / vision / dsh（跟随 DSH）' },
         task: { type: 'string', description: '招募后立刻下发的任务（可选）' },
         member: { type: 'string', description: '成员名字，例如「Web 手#6」（recall 用）' },
         engagement: { type: 'string', description: '靶标 id 或名称' },
@@ -8006,6 +10065,9 @@ function registerCollabTools(ctx, deps) {
             roles: squad.roles().map((role) => ({
               id: role.id, name: role.name, tier: role.tier,
               reportsTo: role.reportsTo || null, temporary: role.temporary === true,
+            })),
+            core: squad.coreRoles().map((role) => ({
+              id: role.id, name: role.name, tier: role.tier, reportsTo: role.reportsTo || null,
             })),
             members: squad.list(eng.id),
             tasks: await tasks.stats(eng.id),
@@ -8028,6 +10090,11 @@ function registerCollabTools(ctx, deps) {
         if (action === 'recruit') {
           const roleId = asText(args.role)
           if (roleId === '') throw new Error('recruit 需要 role')
+          const coreId = squad.coreRoleIdOf(roleId)
+          if (coreId !== '') {
+            const core = squad.coreRoles().find((role) => role.id === coreId)
+            throw new Error(`${core !== undefined ? core.name : coreId} 是常设席位，不能招募；请到控制台「常设席位」里配置`)
+          }
           await squad.ensureRole({
             roleId,
             roleName: args.roleName,
@@ -8046,8 +10113,8 @@ function registerCollabTools(ctx, deps) {
           const key = asText(args.member)
           if (key === '') throw new Error('recall 需要 member')
           /* 回收＝离职：先让成员交出一份交接（发现/坑/技巧/建议），落看板后再释放 */
-          const result = await squad.remove(key, { reason: '回收' })
-          return json({ ...result, handover: 'written-to-board' })
+          const result = await squad.remove(key, { reason: '回收', engagementId: eng.id })
+          return json(result)
         }
         throw new Error(`未知 action：${action}`)
       } catch (error) {
@@ -8055,6 +10122,28 @@ function registerCollabTools(ctx, deps) {
       }
     },
   })
+}
+
+/** 模型上下文溢出错误的识别与 DSH 正常压缩重试。 */
+function isContextWindowError(error) {
+  if (error === null || error === undefined) return false
+  const code = String(error.code || error.name || (error.data && error.data.code) || '').toUpperCase()
+  if (code.includes('CONTEXT_WINDOW') || code.includes('CONTEXT_LENGTH') || code.includes('CONTEXT_OVERFLOW')) return true
+  const text = String(error.message || error.detail || error)
+  return /context\s+(?:length|window)|maximum\s+context|too\s+(?:large|long)\s+for\s+(?:this\s+|the\s+)?model|input\s+.*exceed/i.test(text)
+}
+
+/** 上下文溢出时使用 DSH 自带的正常压缩；压缩出有效结果后再重试。 */
+async function recoverContextOverflow(ctx, agent, failure, signal) {
+  const compaction = ctx.compaction || (typeof ctx.get === 'function' ? ctx.get('compaction') : undefined)
+  if (compaction === undefined || compaction === null || agent === undefined || agent === null || agent.session === undefined) return false
+  const before = agent.session.surface ? agent.session.surface.replaceGeneration : -1
+  try {
+    const result = await compaction.compactIfNeeded(agent, 'context-overflow', signal)
+    return result !== null || (agent.session.surface && agent.session.surface.replaceGeneration > before)
+  } catch {
+    return false
+  }
 }
 
 /* ────────────────────────── 插件入口 ────────────────────────── */
@@ -8068,6 +10157,7 @@ export function apply(ctx, config = {}) {
   }
   const hub = new EventHub()
   const configStore = new ConfigStore(cfg.root)
+  const customModels = new CustomModelRegistry(ctx, configStore)
   const store = new ReconStore(cfg.root, (eng) => {
     try {
       hub.broadcast({ type: 'graph', engagementId: eng.id, version: eng.version, stats: statsOf(eng) })
@@ -8083,8 +10173,9 @@ export function apply(ctx, config = {}) {
   cockpit.board = board
   const mcp = new McpBinder(ctx, hub)
   const browser = new BrowserRunner(cfg.root, hub)
-  const browsers = new Browsers(store, trace)
-  const squad = new Squad({ ctx, store, cfg, configStore, hub, board, tasks, trace })
+  const browsers = new Browsers(store, trace, hub)
+  const squad = new Squad({ ctx, store, cfg, configStore, hub, board, tasks, trace, browsers, cockpit })
+  cockpit.squad = squad
   const automation = new Automation({ ctx, store, cfg, configStore, hub, board, squad })
   const audit = new Audit({ store, board, tasks, squad, trace, configStore })
   const runner = new Runner({ store, cfg, configStore, hub, board, tasks, squad, cockpit, trace })
@@ -8110,11 +10201,28 @@ export function apply(ctx, config = {}) {
         })
       } catch { /* 广播失败不影响落盘 */ }
     }
-    void automation.onDelta(eng, delta)
+    void automation.onDelta(eng, delta).catch((error) => {
+      try { void board.post(eng.id, { author: { role: 'system', name: '调度台' }, kind: 'note', text: `自动化事件处理失败：${shortText(error && error.message ? error.message : error, 300)}` }) } catch { /* 观察者失败不外溢 */ }
+    })
   }
 
   const ready = Promise.all([store.init(), configStore.init(), board.init(), tasks.init(), trace.init()])
-    .then(() => {
+    .then(async () => {
+      try { await squad.migrateCoreRoles() } catch (error) {
+        ctx.logger?.warn?.(`[dsh-venery] 常设席位迁移失败：${error && error.message ? error.message : error}`)
+      }
+      try { await squad.upgradeScoutPrompt() } catch (error) {
+        ctx.logger?.warn?.(`[dsh-venery] scout Nday 提示词升级失败：${error && error.message ? error.message : error}`)
+      }
+      try { await squad.upgradeWebPrompt() } catch (error) {
+        ctx.logger?.warn?.(`[dsh-venery] web 提示词升级失败：${error && error.message ? error.message : error}`)
+      }
+      try { await squad.upgradeStaffPrompt() } catch (error) {
+        ctx.logger?.warn?.(`[dsh-venery] staff 提示词升级失败：${error && error.message ? error.message : error}`)
+      }
+      try { await customModels.syncCurrent() } catch (error) {
+        ctx.logger?.warn?.(`[dsh-venery] 自定义模型挂载失败：${error && error.message ? error.message : error}`)
+      }
       mcp.sync(configStore.get())
       return true
     })
@@ -8132,6 +10240,20 @@ export function apply(ctx, config = {}) {
 
   ctx.effect(() => cockpit.install())
   ctx.effect(() => squad.install())
+  /* 上下文溢出：调用 DSH 自带的正常压缩；有有效结果后重试。 */
+  ctx.effect(() => ctx.on('agent/request-error', async (payload, next) => {
+    if (!isContextWindowError(payload.failure) || (payload.signal && payload.signal.aborted)) return next()
+    try {
+      const recovered = await recoverContextOverflow(ctx, payload.agent, payload.failure, payload.signal)
+      if (recovered) {
+        ctx.logger?.warn?.('[dsh-venery] 模型上下文溢出：已通过 ctx.compaction 压缩历史，正在重试')
+        return { kind: 'retry' }
+      }
+    } catch (error) {
+      ctx.logger?.warn?.(`[dsh-venery] 上下文溢出压缩失败：${error && error.message ? error.message : error}`)
+    }
+    return next()
+  }, { prepend: true }))
   /* 花名册开机先读：历史正文里的 a7 才能翻回名字 */
   void squad.loadRoster().catch(() => {})
   ctx.effect(() => brief.install())
@@ -8178,7 +10300,7 @@ export function apply(ctx, config = {}) {
     } catch { /* 校正失败不影响启动 */ }
   })()
   registerTools(ctx, store, cfg, bindings, configStore, trace, actorForTool, browsers, meeting, squad)
-  registerCollabTools(ctx, { store, cfg, configStore, hub, board, tasks, squad, browser, automation, cockpit, bindings, browsers, meeting, runner, audit })
+  registerCollabTools(ctx, { store, cfg, configStore, hub, board, tasks, squad, browser, automation, cockpit, bindings, browsers, meeting, runner, audit, trace })
 
   /* 内置 bash 工具同样纳入「所有命令留痕」 */
   ctx.effect(() => ctx.on('tools/result', (exec, result) => {
@@ -8278,7 +10400,7 @@ export function apply(ctx, config = {}) {
     return () => clearInterval(timer)
   })
 
-  const deps = { store, cfg, configStore, hub, cockpit, mcp, board, tasks, trace, squad, browser, automation, meeting, runner, audit, ctx, browsers, brief }
+  const deps = { store, cfg, configStore, hub, cockpit, mcp, board, tasks, trace, squad, browser, automation, meeting, runner, audit, ctx, browsers, brief, customModels }
 
   ctx.inject(['webServer'], (host) => {
     host.effect(() => host.webServer.register({
@@ -8306,23 +10428,39 @@ export function apply(ctx, config = {}) {
       path: '/recon/asset',
       handler: async (req, res) => {
         if (req.method !== 'GET') { sendJson(res, 405, { ok: false, error: 'GET only' }); return }
+        if (!sameOrigin(req)) { sendJson(res, 403, { ok: false, error: 'cross-origin 被拒绝' }); return }
         let pathname = ''
         try { pathname = new URL(req.url || '/', 'http://x').searchParams.get('p') || '' } catch { pathname = '' }
         const target = resolve(pathname)
-        const rootPath = resolve(cfg.root)
-        if (pathname === '' || !target.startsWith(`${rootPath}${sep}`)) {
-          sendJson(res, 403, { ok: false, error: '路径不在 recon 根目录内' })
+        /* 只允许展示浏览器截图和用户上传产物；config.json、browser state、
+           chat、commands、board 等派生数据不能通过这个只读口泄露。 */
+        const allowedRoots = [join(cfg.root, 'browser'), join(cfg.root, 'uploads')].map((root) => resolve(root))
+        const allowed = allowedRoots.some((root) => target === root || target.startsWith(`${root}${sep}`))
+        if (pathname === '' || !allowed) {
+          sendJson(res, 403, { ok: false, error: '路径不在可读取的 browser/uploads 目录内' })
           return
         }
         const lowerTarget = target.toLowerCase()
-        const type = lowerTarget.endsWith('.png') ? 'image/png'
+        const imageType = lowerTarget.endsWith('.png') ? 'image/png'
           : lowerTarget.endsWith('.jpg') || lowerTarget.endsWith('.jpeg') ? 'image/jpeg'
             : lowerTarget.endsWith('.webp') ? 'image/webp'
-              : lowerTarget.endsWith('.html') ? 'text/html; charset=utf-8'
-                : 'text/plain; charset=utf-8'
+              : lowerTarget.endsWith('.gif') ? 'image/gif'
+                : ''
+        const underBrowser = target.startsWith(`${resolve(cfg.root, 'browser')}${sep}`)
+        if (underBrowser && imageType === '') {
+          sendJson(res, 403, { ok: false, error: 'browser 目录只允许读取图片截图' })
+          return
+        }
         try {
           const body = await readFile(target)
-          res.writeHead(200, { 'content-type': type, 'cache-control': 'no-store', 'content-length': body.length })
+          const headers = {
+            'content-type': imageType || 'application/octet-stream',
+            'cache-control': 'no-store',
+            'content-length': body.length,
+            'x-content-type-options': 'nosniff',
+          }
+          if (imageType === '') headers['content-disposition'] = `attachment; filename="${encodeURIComponent(target.split(sep).pop() || 'download')}"`
+          res.writeHead(200, headers)
           res.end(body)
         } catch {
           sendJson(res, 404, { ok: false, error: '文件不存在' })
@@ -8345,7 +10483,7 @@ export function apply(ctx, config = {}) {
       host.effect(() => host.systemPrompt.section({
         name: 'venery',
         order: 4900,
-        text: [
+        text: () => withCommonPrompt(configStore.get(), [
           '## 狩猎（dsh-venery）',
           '',
           '本会话装有红队信息收集插件：所有采集结果都写进一份可视化图谱，用户在 Harness 侧栏「狩猎」页面实时查看（节点=资产，边=关系，菱形=漏洞，左右两栏滚动命令与漏洞，底部还有驾驶舱对话）。',
@@ -8360,7 +10498,10 @@ export function apply(ctx, config = {}) {
           '',
           '协作能力（多智能体并行）：',
           '- `recon_board`：团队看板。发现/猜想/任务/结论都写进去（kind + 节点/漏洞/命令引用），所有 Agent 共享。',
-          '- `recon_squad`：派独立 Agent 并行干活（role=commander/staff/scout/web/reverser/intranet/qa），不用等当前任务结束。',
+          '- `recon_squad`：派独立 Agent 并行干活（role=scout/web/reverser/intranet/qa 或临时角色），不用等当前任务结束；总指挥/参谋是常设席位，不能 spawn，要派活用 action=task。`action=group` 可把专业角色加入某个成员的小组。',
+          '- `recon_group`：执行成员遇到跨职责卡点时 `action=request` 请总指挥派专业角色；编组后 `action=ask` 串行求助并等待回复，组内消息共享；总指挥用 `action=close` 让全组各自交接后回收。',
+          '- `recon_memory`：读取全局记忆；只有总指挥/参谋可以 add，且只写项目概况、目标、环境、攻击手法、已确认漏洞、凭据等关键事实。',
+          '- `recon_skill`：列出/加载本机成熟技能（list/load），按角色 skills 指定的技能名读取完整正文，不要凭记忆猜用法。',
           '  spawn 时可指定 `name`（代号）、`prompt`（专属指令）、`skills`（点开哪些技能）、`asRole/roleName/rolePrompt`（临时开新兵种）。',
           '总指挥原则：能派就派。自己做扫描是最差选择，只在没有合适角色且一条命令能收尾时才亲自执行。',
           '- `recon_org`：看编制与在岗、招募（含 developer 之类临时角色）、回收、出作战简报。',
@@ -8369,6 +10510,7 @@ export function apply(ctx, config = {}) {
           '不要为了迁就内置清单把信息塞进 tech/note；新类型会自动配色并出现在图例与筛选里。',
           '职责边界：Web 页面操作与 Web 漏洞归 web 手；JS/APK/EXE 逆向归 reverser；内网横向/隧道/提权归 intranet；',
           '漏洞真伪与任务达标判定归 qa；方案与优先级归 staff；commander 只调度不亲自扫。',
+          '- `recon_nday`：信息收集手的指纹 Nday 检索（Exploit-DB + NVD）；探测到指纹后主动查，不必等指令；只查历史漏洞库、不对目标发包，候选先写看板、实测后才 recon_vuln。',
           '- `recon_browser`：真实浏览器（Playwright+Chromium）打开页面、点击、填表、截图，登录态按靶标持久化。',
           '- `recon_asset_remove`：发现连错/判断错时归档或删除节点，并在看板留原因。',
           '- `recon_watch`：用一句话配事件触发（新资产→猎手、新漏洞→浏览器、命令结束→分析、定时巡检）。',
@@ -8377,7 +10519,7 @@ export function apply(ctx, config = {}) {
           '',
           '规矩：每条命令都留痕、每个资产都上图、每个结论都有 commandId 证据。',
           '用户在「狩猎」驾驶舱里也可能直接下指令，那是另一个执行者，共享同一份事实库。',
-        ].join('\n'),
+        ].join('\n')),
       }))
     })
   }
