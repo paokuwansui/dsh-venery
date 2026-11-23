@@ -4105,7 +4105,6 @@ class Board {
       text,
       refs: entry.refs || {},
       shots: Array.isArray(entry.shots) ? entry.shots : [],
-      status: entry.status || 'open',
     }
     rows.push(record)
     let merged = null
@@ -4206,7 +4205,6 @@ class Board {
       },
       /* 被压缩条目的截图路径不能丢：文字进摘要，图片仍可在页面上单独查看 */
       shots: Array.from(shots),
-      status: 'done',
     }
     const merged = [summary]
     for (const row of rest) merged.push(row)
@@ -4241,7 +4239,6 @@ class Board {
     const rows = await this.raw(engagementId)
     const row = rows.find((item) => item.id === id)
     if (row === undefined) throw new Error(`看板条目不存在：${id}`)
-    if (asText(patch.status) !== '') row.status = asText(patch.status)
     if (asText(patch.text) !== '') row.text = asText(patch.text)
     if (asText(patch.kind) !== '') row.kind = asText(patch.kind)
     await writeJsonAtomic(this.fileOf(engagementId), rows)
@@ -7670,7 +7667,7 @@ function makeHandler(deps) {
             return [...userRows, ...agentRows]
               .sort((a, b) => (Number(a.ts) || 0) - (Number(b.ts) || 0))
               .map((row) => ({
-                id: row.id, ts: row.ts, kind: row.kind, status: row.status,
+                id: row.id, ts: row.ts, kind: row.kind,
                 author: row.author, text: row.text, refs: row.refs, shots: row.shots,
               }))
           })(),
@@ -8842,7 +8839,7 @@ function registerCollabTools(ctx, deps) {
     name: 'recon_board',
     description:
       '团队看板：所有 Agent 共用的协同办公记录。发现（finding）、猜想（hypothesis）、任务（task）、结论（conclusion）、'
-      + '备注（note）都写这里，带节点/漏洞/命令引用，其他人立刻能看到。也可用来认领任务、更新状态。',
+      + '备注（note）都写这里，带节点/漏洞/命令引用，其他人立刻能看到。',
     parameters: {
       type: 'object',
       properties: {
@@ -8854,7 +8851,6 @@ function registerCollabTools(ctx, deps) {
         commandId: { type: 'string', description: '关联命令 id' },
         shots: { type: 'array', items: { type: 'string' }, description: '截图路径（recon_browser 返回的 shot）' },
         id: { type: 'string', description: 'update 时的条目 id' },
-        status: { type: 'string', enum: ['open', 'doing', 'done', 'dropped'], description: 'update 时的状态' },
         limit: { type: 'number', description: 'list 返回条数，默认 40' },
         engagement: { type: 'string', description: '靶标 id 或名称' },
       },
@@ -8872,14 +8868,14 @@ function registerCollabTools(ctx, deps) {
           return json({
             ok: true,
             entries: rows.map((row) => ({
-              id: row.id, kind: row.kind, status: row.status,
+              id: row.id, kind: row.kind,
               author: row.author, text: asText(row.text), refs: row.refs, shots: row.shots,
             })),
           })
         }
         if (asText(args.action) === 'update' || asText(args.action) === 'edit') {
           const row = await board.update(eng.id, asText(args.id), args)
-          return json({ ok: true, entry: { id: row.id, status: row.status, kind: row.kind, text: shortText(row.text, 400) } })
+          return json({ ok: true, entry: { id: row.id, kind: row.kind, text: shortText(row.text, 400) } })
         }
         if (asText(args.action) === 'remove') {
           return json(await board.remove(eng.id, asText(args.id)))

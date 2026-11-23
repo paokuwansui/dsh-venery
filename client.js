@@ -3602,13 +3602,6 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
               className: 'rc2-zoom', title: '放大到中央',
               onClick: (event) => { event.stopPropagation(); openSpot('board', entry.id) },
             }, '⤢'),
-            ['doing', 'done'].map((status) => h('button', {
-              key: status,
-              className: `rc2-fchip${entry.status === status ? ' on' : ''}`,
-              onClick: async () => {
-                await api({ op: 'board.update', id: entry.id, status, engagement: engagement ? engagement.id : undefined })
-              },
-            }, status === 'doing' ? '进行中' : '已完成')),
             h('button', {
               className: 'rc2-fchip',
               onClick: () => { void navigator.clipboard?.writeText(entry.text || '') },
@@ -4540,7 +4533,6 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
           kvs.push(['作者', (brd.author && brd.author.name) || '-'])
           kvs.push(['类型', kindLabel(brd.kind)])
           if (brd.ts) kvs.push(['时间', fmtTime(new Date(brd.ts).toISOString())])
-          if (brd.status) kvs.push(['状态', brd.status])
           const refs = brd.refs || {}
           for (const key of ['nodeIds', 'vulnIds', 'commandIds']) {
             if (Array.isArray(refs[key]) && refs[key].length > 0) kvs.push([key, refs[key].join(', ')])
