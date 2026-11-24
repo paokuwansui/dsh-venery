@@ -434,12 +434,8 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
 .rc2-trace-head{display:flex;align-items:center;gap:5px;font-size:10.5px;color:var(--dsw-alias-fg-3)}
 .rc2-tk{font-size:9.5px;padding:0 4px;border-radius:3px;border:1px solid transparent;white-space:nowrap}
 .rc2-trace-actor{font-size:10.5px;font-weight:600;max-width:96px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.rc2-trace-title{font-size:11.5px;color:var(--dsw-alias-fg-1);line-height:1.45;
-  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word}
-.rc2-trace.open .rc2-trace-title{-webkit-line-clamp:unset}
-.rc2-trace-detail{font-size:11px;color:var(--dsw-alias-fg-3);white-space:pre-wrap;word-break:break-word;line-height:1.55;
-  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
-.rc2-trace.open .rc2-trace-detail{-webkit-line-clamp:unset;max-height:340px;overflow:auto}
+.rc2-trace-title{font-size:11.5px;color:var(--dsw-alias-fg-1);line-height:1.45;white-space:pre-wrap;word-break:break-word}
+.rc2-trace-detail{font-size:11px;color:var(--dsw-alias-fg-3);white-space:pre-wrap;word-break:break-word;line-height:1.55;max-height:340px;overflow:auto}
 .rc2-trace-refs{display:flex;flex-wrap:wrap;gap:4px;margin-top:2px}
 .rc2-spotrel{border-top:1px dashed var(--dsw-alias-border-l1);padding-top:8px;display:flex;flex-direction:column;gap:3px}
 .rc2-relrow{display:flex;align-items:center;gap:6px;width:100%;text-align:left;padding:4px 6px;border-radius:4px;
@@ -569,7 +565,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
   flex:0 0 auto}
 .rc2-thinklabel{flex:0 0 auto;letter-spacing:.12em;text-transform:uppercase;opacity:.72}
 .rc2-thinkpeek{flex:1 1 auto;min-width:0;font-family:ui-monospace,Menlo,monospace;font-size:10.5px;
-  color:inherit;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.9}
+  color:inherit;white-space:pre-wrap;word-break:break-word;opacity:.9}
 .rc2-meetingbar{display:flex;align-items:center;gap:8px;padding:5px 10px;margin-bottom:6px;
   border-radius:5px;border:1px solid var(--dsw-alias-border-l1);font-size:11px;
   background:color-mix(in srgb,var(--rc-accent) 5%,transparent)}
@@ -718,11 +714,11 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
 .rc2-sqpill.running{color:#22d3ee;border-color:#22d3ee66;background:#22d3ee14}
 .rc2-sqpill.starting{color:#fbbf24;border-color:#fbbf2466}
 .rc2-sqpill.done{color:#34d399;border-color:#34d39955}
-.rc2-sqtask{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11.5px;color:var(--dsw-alias-label-secondary)}
+.rc2-sqtask{flex:1 1 auto;min-width:0;font-size:11.5px;color:var(--dsw-alias-label-secondary);white-space:pre-wrap;word-break:break-word}
 .rc2-sqacts{display:flex;align-items:center;gap:4px;flex:0 0 auto}
-.rc2-sqout{display:flex;align-items:center;gap:8px;padding:0 0 7px 14px;font-size:10.5px;color:var(--dsw-alias-label-secondary);overflow:hidden}
+.rc2-sqout{display:flex;align-items:flex-start;gap:8px;padding:0 0 7px 14px;font-size:10.5px;color:var(--dsw-alias-label-secondary)}
 .rc2-sqtool{flex:0 0 auto;font-family:ui-monospace,monospace;color:var(--rc-accent);opacity:.85}
-.rc2-sqtext{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;line-height:1.5;font-family:ui-monospace,monospace}
+.rc2-sqtext{flex:1 1 auto;min-width:0;line-height:1.5;font-family:ui-monospace,monospace;white-space:pre-wrap;word-break:break-word}
 .rc2-squadcard{border:1px solid var(--dsw-alias-border-l1);border-radius:6px;padding:7px 9px;background:var(--dsw-alias-bg-base)}
 .rc2-squadout{margin-top:5px;font-family:ui-monospace,Menlo,monospace;font-size:10.5px;line-height:1.6;
   color:var(--dsw-alias-label-secondary);white-space:pre-wrap;max-height:120px;overflow:auto}
@@ -1545,11 +1541,11 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
             setChat((prev) => ({ ...prev, messages: [], streaming: { text: '', reasoning: '' } }))
             setToolLines([])
           } else if (payload.type === 'board.post') {
-            setBoardEntries((prev) => (prev.some((row) => row.id === payload.entry.id) ? prev : [...prev, payload.entry].slice(-200)))
+            setBoardEntries((prev) => (prev.some((row) => row.id === payload.entry.id) ? prev : [...prev, payload.entry]))
           } else if (payload.type === 'board.update') {
             setBoardEntries((prev) => {
               const exists = prev.some((row) => row.id === payload.entry.id)
-              if (!exists) return [...prev, payload.entry].slice(-200)
+              if (!exists) return [...prev, payload.entry]
               return prev.map((row) => (row.id === payload.entry.id ? payload.entry : row))
             })
           } else if (payload.type === 'board.remove') {
@@ -1583,7 +1579,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
           } else if (payload.type === 'squad.delta') {
             if (payload.key === chatTargetKeyRef.current) setMemberStream((prev) => ({ ...prev, text: prev.text + payload.text }))
             setSquadMembers((prev) => prev.map((row) => (row.key === payload.key
-              ? { ...row, lastText: shortText(`${row.lastText || ''}${payload.text}`, 400), status: 'running' }
+              ? { ...row, lastText: `${row.lastText || ''}${payload.text}`, status: 'running' }
               : row)))
           } else if (payload.type === 'squad.tool') {
             setSquadMembers((prev) => prev.map((row) => (row.key === payload.key ? { ...row, lastTool: payload.name } : row)))
@@ -2926,7 +2922,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
             title: [`${row.label}${row.original !== '' && row.original !== row.label ? `（${row.original}）` : ''}${row.core ? ' · 常驻' : ''}`,
               row.running ? '状态：执行中'
                 : (row.core ? '状态：在岗待命（常驻席位）' : `状态：${row.status || '待机'}`),
-              row.task !== '' ? `任务：${shortText(row.task, 90)}` : ''].filter((line) => line !== '').join('\n'),
+              row.task !== '' ? `任务：${row.task}` : ''].filter((line) => line !== '').join('\n'),
           },
           h('i', { className: row.running ? 'pulse' : '', style: { background: row.color } }),
           row.label)))
@@ -3836,9 +3832,9 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
                   },
                 }, '驳回')),
               h('div', { className: 'rc2-boardtext' }, task.title),
-              task.goal ? h('div', { className: 'rc2-meta', style: { marginTop: 4 } }, `🎯 ${shortText(task.goal, 200)}`) : null,
-              task.acceptance ? h('div', { className: 'rc2-meta', style: { marginTop: 2 } }, `✅ 验收：${shortText(task.acceptance, 200)}`) : null,
-              task.note ? h('div', { className: 'rc2-meta', style: { marginTop: 2, color: 'var(--rc-danger)' } }, `📝 ${shortText(task.note, 200)}`) : null
+              task.goal ? h('div', { className: 'rc2-meta', style: { marginTop: 4 } }, `🎯 ${task.goal}`) : null,
+              task.acceptance ? h('div', { className: 'rc2-meta', style: { marginTop: 2 } }, `✅ 验收：${task.acceptance}`) : null,
+              task.note ? h('div', { className: 'rc2-meta', style: { marginTop: 2, color: 'var(--rc-danger)' } }, `📝 ${task.note}`) : null
             )
           }))
 
@@ -3900,7 +3896,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
                   : member.status === 'starting' ? t('agentStarting')
                     : member.status === 'done' ? t('agentDone') : t('agentIdle')),
             member.idleSince ? h('span', { className: 'rc2-meta' }, `${Math.max(0, Math.round((Date.now() - member.idleSince) / 60000))}m`) : null),
-          h('span', { className: 'rc2-sqtask', title: member.task || '' }, member.task ? `▸ ${shortText(member.task, 200)}` : '—'),
+          h('span', { className: 'rc2-sqtask', title: member.task || '' }, member.task ? `▸ ${member.task}` : '—'),
           h('span', { className: 'rc2-sqacts' },
             h('button', { className: 'rc2-btn ghost', title: '配置这名队员的专属 MCP', onClick: () => void editMemberMcp(member) }, 'MCP'),
             h('button', { className: 'rc2-btn ghost', onClick: () => void addMemberTask(member) }, t('squadAsk')),
@@ -3915,7 +3911,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
         const out = hasOut
           ? h('div', { className: 'rc2-sqout', title: `${member.lastTool || ''} ${member.lastText || ''}` },
             member.lastTool ? h('span', { className: 'rc2-sqtool' }, `⚙ ${shortText(member.lastTool, 40)}`) : null,
-            member.lastText ? h('span', { className: 'rc2-sqtext' }, shortText(member.lastText, 240)) : null)
+            member.lastText ? h('span', { className: 'rc2-sqtext' }, member.lastText) : null)
           : null
 
         return h('div', { key: member.key, className: 'rc2-sqcard' }, head, out)
@@ -4069,7 +4065,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
           return '队员状态：\n' + squadMembers.map((m) => {
             const state = m.status === 'running' ? '在跑' : (m.status === 'starting' ? '启动中' : '待命')
             return `· ${m.name}（${roleNameOf(m.role)}）${state}`
-              + (m.task ? `\n  任务：${shortText(m.task, 90)}` : '')
+              + (m.task ? `\n  任务：${m.task}` : '')
               + (m.lastTool ? `\n  最近：${shortText(m.lastTool, 60)}` : '')
           }).join('\n') + `\n共 ${squadMembers.length} 人，在跑 ${running} 人。`
         }
@@ -4089,7 +4085,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
           const doing = taskItems.filter((t2) => t2.status === 'doing').length
           const failed = taskItems.filter((t2) => t2.status === 'failed').length
           const recent = taskItems.slice(-4).reverse().map((t2) =>
-            `· [${t2.status}] ${shortText(t2.title, 56)}`)
+            `· [${t2.status}] ${t2.title}`)
           return `任务 ${taskStats.total}：待派 ${open} · 进行中 ${doing} · 通过 ${taskStats.passed} · 驳回 ${failed}\n`
             + (recent.length > 0 ? `最近：\n${recent.join('\n')}` : '暂无任务记录。')
         }
@@ -4107,7 +4103,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
           const recent = (boardEntries || []).slice(-5).reverse()
           if (recent.length === 0) return '看板还没有内容。'
           return '最近看板：\n' + recent.map((entry) =>
-            `· [${entry.kind}] ${shortText(entry.text || '', 70)}`).join('\n')
+            `· [${entry.kind}] ${entry.text || ''}`).join('\n')
         }
 
         if (/命令|执行|跑了|留痕/.test(q)) {
@@ -4505,7 +4501,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
         const brd = spot.kind === 'board' ? boardEntries.find((e) => e.id === spot.id) : undefined
         const historyCommand = spot.kind === 'command' && cmd === undefined
         if (cmd === undefined && vul === undefined && brd === undefined && historyCommand === false) return null
-        const title = cmd ? cmd.command : vul ? vul.title : brd ? shortText(brd.text || '', 140) : `命令 ${spot.id}`
+        const title = cmd ? cmd.command : vul ? vul.title : brd ? (brd.text || '') : `命令 ${spot.id}`
         const kvs = []
         if (cmd) {
           kvs.push(['退出码', cmd.exitCode === null || cmd.exitCode === undefined ? '…' : String(cmd.exitCode)])
@@ -4794,11 +4790,11 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
           ? h('div', {
             className: 'rc2-thinkrow',
             title: showThinking
-              ? shortText(reasoningLine || chat.streaming.text, 600)
+              ? (reasoningLine || chat.streaming.text)
               : t('thinkingCollapsed'),
           },
           h('span', { className: 'rc2-thinklabel' }, '主 agent 输出'),
-          h('span', { className: 'rc2-thinkpeek' }, shortText(reasoningLine || chat.streaming.text, 400)))
+          h('span', { className: 'rc2-thinkpeek' }, reasoningLine || chat.streaming.text))
           : null,
         dockOpen ? dockBody : null,
         queueBar,

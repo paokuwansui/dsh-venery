@@ -2354,7 +2354,6 @@ class Cockpit {
   pushMessage(engagementId, message) {
     const list = this.transcriptOf(engagementId)
     list.push(message)
-    if (list.length > 600) list.splice(0, list.length - 600)
     this.scheduleSave(engagementId)
   }
 
@@ -2423,7 +2422,7 @@ class Cockpit {
         lines.push('')
         lines.push('未闭环任务：')
         for (const row of open.slice(-12)) {
-          lines.push(`- ${row.id} [${row.role}/${row.status}] ${row.title}｜验收：${shortText(row.acceptance || '-', 60)}`)
+          lines.push(`- ${row.id} [${row.role}/${row.status}] ${row.title}｜验收：${row.acceptance || '-'}`)
         }
       }
       const failed = taskRows.filter((row) => row.status === 'failed')
@@ -2754,11 +2753,11 @@ class Cockpit {
       lines.push('【调度台提醒】任务账本有新情况，先处理这些再继续别的事：')
       if (failed.length > 0) {
         lines.push(`被验收驳回 ${failed.length} 条：`)
-        for (const row of failed.slice(-6)) lines.push(`- ${row.id} ${row.title}｜缺口：${shortText(row.note || '未达标', 120)}`)
+        for (const row of failed.slice(-6)) lines.push(`- ${row.id} ${row.title}｜缺口：${row.note || '未达标'}`)
       }
       if (mine.length > 0) {
         lines.push('等你重新拆解/分派：')
-        for (const row of mine.slice(-6)) lines.push(`- ${row.id} ${row.title}｜目标：${shortText(row.goal || '-', 100)}`)
+        for (const row of mine.slice(-6)) lines.push(`- ${row.id} ${row.title}｜目标：${row.goal || '-'}`)
       }
       lines.push('要求：读 `recon_task list` 确认状态；有返工就重新拆成可验收小任务并派给合适角色；')
       lines.push('成员完成后先安排 QA 核验证据，再决定是否通过；不要自己下场扫。')
@@ -2882,7 +2881,7 @@ class Cockpit {
             type: 'chat.tool',
             engagementId,
             name: event.data.name,
-            args: shortText(event.data.arguments, 240),
+            args: event.data.arguments,
           })
         } else if (event.type === 'tool/result') {
           const text = blocksText(event.data.message.content)
@@ -2890,7 +2889,7 @@ class Cockpit {
             type: 'chat.tool-result',
             engagementId,
             ok: event.data.error === undefined,
-            text: shortText(text, 240),
+            text,
           })
         } else if (event.type === 'assistant/message') {
           const blocks = event.data.message.content
@@ -2956,7 +2955,7 @@ class Cockpit {
               kind: 'chat',
               actor: { role: 'commander', name: '总指挥' },
               title: '总指挥回复',
-              detail: shortText(fullText || fullReasoning, 900),
+              detail: fullText || fullReasoning,
             })
           }
           state.lastSegment = undefined
@@ -3075,7 +3074,7 @@ class Brief {
   }
 
   async writeHistory(engagementId, rows) {
-    const kept = rows.slice(-120)
+    const kept = rows
     this.history.set(engagementId, kept)
     try {
       await mkdir(this.dir(), { recursive: true })
@@ -3358,7 +3357,7 @@ class Brief {
         if (user === null || user.role !== 'user') continue
         const answer = rows.slice(i + 1).find((row) => row && row.role === 'assistant')
         if (answer === undefined) continue
-        pairs.push(`Q：${shortText(asText(user.text).replace(/\s+/g, ' '), 180)}\nA：${shortText(asText(answer.text).replace(/\s+/g, ' '), 240)}`)
+        pairs.push(`Q：${asText(user.text)}\nA：${asText(answer.text)}`)
       }
       if (pairs.length > 0) {
         history = '\n\n<history>\n下面是你和指挥席之前的问答（上下文已换新会话，仅供你接续，不要复述）：\n'
@@ -4005,7 +4004,7 @@ class Board {
     const lines = []
     const options = boardOptions(this.configStore)
     lines.push('## 团队看板完整内容（强制阅读，不能只看最近几条）')
-    lines.push(`统计：用户 ${userRows.length} 条（无上限、永不压缩、单独计数）· agent ${agentRows.length} 条（上限 ${options.limit}，触顶后最早 ${options.mergeCount} 条压成摘要）。`)
+    lines.push(`统计：用户 ${userRows.length} 条 · agent ${agentRows.length} 条；全部正文完整保存，不自动压缩。`)
     lines.push('你必须完整阅读当前看板的全部文字；用户发言优先级最高。图片不在这里展开，按下方截图路径单独查看。')
     const renderRow = (row) => {
       const when = new Date(Number(row.ts) || Date.now()).toLocaleString('zh-CN')
@@ -4108,11 +4107,6 @@ class Board {
     }
     rows.push(record)
     let merged = null
-    /* 用户发言不计入上限：只有 agent 条目涨到阈值才合并 */
-    if (this.isUserEntry(record) === false) {
-      const agentRows = rows.filter((row) => this.isUserEntry(row) === false)
-      if (agentRows.length >= boardOptions(this.configStore).limit) merged = await this.compactInner(engagementId)
-    }
     await writeJsonAtomic(this.fileOf(engagementId), rows)
     try { this.hub.broadcast({ type: 'board.post', engagementId, entry: record }) } catch { /* 广播失败 */ }
     return merged === null ? record : { ...record, merged }
@@ -4317,17 +4311,14 @@ class Trace {
       ts: nowMs(),
       kind: asText(event.kind, 'event'),
       actor: event.actor || { role: 'system', name: '系统' },
-      title: shortText(asText(event.title, ''), 240),
+      title: asText(event.title, ''),
       detail: asText(event.detail),
       refs: event.refs || {},
       meta: event.meta || {},
     }
     rows.push(row)
-    const compacted = rows.length > 5000
-    if (compacted) rows.splice(0, rows.length - 5000)
     try {
-      if (compacted) await writeJsonLines(this.fileOf(engagementId), rows)
-      else await appendFile(this.fileOf(engagementId), `${JSON.stringify(row)}\n`, 'utf8')
+      await appendFile(this.fileOf(engagementId), `${JSON.stringify(row)}\n`, 'utf8')
     } catch { /* 落盘失败不影响 */ }
     try { this.hub.broadcast({ type: 'trace', engagementId, event: row }) } catch { /* 广播失败 */ }
     return row
@@ -4424,7 +4415,6 @@ class Tasks {
       verifiedAt: null,
     }
     rows.push(task)
-    while (rows.length > 600) rows.shift()
     await this.save(engagementId, rows)
     try { this.hub.broadcast({ type: 'task.created', engagementId, task }) } catch { /* 广播失败 */ }
     if (this.trace !== undefined && this.trace !== null) {
@@ -4776,7 +4766,6 @@ class Squad {
     const rows = this.transcripts.get(member.key)
     if (rows === undefined) return
     rows.push(record)
-    if (rows.length > 400) rows.splice(0, rows.length - 400)
     clearTimeout(this.saveTimers.get(member.key))
     this.saveTimers.set(member.key, setTimeout(() => {
       ensureDir(join(this.cfg.root, 'chat'))
@@ -5018,7 +5007,7 @@ class Squad {
       createdAt: group.createdAt,
       updatedAt: group.updatedAt,
       members,
-      messages: group.messages.slice(-200).map((message) => ({ ...message })),
+      messages: group.messages.map((message) => ({ ...message })),
     }
   }
 
@@ -5058,7 +5047,6 @@ class Squad {
       text: asText(message.text),
     })
     /* 小组消息是临时协作上下文，保留足够长的历史，防止单个小组无限膨胀 */
-    if (group.messages.length > 500) group.messages.splice(0, group.messages.length - 500)
     group.updatedAt = nowMs()
     this.hub.broadcast({ type: 'squad.group', engagementId: group.engagementId, group: this.groupView(group) })
     return group.messages[group.messages.length - 1]
@@ -5349,7 +5337,7 @@ class Squad {
         skills: Array.isArray(member.skills) ? member.skills : [],
         mcp: asMcpList(member.mcp),
         mcpError: asText(member.mcpError),
-        lastText: shortText(member.lastText, 400),
+        lastText: member.lastText,
         lastTool: member.lastTool,
         groupId: member.groupId || null,
         waitingFor: asText(member.waitingFor),
@@ -6031,7 +6019,7 @@ class Squad {
   await this.board.post(engagementId, {
         author: { role: 'system', name: '调度台' },
         kind: 'task',
-        text: `${name}（${role.name} · ${wantedTier} · ${origin === 'trigger' ? '事件触发' : '手动派发'}）开工：${shortText(asText(task), 400)}`,
+        text: `${name}（${role.name} · ${wantedTier} · ${origin === 'trigger' ? '事件触发' : '手动派发'}）开工：${asText(task)}`,
       })
     }
     if (asText(task) !== '') await this.taskByMember(member, task)
@@ -6053,7 +6041,7 @@ class Squad {
       task: member.task,
       startedAt: member.startedAt,
       idleSince: member.idleSince || null,
-      lastText: shortText(member.lastText, 400),
+      lastText: member.lastText,
       lastTool: member.lastTool,
       core: CORE_ROLES.has(member.role),
       sessionId: member.sessionId,
@@ -6278,7 +6266,7 @@ class Squad {
       kind: 'member',
       actor: { role: member.role, name: member.name },
       title: `${member.name} 离职交接`,
-      detail: shortText(body, 900),
+      detail: body,
       refs: { memberName: member.name, role: member.role },
     })
     return body
@@ -6340,7 +6328,6 @@ class Squad {
         const chunk = frame.chunk
         if (chunk.type === 'text-delta') {
           member.lastText = (member.lastText || '') + chunk.text
-          if (member.lastText.length > 4000) member.lastText = member.lastText.slice(-4000)
           this.hub.broadcast({ type: 'squad.delta', engagementId: member.engagementId, key: member.key, text: chunk.text })
         } else if (chunk.type === 'reasoning-delta') {
           this.hub.broadcast({ type: 'squad.reasoning', engagementId: member.engagementId, key: member.key, text: chunk.text })
@@ -6359,9 +6346,9 @@ class Squad {
             kind: 'result',
             actor: { role: member.role, name: member.name },
             title: `${okr ? '✓' : '✗'} ${event.data.name || 'tool'} 结果`,
-            detail: shortText(rt, 700),
+            detail: rt,
             refs: { memberName: member.name, role: member.role, tool: event.data.name },
-            meta: { ok: okr, out: shortText(rt, 600) },
+            meta: { ok: okr, out: rt },
           })
         } else if (event.type === 'tool/call') {
           member.lastTool = event.data.name
@@ -6371,7 +6358,7 @@ class Squad {
             engagementId: member.engagementId,
             key: member.key,
             name: event.data.name,
-            args: shortText(event.data.arguments, 240),
+            args: event.data.arguments,
           })
           if (event.data.name === 'recon_board') {
             try {
@@ -6391,7 +6378,7 @@ class Squad {
             kind: isSkill ? 'skill' : 'tool',
             actor: { role: member.role, name: member.name },
             title: isSkill ? `加载技能 ${skillName || '(未命名)'}` : `调用 ${event.data.name}`,
-            detail: shortText(event.data.arguments, 600),
+            detail: event.data.arguments,
             refs: { memberName: member.name, role: member.role },
           })
         } else if (event.type === 'assistant/message') {
@@ -6412,7 +6399,7 @@ class Squad {
               kind: 'chat',
               actor: { role: member.role, name: member.name },
               title: `${member.name} 汇报`,
-              detail: shortText(text || reasoning, 900),
+              detail: text || reasoning,
               refs: { memberName: member.name, role: member.role },
             })
             void this.transcriptOf(member).then(() => {
@@ -6440,7 +6427,7 @@ class Squad {
             void this.board.post(member.engagementId, {
               author: { role: member.role, name: member.name },
               kind: 'finding',
-              text: shortText(finished, 800),
+              text: finished,
             })
           }
           member.boardPosts = 0
@@ -6448,9 +6435,9 @@ class Squad {
              常设总指挥自己不是队员会话；普通成员每次派活只通知一次。 */
           if (finishedTask !== '' && member.role !== 'commander' && member.taskNotified !== true) {
             member.taskNotified = true
-            const report = shortText(asText(finished) || asText(member.lastAnswer), 700)
+            const report = asText(finished) || asText(member.lastAnswer)
             void this.cockpit?.nudge?.(member.engagementId,
-              `${member.name}（${member.role}）完成了派发任务：${shortText(finishedTask, 160)}${report !== '' ? `\n成员汇报：${report}` : ''}`,
+              `${member.name}（${member.role}）完成了派发任务：${finishedTask}${report !== '' ? `\n成员汇报：${report}` : ''}`,
               { always: true }).catch(() => {})
           }
           void this.refreshPrompt(member)
@@ -6793,7 +6780,7 @@ class Audit {
       kind: 'verdict',
       actor: { role: 'qa', name: '验收' },
       title: `审计 ${report.scope}：${report.verdictText}`,
-      detail: shortText(goal, 900),
+      detail: goal,
       refs: { taskId: task.id },
     })
     return { ok: true, task, report }
@@ -7655,15 +7642,14 @@ function makeHandler(deps) {
             /* 老数据里可能存过只有工具调用的空回复，读出来时滤掉，别让空气泡一直挂在界面上 */
             messages: transcript
               .filter((row) => row !== null && row !== undefined
-                && ((row.text || '') !== '' || (row.reasoning || '') !== ''))
-              .slice(-200),
+                && ((row.text || '') !== '' || (row.reasoning || '') !== '')),
           },
           /* 全量读出来算真实条数，再按显示上限切片：计数永远是真实值，不会在某个数上卡住 */
           /* agent 条目按上限切片；用户发言永不截断，和 agent 条目按时间合并回显。 */
           board: (() => {
             const limit = boardOptions(configStore).limit
             const userRows = boardAll.filter((row) => board.isUserEntry(row))
-            const agentRows = boardAll.filter((row) => board.isUserEntry(row) === false).slice(-limit)
+            const agentRows = boardAll.filter((row) => board.isUserEntry(row) === false)
             return [...userRows, ...agentRows]
               .sort((a, b) => (Number(a.ts) || 0) - (Number(b.ts) || 0))
               .map((row) => ({
@@ -8082,7 +8068,7 @@ function makeHandler(deps) {
         if (eng === undefined) { sendJson(res, 200, { ok: true, chat: null }); return }
         await browsers.restore(eng.id)
         const transcript = await cockpit.loadTranscript(eng.id)
-        sendJson(res, 200, { ok: true, chat: { ...cockpit.stateOf(eng.id), messages: transcript.slice(-200) } })
+        sendJson(res, 200, { ok: true, chat: { ...cockpit.stateOf(eng.id), messages: transcript } })
         return
       }
 
@@ -8224,15 +8210,6 @@ function makeHandler(deps) {
         const eng = await pick(engagementArg)
         if (eng === undefined) throw new Error('还没有靶标')
         sendJson(res, 200, await board.remove(eng.id, asText(body.id)))
-        return
-      }
-
-      if (op === 'board.compact') {
-        const eng = await pick(engagementArg)
-        if (eng === undefined) throw new Error('还没有靶标')
-        const merged = await board.compact(eng.id)
-        if (merged !== null) await board.persist(eng.id)
-        sendJson(res, 200, { ok: true, merged })
         return
       }
 
@@ -8699,7 +8676,7 @@ function makeHandler(deps) {
         const member = squad.members.get(key)
         if (member === undefined) throw new Error(`成员不存在：${key}`)
         const rows = await squad.transcriptOf(member)
-        sendJson(res, 200, { ok: true, messages: rows.slice(-200), member: squad.view(member) })
+        sendJson(res, 200, { ok: true, messages: rows, member: squad.view(member) })
         return
       }
 
@@ -8875,7 +8852,7 @@ function registerCollabTools(ctx, deps) {
         }
         if (asText(args.action) === 'update' || asText(args.action) === 'edit') {
           const row = await board.update(eng.id, asText(args.id), args)
-          return json({ ok: true, entry: { id: row.id, kind: row.kind, text: shortText(row.text, 400) } })
+          return json({ ok: true, entry: { id: row.id, kind: row.kind, text: row.text } })
         }
         if (asText(args.action) === 'remove') {
           return json(await board.remove(eng.id, asText(args.id)))
@@ -9860,8 +9837,8 @@ function registerCollabTools(ctx, deps) {
             stats: await tasks.stats(eng.id),
             tasks: filtered.map((row) => ({
               id: row.id, title: row.title, role: row.role, assignee: row.assignee || null,
-              status: row.status, goal: shortText(row.goal, 160), acceptance: shortText(row.acceptance, 160),
-              evidence: row.evidence, note: shortText(row.note, 200),
+              status: row.status, goal: row.goal, acceptance: row.acceptance,
+              evidence: row.evidence, note: row.note,
               verifiedBy: row.verifiedBy || null, verifiedAt: row.verifiedAt || null,
             })),
           })

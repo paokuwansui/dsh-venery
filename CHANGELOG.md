@@ -49,6 +49,7 @@
 - Web 手默认提示词增加强制目录/路由扫描和浏览器交互验证要求；信息收集手默认要求尽可能做全端口扫描；自动化默认开启，默认规则启用。
 - 自动化新增独立并发上限 `maxAutomationAgents`（默认 3），超过上限的触发任务进入内存队列，按空位顺序派发；控制台可配置并查看队列/运行数。
 - 新增 `recon_skill` 技能加载工具，支持 `$HOME/Public/skills`、`$DSH_HOME/skills`、`$DSH_HOME/redteam/skills`；配置角色级 skills 和 MCP，并用本地 MCP 服务验证了角色派发时的私有 MCP 挂载路径。
+- AI 对话、成员汇报、nudge 系统提醒、看板正文、任务目标/验收/备注、轨迹详情和前端主 agent 输出预览移除字符截断；对话/成员/汇报历史与看板不再自动裁剪或合并。
 - 强制指挥闭环：mission set 前必须有参谋方案；任务只能由总指挥创建；accept/reject 只能由 QA 执行并写入 verifiedBy=qa；成员完成后自动通知总指挥；QA 全部通过后强制通知总指挥，close 必须复核 QA 记录并停止/回收非核心队员。
 - 会议轮数/冷却时间持久化到 `meeting/<engagement>.json`。
 - 看板/任务写操作增加项目级串行锁；Trace 超限时重写文件而不是无限追加。
