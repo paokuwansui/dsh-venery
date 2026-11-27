@@ -449,11 +449,16 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
   border-bottom:1px solid var(--dsw-alias-border-l1);font-size:10.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--dsw-alias-label-secondary)}
 .rc2-railhead-title{flex:0 0 auto;white-space:nowrap}
 .rc2-railhead .rc2-spacer{flex:1 1 auto}
-.rc2-boardbar{display:flex;align-items:center;gap:6px;padding:4px 8px;flex:0 0 auto;flex-wrap:nowrap;
+.rc2-boardbar{display:flex;align-items:center;justify-content:flex-end;gap:6px;padding:5px 8px;flex:0 0 auto;flex-wrap:wrap;row-gap:4px;
   border-bottom:1px solid var(--dsw-alias-border-l1);min-width:0}
-.rc2-boardbar .rc2-select{flex:0 0 auto}
+.rc2-boardbar .rc2-select{flex:0 0 auto;height:24px!important;box-sizing:border-box}
 .rc2-boardbar .rc2-spacer{flex:1 1 auto}
-.rc2-boardwho{font-size:10px;line-height:16px;white-space:nowrap;flex:0 0 auto;max-width:130px;overflow:hidden;
+.rc2-boardbar-actions{display:flex;align-items:center;justify-content:flex-end;gap:6px;flex:0 1 auto;min-width:0;flex-wrap:wrap;margin-left:auto}
+.rc2-boardbar-actions .rc2-search{height:24px!important;box-sizing:border-box}
+.rc2-boardbar .rc2-row{margin-bottom:0;flex:0 0 auto;align-items:center}
+.rc2-boardbar .rc2-row .rc2-search{height:24px!important;width:64px!important;box-sizing:border-box}
+.rc2-boardbar .rc2-row .rc2-btn{height:24px!important;box-sizing:border-box;white-space:nowrap}
+.rc2-boardwho{display:inline-flex;align-items:center;height:24px;box-sizing:border-box;font-size:10px;line-height:1;white-space:nowrap;flex:0 0 auto;max-width:130px;overflow:hidden;
   text-overflow:ellipsis;padding:0 6px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1);
   color:var(--rc-accent);background:color-mix(in srgb,var(--rc-accent) 8%,transparent)}
 .rc2-railhead b{color:var(--rc-accent);font-weight:700}
@@ -1135,6 +1140,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
       const [boardTotal, setBoardTotal] = useState(0)
       const [boardAgentCount, setBoardAgentCount] = useState(0)
       const [boardUserCount, setBoardUserCount] = useState(0)
+      const [boardCompressCount, setBoardCompressCount] = useState(50)
       const [boardDraft, setBoardDraft] = useState('')
       const [boardKind, setBoardKind] = useState('finding')
       const [squadMembers, setSquadMembers] = useState([])
@@ -3565,8 +3571,21 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
           })) : null)
       }
 
+      const boardIsUserEntry = (entry) => Boolean(entry && entry.author && entry.author.role === 'user')
+      const boardEntrySummary = (entry) => {
+        if (boardIsUserEntry(entry)) return ''
+        const text = String(entry.text || '').replace(/\s+/g, ' ').trim()
+        const explicit = String(entry.summary || '').replace(/\s+/g, ' ').trim()
+        if (entry.refs && entry.refs.merged) return explicit || '📦 已压缩条目摘要'
+        if (explicit === '') return '（未提供有效概括，点“看正文”）'
+        const bodyPrefix = explicit.replace(/…$/g, '').trim()
+        if (explicit === text || (bodyPrefix.length >= 80 && text.startsWith(bodyPrefix))) return '（原概括是正文截断，点“看正文”）'
+        return explicit
+      }
       const boardRow = (entry) => {
         const authorRole = entry.author && entry.author.role ? entry.author.role : 'system'
+        const isUserEntry = boardIsUserEntry(entry)
+        const displayText = isUserEntry ? entry.text : boardEntrySummary(entry)
         const refs = entry.refs || {}
         const refButtons = []
         for (const nodeId of Array.isArray(refs.nodeIds) ? refs.nodeIds : []) {
@@ -3594,10 +3613,14 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
             h('span', { className: `rc2-kind k-${entry.kind}` }, kindLabel(entry.kind)),
             h('span', { className: 'rc2-meta' }, entry.ts ? fmtTime(new Date(entry.ts).toISOString()) : ''),
             h('span', { className: 'rc2-spacer' }),
+            !isUserEntry ? h('button', {
+              className: 'rc2-fchip', title: '用模型根据正文生成真正的概括',
+              onClick: (event) => { event.stopPropagation(); void summarizeBoardEntry(entry) },
+            }, '生成概括') : null,
             h('button', {
-              className: 'rc2-zoom', title: '放大到中央',
+              className: 'rc2-fchip', title: '查看完整正文',
               onClick: (event) => { event.stopPropagation(); openSpot('board', entry.id) },
-            }, '⤢'),
+            }, '看正文'),
             h('button', {
               className: 'rc2-fchip',
               onClick: () => { void navigator.clipboard?.writeText(entry.text || '') },
@@ -3622,7 +3645,8 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
                 void refresh(engagement ? engagement.id : undefined)
               },
             }, '删')),
-          h('div', { className: `rc2-boardtext${mdOn ? ' rc2-md' : ''}` }, entry.text ? mdOrText(entry.text, entry.id, mdOn) : ''),
+          h('div', { className: 'rc2-meta', style: { marginTop: 4 } }, isUserEntry ? '正文' : '概括'),
+          h('div', { className: `rc2-boardtext${mdOn ? ' rc2-md' : ''}` }, displayText ? mdOrText(displayText, entry.id, mdOn) : ''),
           mergedAuthorsBlock(entry),
           refButtons.length > 0 ? h('div', { className: 'rc2-refs' }, refButtons) : null,
           Array.isArray(entry.shots) && entry.shots.length > 0
@@ -3668,6 +3692,43 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
       const boardAuthorLabel = boardAuthor === 'all'
         ? `你 · ${boardUserPosts} 条`
         : `${boardAuthor} · ${boardAuthorCountOf(boardAuthor)} 条`
+      const manualCompactBoard = async () => {
+        if (engagement === null || engagement === undefined) return
+        const count = Math.max(1, Math.min(100000, Math.floor(Number(boardCompressCount) || 0)))
+        const res = await api({ op: 'board.compact', engagement: engagement.id, count })
+        if (!res || !res.ok) {
+          void uiAlert('手动压缩失败', res && res.error ? res.error : '未知错误')
+          return
+        }
+        if (res.merged === null) {
+          void uiAlert('没有可压缩的条目', res.note || '当前没有 agent 看板条目')
+          return
+        }
+        await refresh(engagement.id)
+      }
+      const summarizeBoardEntry = async (entry) => {
+        if (engagement === null || engagement === undefined) return
+        const res = await api({ op: 'board.summarize', engagement: engagement.id, id: entry.id })
+        if (!res || !res.ok) {
+          void uiAlert('生成概括失败', res && res.error ? res.error : '未知错误')
+          return
+        }
+        await refresh(engagement.id)
+      }
+      const boardCompactControls = h('div', { className: 'rc2-row', style: { gap: 4, flex: '0 0 auto' } },
+        h('input', {
+          className: 'rc2-search',
+          type: 'number', min: 1, max: 100000, step: 1,
+          style: { width: 62 },
+          value: boardCompressCount,
+          title: '手动压缩最早的 N 条 agent 看板，用户发言不会被压缩',
+          onChange: (event) => setBoardCompressCount(Math.max(1, Math.min(100000, Number(event.target.value) || 1))),
+        }),
+        h('button', {
+          className: 'rc2-btn ghost',
+          onClick: () => { void manualCompactBoard() },
+          title: '把输入数量的最早 agent 看板条目压成一条摘要；用户发言不会被压缩',
+        }, '手动压缩'))
       const boardFilterBar = h('div', { className: 'rc2-filterbar', style: { borderBottom: '1px solid var(--dsw-alias-border-l1)' } },
         h('input', {
           className: 'rc2-search', style: { width: 160, height: 22 },
@@ -3849,7 +3910,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
           .filter((entry) => {
             const needleBoard = boardQuery.trim().toLowerCase()
             if (needleBoard === '') return true
-            return `${entry.text || ''} ${(entry.author && entry.author.name) || ''} ${entry.kind}`.toLowerCase().includes(needleBoard)
+            return `${entry.text || ''} ${entry.summary || ''} ${(entry.author && entry.author.name) || ''} ${entry.kind}`.toLowerCase().includes(needleBoard)
           })
           .map(boardRow))
 
@@ -4029,11 +4090,13 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
             title: boardAuthor === 'all' ? `当前：全部发言（你的发言 ${boardUserPosts} 条）` : `当前只看：${boardAuthor}，共 ${boardAuthorCountOf(boardAuthor)} 条`,
           }, boardAuthorLabel),
           h('span', { className: 'rc2-spacer' }),
-          h('input', {
-            className: 'rc2-search', style: { width: 96, height: 20, fontSize: 10.5 },
-            value: boardQuery, placeholder: '搜索…',
-            onChange: (event) => setBoardQuery(event.target.value),
-          })),
+          h('div', { className: 'rc2-boardbar-actions' },
+            h('input', {
+              className: 'rc2-search', style: { width: 96, fontSize: 10.5 },
+              value: boardQuery, placeholder: '搜索…',
+              onChange: (event) => setBoardQuery(event.target.value),
+            }),
+            boardCompactControls)),
         h('div', { className: 'rc2-feed rc2-feed-grow', style: { flex: '1 1 auto', minHeight: 0 } },
           railMerged,
           rightBoardRows.length === 0 && railMerged === null
@@ -4909,7 +4972,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
       const [autoStatus, setAutoStatus] = useState(null)
       const [meetCfg, setMeetCfg] = useState({ stallMinutes: 20, gapMinutes: 20, maxRounds: 3 })
       const [handCfg, setHandCfg] = useState({ enabled: true, timeoutMs: 90000, keepSkill: true })
-      const [boardCfg, setBoardCfg] = useState({ limit: 100, mergeCount: 50 })
+      const [boardCfg, setBoardCfg] = useState({ limit: 100, mergeCount: 50, mergeMode: 'deterministic', mergeModel: 'fast' })
       const [traceCfg, setTraceCfg] = useState({ limit: 500 })
       const [traceMode, setTraceMode] = useState('500')
       const [rolesEdit, setRolesEdit] = useState(null)
@@ -4946,7 +5009,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
             setCfg(conf.config)
             setPresence(conf.keys || {})
             if (conf.config && conf.config.meeting) setMeetCfg({ ...{ stallMinutes: 20, gapMinutes: 20, maxRounds: 3 }, ...conf.config.meeting })
-            if (conf.config && conf.config.board) setBoardCfg({ ...{ limit: 100, mergeCount: 50 }, ...conf.config.board })
+            if (conf.config && conf.config.board) setBoardCfg((prev) => ({ ...prev, ...conf.config.board }))
             if (conf.config && conf.config.handover) setHandCfg({ ...{ enabled: true, timeoutMs: 90000, keepSkill: true }, ...conf.config.handover })
             if (conf.config && conf.config.trace) {
               const limit = [500, 1000, 2000].includes(Number(conf.config.trace.limit)) ? Number(conf.config.trace.limit) : Math.max(100, Math.min(5000, Number(conf.config.trace.limit) || 500))
@@ -5008,7 +5071,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
             setCfg(conf.config)
             setPresence(conf.keys || {})
             if (conf.config && conf.config.meeting) setMeetCfg({ ...{ stallMinutes: 20, gapMinutes: 20, maxRounds: 3 }, ...conf.config.meeting })
-            if (conf.config && conf.config.board) setBoardCfg({ ...{ limit: 100, mergeCount: 50 }, ...conf.config.board })
+            if (conf.config && conf.config.board) setBoardCfg((prev) => ({ ...prev, ...conf.config.board }))
             if (conf.config && conf.config.trace) {
               const limit = [500, 1000, 2000].includes(Number(conf.config.trace.limit)) ? Number(conf.config.trace.limit) : Math.max(100, Math.min(5000, Number(conf.config.trace.limit) || 500))
               setTraceCfg({ limit })
@@ -5471,7 +5534,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
                   value: String(boardCfg.limit || 100),
                   onChange: (e) => {
                     const limit = Number(e.target.value) || 100
-                    setBoardCfg({ limit, mergeCount: Math.min(boardCfg.mergeCount || 50, Math.max(10, Math.floor(limit / 2))) })
+                    setBoardCfg({ ...boardCfg, limit, mergeCount: Math.min(boardCfg.mergeCount || 50, Math.max(10, Math.floor(limit / 2))) })
                   },
                 }, ['50', '100', '200'].map((v) => h('option', { key: v, value: v }, `${v} 条`))),
                 h('select', {
@@ -5481,6 +5544,22 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
                 }, ['25', '50', '100'].filter((v) => Number(v) <= Math.max(10, Math.floor((boardCfg.limit || 100) / 2)))
                   .map((v) => h('option', { key: v, value: v }, `合并最早 ${v} 条`))),
                 h('span', { className: 'rc2-meta' }, `当前：满 ${boardCfg.limit || 100} 条 → 最早 ${Math.min(boardCfg.mergeCount || 50, Math.max(10, Math.floor((boardCfg.limit || 100) / 2)))} 条压成一条摘要`))),
+            h('div', { className: 'rc2-grid2', style: { marginTop: 10 } },
+              h('div', { className: 'rc2-field' }, h('label', null, '看板合并方式'),
+                h('select', {
+                  className: 'rc2-select rc2-boardcfg-select rc2-boardcfg-select-wide',
+                  style: { width: '100%', minWidth: 220 },
+                  value: boardCfg.mergeMode === 'ai' ? 'ai' : 'deterministic',
+                  onChange: (e) => setBoardCfg({ ...boardCfg, mergeMode: e.target.value === 'ai' ? 'ai' : 'deterministic' }),
+                }, h('option', { value: 'deterministic' }, '无 AI：确定性归档汇总'), h('option', { value: 'ai' }, 'AI 语义合并'))),
+              h('div', { className: 'rc2-field' }, h('label', null, 'AI 合并模型'),
+                h('select', {
+                  className: 'rc2-select rc2-boardcfg-select rc2-boardcfg-select-wide',
+                  style: { width: '100%', minWidth: 220 },
+                  value: boardCfg.mergeModel === 'deep' ? 'deep' : 'fast',
+                  disabled: boardCfg.mergeMode !== 'ai',
+                  onChange: (e) => setBoardCfg({ ...boardCfg, mergeModel: e.target.value === 'deep' ? 'deep' : 'fast' }),
+                }, h('option', { value: 'fast' }, 'Flash / 快速'), h('option', { value: 'deep' }, '深度 / Deep')))),
             h('div', { className: 'rc2-grid3', style: { marginTop: 10 } },
               h('div', { className: 'rc2-field' }, h('label', null, t('handoverEnabled')),
                 h('select', {

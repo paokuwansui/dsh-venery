@@ -129,6 +129,8 @@ const DEFAULT_CONFIG = {
   chat: { tier: 'deep', history: 200 },
   /** 全员会议：多久没新信息算停滞、同一项目开会冷却、最多自动开几轮。 */
   meeting: { stallMinutes: 20, gapMinutes: 20, maxRounds: 3 },
+  /** 看板：达到上限后的合并方式；AI 语义合并模型档位固定无思考。 */
+  board: { limit: 100, mergeCount: 50, mergeMode: 'deterministic', mergeModel: 'fast' },
   /** 轨迹面板最高显示条数（控制台可配置 500/1000/2000/自定义）。 */
   trace: { limit: 500 },
   /** 离职交接：成员被释放前是否先产出交接（发现/经验/坑/技巧），写进看板。 */
@@ -184,11 +186,22 @@ function commonPromptOf(config) {
   return asText(prompt && prompt.common)
 }
 
+const BOARD_WRITING_RULES = [
+  '## 看板写入规则（所有 agent 必须遵守）',
+  '- 写 agent 看板必须分两层：`summary` 是**概括索引**，`text` 是**完整正文**。',
+  '- `summary`：必须是语义提炼，写清对象/位置/结论/下一步；禁止直接复制正文、截断正文或只写空泛的“有发现”。',
+  '- `text`：写完整证据、命令 commandId、判断、影响、限制和下一步；禁止用概括冒充正文。',
+  '- 所有 agent 发看板必须同时提供 `summary` 和 `text`。用户看板条目只有正文，不需要 summary。',
+  '- 读取看板时默认只拿到概括；需要正文必须用 `recon_board action=view id=...` 按 id 查看。',
+  '- 截图只写 `shots` 路径，不在 summary/text 内嵌图片。',
+].join('\n')
+
 function withCommonPrompt(config, own) {
   const common = commonPromptOf(config)
   const text = String(own === undefined || own === null ? '' : own)
-  /* 通用提示词同样是用户输入：双花括号必须消毒，否则会破坏整个提示词模板 */
-  return common === '' ? text : `${safePromptText(common)}\n${text}`
+  const commonText = common === '' ? '' : safePromptText(common)
+  /* 通用提示词和看板写入规则都注入所有 agent；双花括号必须消毒。 */
+  return [commonText, BOARD_WRITING_RULES, text].filter((part) => part !== '').join('\n')
 }
 
 /** MCP 配置数组：保留对象结构，只丢掉空项与没名字的项。 */
@@ -2409,7 +2422,7 @@ class Cockpit {
     }
     /* 完整看板：所有 agent 必须看到全部文字，用户发言全文且无上限 */
     try {
-      const boardText = await boardPromptText(this.board, engagementId)
+      const boardText = await boardPromptText(this.board, engagementId, { actor: { key: 'lead' } })
       if (boardText !== '') {
         lines.push('')
         lines.push(boardText)
@@ -2430,25 +2443,6 @@ class Cockpit {
         lines.push(`有 ${failed.length} 条任务被验收驳回，优先处理返工。`)
       }
     } catch { /* 任务读取失败不影响对话 */ }
-    if (this.trace !== undefined && this.trace !== null) {
-      try {
-        const rows = await this.trace.list(engagementId, 1200)
-        let own = 0
-        let delegated = 0
-        for (const row of rows) {
-          if (row.kind !== 'command') continue
-          const role = (row.actor || {}).role || ''
-          if (role === 'lead' || role === 'commander' || role === 'user') own += 1
-          else delegated += 1
-        }
-        const total = own + delegated
-        if (total > 0) {
-          lines.push('')
-          lines.push(`下派率：${Math.round((delegated / total) * 100)}%（成员 ${delegated} 条 / 你自己 ${own} 条，共 ${total} 条命令）`)
-          if (delegated < own) lines.push('⚠️ 你自己跑得比队员多，这是不合格的指挥。下一步必须派活。')
-        }
-      } catch { /* 忽略 */ }
-    }
     const memory = Array.isArray(config.memory) ? config.memory : []
     if (memory.length > 0) {
       lines.push('')
@@ -2966,7 +2960,9 @@ class Cockpit {
             reason: event.data.reason && event.data.reason.kind ? event.data.reason.kind : 'completed',
           })
         }
-      } catch { /* 同上 */ }
+      } catch (error) {
+          /* 同上 */
+      }
     })
     const offStatus = ctx.on('agent/status', (payload) => {
       try {
@@ -3176,7 +3172,7 @@ class Brief {
 
     /* 完整看板：用户发言全文 + 全部 agent 条目全文 */
     try {
-      const boardText = await boardPromptText(this.board, engagementId)
+      const boardText = await boardPromptText(this.board, engagementId, { actor: { key: 'brief' } })
       if (boardText !== '') {
         lines.push('')
         lines.push(boardText)
@@ -3198,16 +3194,6 @@ class Brief {
       }
     } catch { /* 同上 */ }
 
-    /* 轨迹（派活 / 验收 / 开会） */
-    try {
-      const rows = await this.trace?.list?.(engagementId, 12)
-      if (Array.isArray(rows) && rows.length > 0) {
-        lines.push('最近动作：')
-        for (const row of rows.slice(-8)) {
-          lines.push(`  · ${asText(row.kind, '-')}｜${shortText(asText(row.title), 70)}｜${shortText(asText(row.detail).replace(/\s+/g, ' '), 90)}`)
-        }
-      }
-    } catch { /* 同上 */ }
 
     /* 停滞判定 */
     try {
@@ -3930,18 +3916,37 @@ function boardOptions(configStore) {
   const wantedMerge = [25, 50, 100].includes(Number(raw.mergeCount)) ? Number(raw.mergeCount) : BOARD_MERGE_COUNT
   /* 合并条数不能超过阈值的一半，否则一次合并就把看板清空 */
   const mergeCount = Math.min(wantedMerge, Math.max(10, Math.floor(limit / 2)))
-  return { limit, mergeCount }
+  const mergeMode = raw.mergeMode === 'ai' ? 'ai' : 'deterministic'
+  const mergeModel = ['deep', 'fast'].includes(asText(raw.mergeModel)) ? asText(raw.mergeModel) : 'fast'
+  return { limit, mergeCount, mergeMode, mergeModel }
+}
+
+/** 看板概括只接受真实 summary；禁止用正文截断伪造概括。 */
+function boardSummaryOf(row) {
+  if (row === null || row === undefined || typeof row !== 'object') return ''
+  if (row.author && row.author.role === 'user') return ''
+  const text = asText(row.text).replace(/\s+/g, ' ').trim()
+  const explicit = asText(row.summary).replace(/\s+/g, ' ').trim()
+  if (explicit === '') return ''
+  /* 压缩摘要本身既是概括也是正文，允许通过 merged 标记识别。 */
+  if (row.refs && row.refs.merged) return explicit
+  const bodyPrefix = explicit.replace(/…$/g, '').trim()
+  if (explicit === text || (bodyPrefix.length >= 80 && text.startsWith(bodyPrefix))) return ''
+  return explicit
 }
 
 class Board {
-  constructor(root, hub, configStore) {
+  constructor(root, hub, configStore, ctx) {
     this.root = root
     this.hub = hub
     this.configStore = configStore
+    this.ctx = ctx
     this.dir = join(root, 'board')
     this.cache = new Map()
     this.seq = 0
     this.locks = new Map()
+    /* agent 已经通过 view 看过的条目：后续该 agent 的提示词用正文替换概括。 */
+    this.viewed = new Map()
   }
 
   withLock(id, operation) {
@@ -3977,6 +3982,26 @@ class Board {
     return Array.isArray(rows) ? rows.length : 0
   }
 
+  viewedKey(engagementId, actor) {
+    if (actor && actor.kind === 'leader') return `${engagementId}:lead`
+    const key = actor && (actor.key || actor.name || actor.role) ? String(actor.key || actor.name || actor.role) : 'lead'
+    return `${engagementId}:${key}`
+  }
+
+  markViewed(engagementId, actor, id) {
+    const key = this.viewedKey(engagementId, actor)
+    if (!this.viewed.has(key)) this.viewed.set(key, new Set())
+    this.viewed.get(key).add(asText(id))
+    if (this.viewed.get(key).size > 2000) {
+      const rows = Array.from(this.viewed.get(key))
+      this.viewed.set(key, new Set(rows.slice(-1000)))
+    }
+  }
+
+  viewedIdsOf(engagementId, actor) {
+    return this.viewed.get(this.viewedKey(engagementId, actor)) || new Set()
+  }
+
   /** 用户发言全量：永不合并、永不截断，单独按用户条数计算。 */
   directivesForPrompt(engagementId) {
     const rows = this.rawSync(engagementId)
@@ -3993,25 +4018,22 @@ class Board {
   }
 
   /**
-   * 所有 agent 强制读取的完整看板。
-   * 用户发言单列且全文；agent 条目全文；合并摘要也在其中。图片只给路径由 agent 单独查看。
+   * 看板上下文索引：用户发言正文完整注入；agent 条目只注入简短索引，
+   * 正文用 `recon_board action=view id=...` 按需查看。图片始终只给路径。
    */
-  promptText(engagementId) {
+  promptText(engagementId, options = {}) {
     const rows = this.rawSync(engagementId)
     if (!Array.isArray(rows) || rows.length === 0) return ''
     const userRows = rows.filter((row) => this.isUserEntry(row))
     const agentRows = rows.filter((row) => this.isUserEntry(row) === false)
+    const viewedIds = options && options.viewedIds instanceof Set
+      ? options.viewedIds
+      : (options && options.actor ? this.viewedIdsOf(engagementId, options.actor) : new Set())
     const lines = []
-    const options = boardOptions(this.configStore)
-    lines.push('## 团队看板完整内容（强制阅读，不能只看最近几条）')
-    lines.push(`统计：用户 ${userRows.length} 条 · agent ${agentRows.length} 条；全部正文完整保存，不自动压缩。`)
-    lines.push('你必须完整阅读当前看板的全部文字；用户发言优先级最高。图片不在这里展开，按下方截图路径单独查看。')
-    const renderRow = (row) => {
-      const when = new Date(Number(row.ts) || Date.now()).toLocaleString('zh-CN')
-      const who = row.author && row.author.name ? row.author.name : '?'
-      lines.push('')
-      lines.push(`### [${asText(row.kind, 'note')}] ${who} · ${when} · ${asText(row.id, '')}`)
-      lines.push(safePromptText(asText(row.text)))
+    lines.push('## 团队看板概括索引（强制阅读）')
+    lines.push(`统计：用户 ${userRows.length} 条（正文全部注入、无上限）· agent ${agentRows.length} 条（只注入概括索引，正文按需查看）。`)
+    lines.push('用户发言优先级最高，必须完整阅读。agent 正文不要凭空猜测；需要细节时用 `recon_board action=view id=条目ID` 获取全文。图片只给路径，需要时单独查看。')
+    const renderMeta = (row) => {
       const refs = row.refs && typeof row.refs === 'object' ? row.refs : {}
       const refParts = []
       for (const key of ['nodeIds', 'vulnIds', 'commandIds']) {
@@ -4019,18 +4041,41 @@ class Board {
       }
       if (refParts.length > 0) lines.push(`引用：${refParts.join('；')}`)
       const shots = Array.isArray(row.shots) ? row.shots : []
-      if (shots.length > 0) lines.push(`截图（需单独查看）：${shots.join(' | ')}`)
+      if (shots.length > 0) lines.push(`截图（仅路径，需要时单独查看）：${shots.join(' | ')}`)
       if (refs.merged && refs.merged.count !== undefined) lines.push(`本条为压缩摘要：压缩 ${refs.merged.count} 条（${asText(refs.merged.from)} → ${asText(refs.merged.to)}）`)
+    }
+    const renderUserRow = (row) => {
+      const when = new Date(Number(row.ts) || Date.now()).toLocaleString('zh-CN')
+      const who = row.author && row.author.name ? row.author.name : '?'
+      lines.push('')
+      lines.push(`### [${asText(row.kind, 'note')}] ${who} · ${when} · ${asText(row.id, '')}`)
+      lines.push(safePromptText(asText(row.text)))
+      renderMeta(row)
+    }
+    const renderAgentRow = (row) => {
+      const when = new Date(Number(row.ts) || Date.now()).toLocaleString('zh-CN')
+      const who = row.author && row.author.name ? row.author.name : '?'
+      lines.push('')
+      lines.push(`### [${asText(row.kind, 'note')}] ${who} · ${when} · ${asText(row.id, '')}`)
+      if (viewedIds.has(row.id)) {
+        lines.push('正文（已查看，已替代原概括）：')
+        lines.push(safePromptText(asText(row.text)))
+      } else {
+        const summary = boardSummaryOf(row)
+        lines.push(`概括：${summary === '' ? '⚠️ 未提供有效概括，请按 id 查看正文' : safePromptText(summary)}`)
+        lines.push(`查看正文：recon_board action=view id=${asText(row.id, '')}`)
+      }
+      renderMeta(row)
     }
     if (userRows.length > 0) {
       lines.push('')
-      lines.push('### 用户发言（永不压缩 / 无上限 / 单独计数）')
-      for (const row of userRows) renderRow(row)
+      lines.push('### 用户发言正文（永不压缩 / 无上限 / 单独计数）')
+      for (const row of userRows) renderUserRow(row)
     }
     lines.push('')
-    lines.push('### 团队 agent 看板条目（全部，含已压缩摘要）')
+    lines.push('### agent 看板简短索引（全部条目）')
     if (agentRows.length === 0) lines.push('（暂无 agent 看板条目）')
-    for (const row of agentRows) renderRow(row)
+    for (const row of agentRows) renderAgentRow(row)
     return lines.join('\n')
   }
 
@@ -4065,6 +4110,16 @@ class Board {
     return rows.slice(-limit)
   }
 
+  /** 按关键词检索看板概括和正文；返回命中的条目，正文仍由 view 读取。 */
+  async search(engagementId, query, limit = 50) {
+    const needle = asText(query).toLowerCase()
+    if (needle === '') return []
+    const rows = await this.raw(engagementId)
+    return rows
+      .filter((row) => `${asText(row.text)} ${boardSummaryOf(row)} ${asText(row.kind)} ${asText(row.author && row.author.name)}`.toLowerCase().includes(needle))
+      .slice(-Math.max(1, Math.min(1000, Number(limit) || 50)))
+  }
+
   /** 用户（指挥席本人）的看板发言：无上限、永不压缩、强制进所有 agent 上下文 */
   isUserEntry(row) {
     /* 只有「真人」经 board.post 写入的才算用户发言（role=user）。
@@ -4096,37 +4151,46 @@ class Board {
     if (text.trim() === '') throw new Error('看板内容不能为空')
     const rows = await this.raw(engagementId)
     this.seq += 1
+    const isUser = entry.author && entry.author.role === 'user'
     const record = {
       id: `b${nowMs().toString(36)}${this.seq}`,
       ts: nowMs(),
       author: entry.author || { role: 'system', name: '系统' },
       kind: entry.kind || 'note',
       text,
+      summary: isUser ? '' : boardSummaryOf({ author: entry.author, text, summary: entry.summary }),
       refs: entry.refs || {},
       shots: Array.isArray(entry.shots) ? entry.shots : [],
     }
     rows.push(record)
     let merged = null
+    /* 达到设定的 agent 条目上限时自动压缩最早一批；手动压缩按钮也走同一条链路。 */
+    if (this.isUserEntry(record) === false) {
+      const options = boardOptions(this.configStore)
+      const agentRows = rows.filter((row) => this.isUserEntry(row) === false)
+      if (agentRows.length >= options.limit) merged = await this.compactInner(engagementId, options.mergeCount)
+    }
     await writeJsonAtomic(this.fileOf(engagementId), rows)
     try { this.hub.broadcast({ type: 'board.post', engagementId, entry: record }) } catch { /* 广播失败 */ }
     return merged === null ? record : { ...record, merged }
   }
 
-  /** 到上限就把最早的 50 条压成一条摘要（保留 kind 统计、时间范围与引用 id）。 */
-  async compact(engagementId) {
-    return this.withLock(engagementId, () => this.compactInner(engagementId))
+  /** 手动把最早的 N 条 agent 看板压成一条摘要；用户发言永不参与合并。 */
+  async compact(engagementId, count) {
+    return this.withLock(engagementId, () => this.compactInner(engagementId, count))
   }
 
-  async compactInner(engagementId) {
+  async compactInner(engagementId, count) {
     const rows = await this.raw(engagementId)
     const options = boardOptions(this.configStore)
+    const wanted = Number.isFinite(Number(count)) ? Math.max(1, Math.min(100000, Math.floor(Number(count)))) : options.mergeCount
     /* 用户发言永不参与合并：先把它们摘出来，合并完按原时间顺序放回去 */
     const userRows = rows.filter((row) => this.isUserEntry(row))
     const agentRows = rows.filter((row) => this.isUserEntry(row) === false)
-    if (agentRows.length < options.limit) return null
-    const head = agentRows.slice(0, options.mergeCount)
+    if (agentRows.length === 0) return null
+    const head = agentRows.slice(0, Math.min(wanted, agentRows.length))
     if (head.length === 0) return null
-    const rest = agentRows.slice(options.mergeCount)
+    const rest = agentRows.slice(head.length)
     const byKind = {}
     const nodeIds = new Set()
     const vulnIds = new Set()
@@ -4141,7 +4205,7 @@ class Board {
       rec.count += Number(count) || 0
       for (const sample of Array.isArray(samples) ? samples : []) {
         if (asText(sample) === '' || rec.samples.length >= 2) continue
-        rec.samples.push(shortText(sample, 160))
+        rec.samples.push(asText(sample))
       }
       authors.set(key, rec)
     }
@@ -4161,7 +4225,7 @@ class Board {
         addAuthor((row.author && row.author.name) || '?', (row.author && row.author.role) || 'system', 1, [row.text])
       }
       if (kind === 'finding' && highlights.length < 3) {
-        highlights.push(`· ${(row.author && row.author.name) || '?'}：${shortText(row.text, 110)}`)
+        highlights.push(`· ${(row.author && row.author.name) || '?'}：${asText(row.text)}`)
       }
     }
     const span = `${new Date(Number(head[0].ts) || nowMs()).toLocaleString('zh-CN')} – ${new Date(Number(head[head.length - 1].ts) || nowMs()).toLocaleString('zh-CN')}`
@@ -4172,19 +4236,24 @@ class Board {
       .map((row) => `${row.name} ${row.count}`)
       .join(' / ')
     this.seq += 1
+    const aiMerged = await this.aiMergeHead(head, options)
+    const summaryText = aiMerged !== ''
+      ? `${aiMerged}\n\n---\n📦 已合并 ${head.length} 条看板（${span}）；构成：${kindText}；按人：${authorText || '-'}`
+      : [
+      `📦 **已合并 ${head.length} 条看板**（${span}）`,
+      `构成：${kindText}`,
+      authorText !== '' ? `按人：${authorText}` : '',
+      highlights.length > 0 ? `关键发现：\n${highlights.join('\n')}` : '',
+      `引用保留：节点 ${nodeIds.size} / 漏洞 ${vulnIds.size} / 命令 ${commandIds.size}（点下方标签可直接跳）`,
+    ].filter((line) => line !== '').join('\n')
     const summary = {
       id: `b${nowMs().toString(36)}${this.seq}`,
       /* 用被合并段的时间起点：按 ts 排序后它落回原位置，用户发言的时间线不会被打乱 */
       ts: Number(head[0].ts) || nowMs(),
       author: { role: 'system', name: '调度台' },
       kind: 'note',
-      text: [
-        `📦 **已合并 ${head.length} 条看板**（${span}）`,
-        `构成：${kindText}`,
-        authorText !== '' ? `按人：${authorText}` : '',
-        highlights.length > 0 ? `关键发现：\n${highlights.join('\n')}` : '',
-        `引用保留：节点 ${nodeIds.size} / 漏洞 ${vulnIds.size} / 命令 ${commandIds.size}（点下方标签可直接跳）`,
-      ].filter((line) => line !== '').join('\n'),
+      text: summaryText,
+      summary: summaryText,
       refs: {
         nodeIds: Array.from(nodeIds).slice(0, 12),
         vulnIds: Array.from(vulnIds).slice(0, 12),
@@ -4195,6 +4264,7 @@ class Board {
           to: head[head.length - 1].id,
           at: nowMs(),
           authors: Array.from(authors.values()),
+          entries: head,
         },
       },
       /* 被压缩条目的截图路径不能丢：文字进摘要，图片仍可在页面上单独查看 */
@@ -4229,11 +4299,96 @@ class Board {
     return this.withLock(engagementId, () => this.updateInner(engagementId, id, patch))
   }
 
+  /** AI 语义合并：把最早 N 条 agent 看板压成一段真正的语义摘要。 */
+  async aiMergeHead(head, options) {
+    if (options.mergeMode !== 'ai') return ''
+    const llm = this.ctx && typeof this.ctx.get === 'function' ? this.ctx.get('llm') : undefined
+    if (llm === undefined || llm === null || typeof llm.stream !== 'function') return ''
+    let selection = modelSelectionFor(this.ctx, this.configStore, options.mergeModel === 'deep' ? 'deep' : 'fast')
+    if (asText(selection.provider) === '' || asText(selection.model) === '') {
+      const fallback = this.ctx.get('agentDefaultModel')
+      if (fallback !== undefined && fallback !== null && typeof fallback.currentSelection === 'function') {
+        const current = fallback.currentSelection()
+        if (current !== undefined && current !== null) selection = { ...current }
+      }
+    }
+    if (asText(selection.provider) === '' || asText(selection.model) === '') return ''
+    const payload = head.map((row) => [
+      `[${asText(row.id)}] ${asText((row.author && row.author.name) || '?')} / ${asText(row.kind, 'note')}`,
+      asText(row.text),
+    ].join('\n')).join('\n\n---\n\n')
+    let out = ''
+    try {
+      const stream = llm.stream({
+        provider: asText(selection.provider),
+        model: asText(selection.model),
+        reasoningEffort: 'off',
+        system: '你是看板语义合并器。把多条看板合并成一段真正的语义摘要：保留对象、结论、证据 commandId、未闭环事项和下一步；不要逐条复述，不要编造，不要输出前后解释。只输出摘要正文。',
+        messages: [{ role: 'user', content: [{ type: 'text', text: `合并以下 ${head.length} 条看板：\n\n${payload}` }] }],
+        maxTokens: 1200,
+        temperature: 0.1,
+      })
+      for await (const chunk of stream) {
+        if (chunk && chunk.type === 'text-delta' && typeof chunk.text === 'string') out += chunk.text
+      }
+    } catch {
+      return ''
+    }
+    return asText(out)
+  }
+
+  /** 用一次独立 LLM 调用把已有正文提炼成真正的概括；正文永不改。 */
+  async summarizeEntry(engagementId, id) {
+    const rows = await this.raw(engagementId)
+    const row = rows.find((item) => item.id === asText(id))
+    if (row === undefined) throw new Error(`看板条目不存在：${id}`)
+    if (this.isUserEntry(row)) throw new Error('用户看板条目不需要概括')
+    const body = asText(row.text)
+    if (body === '') throw new Error('看板正文为空，无法生成概括')
+    const llm = this.ctx && typeof this.ctx.get === 'function' ? this.ctx.get('llm') : undefined
+    if (llm === undefined || llm === null || typeof llm.stream !== 'function') throw new Error('llm 服务不可用，无法生成概括')
+    let selection = modelSelectionFor(this.ctx, this.configStore, 'fast')
+    if (asText(selection.provider) === '' || asText(selection.model) === '') {
+      const fallback = this.ctx.get('agentDefaultModel')
+      if (fallback !== undefined && fallback !== null && typeof fallback.currentSelection === 'function') {
+        const current = fallback.currentSelection()
+        if (current !== undefined && current !== null) selection = { ...current }
+      }
+    }
+    if (asText(selection.provider) === '' || asText(selection.model) === '') throw new Error('没有可用模型，无法生成概括')
+    let summary = ''
+    try {
+      const stream = llm.stream({
+        provider: asText(selection.provider),
+        model: asText(selection.model),
+        system: '你是严格的看板概括器。只输出 1-3 句真正的语义概括，说明对象、位置、结论和下一步；禁止复制正文、禁止截断正文、禁止输出 Markdown 标题或前后解释。',
+        messages: [{ role: 'user', content: [{ type: 'text', text: `请概括以下看板正文：\n\n${body}` }] }],
+        maxTokens: 512,
+        temperature: 0.1,
+      })
+      for await (const chunk of stream) {
+        if (chunk && chunk.type === 'text-delta' && typeof chunk.text === 'string') summary += chunk.text
+      }
+    } catch (error) {
+      throw new Error(`生成概括失败：${error && error.message ? error.message : String(error)}`)
+    }
+    summary = summary.trim()
+    if (summary === '') throw new Error('模型没有返回概括')
+    row.summary = summary
+    await writeJsonAtomic(this.fileOf(engagementId), rows)
+    try { this.hub.broadcast({ type: 'board.update', engagementId, entry: row }) } catch { /* 忽略 */ }
+    return row
+  }
+
   async updateInner(engagementId, id, patch) {
     const rows = await this.raw(engagementId)
     const row = rows.find((item) => item.id === id)
     if (row === undefined) throw new Error(`看板条目不存在：${id}`)
     if (asText(patch.text) !== '') row.text = asText(patch.text)
+    if (Object.prototype.hasOwnProperty.call(patch, 'summary')) {
+      const isUser = this.isUserEntry(row)
+      row.summary = isUser ? '' : boardSummaryOf({ author: row.author, text: row.text, summary: patch.summary })
+    }
     if (asText(patch.kind) !== '') row.kind = asText(patch.kind)
     await writeJsonAtomic(this.fileOf(engagementId), rows)
     try { this.hub.broadcast({ type: 'board.update', engagementId, entry: row }) } catch { /* 同上 */ }
@@ -4242,25 +4397,32 @@ class Board {
 
   forget(engagementId) {
     this.cache.delete(engagementId)
+    const prefix = `${engagementId}:`
+    for (const key of Array.from(this.viewed.keys())) if (key.startsWith(prefix)) this.viewed.delete(key)
   }
 
   async recentText(engagementId, limit = 12) {
     const rows = await this.list(engagementId, limit)
     if (rows.length === 0) return ''
     return rows
-      .map((row) => `- [${row.kind}] ${row.author && row.author.name ? row.author.name : '?'}: ${shortText(safePromptText(row.text), 220)}`)
+      .map((row) => {
+        const summary = row.author && row.author.role === 'user' ? asText(row.text) : boardSummaryOf(row)
+        return `- [${row.kind}] ${row.author && row.author.name ? row.author.name : '?'}: ${safePromptText(summary === '' ? '（未提供有效概括）' : summary)}`
+      })
       .join('\n')
   }
 }
 
 
 /** 给 agent 的完整看板文本：用户发言全文 + 全部 agent 条目全文。 */
-async function boardPromptText(board, engagementId) {
+async function boardPromptText(board, engagementId, options = {}) {
   if (board === undefined || board === null) return ''
   try {
     await board.raw(engagementId)
-    return board.promptText(engagementId)
-  } catch { return '' }
+    return board.promptText(engagementId, options)
+  } catch {
+    return ''
+  }
 }
 
 /** 轨迹账（Trajectory）：谁在什么时候做了什么——调度、招募、技能、命令、图谱变更全部一条流。 */
@@ -5555,7 +5717,7 @@ class Squad {
 
     /* —— 完整看板（强制阅读：用户发言全文 + 全部 agent 条目全文）—— */
     if (this.board !== undefined && this.board !== null) {
-      const boardText = this.board.promptText(engagementId)
+      const boardText = this.board.promptText(engagementId, { actor: member })
       if (boardText !== '') { lines.push(''); lines.push(boardText) }
     }
 
@@ -5748,7 +5910,7 @@ class Squad {
       if (recentNodes.length > 0) lines.push(`最近资产：${recentNodes.join(' , ')}`)
     }
     /* 完整看板置顶注入：用户发言全文 + 所有 agent 条目全文 */
-    const boardText = await boardPromptText(this.board, engagementId)
+    const boardText = await boardPromptText(this.board, engagementId, { actor: member })
     if (boardText !== '') {
       lines.push('')
       lines.push(boardText)
@@ -5783,25 +5945,6 @@ class Squad {
         lines.push(`有 ${failed.length} 条任务被验收驳回，优先处理返工。`)
       }
     } catch { /* 任务读取失败不影响对话 */ }
-    if (this.trace !== undefined && this.trace !== null) {
-      try {
-        const rows = await this.trace.list(engagementId, 1200)
-        let own = 0
-        let delegated = 0
-        for (const row of rows) {
-          if (row.kind !== 'command') continue
-          const role = (row.actor || {}).role || ''
-          if (role === 'lead' || role === 'commander' || role === 'user') own += 1
-          else delegated += 1
-        }
-        const total = own + delegated
-        if (total > 0) {
-          lines.push('')
-          lines.push(`下派率：${Math.round((delegated / total) * 100)}%（成员 ${delegated} 条 / 你自己 ${own} 条，共 ${total} 条命令）`)
-          if (delegated < own) lines.push('⚠️ 你自己跑得比队员多，这是不合格的指挥。下一步必须派活。')
-        }
-      } catch { /* 忽略 */ }
-    }
     const memory = Array.isArray(config.memory) ? config.memory : []
     if (memory.length > 0) {
       lines.push('')
@@ -6591,7 +6734,7 @@ class Audit {
     this.configStore = configStore
   }
 
-  /** 从 sessionId 里取执行者代号（recon-squad-a19-xxxx → a19）。 */
+  /** 从 sessionId 里取执行者代号（recon-squad-<key>-xxxx → <key>）。 */
   keyOf(row) {
     const hit = /^recon-squad-(a\d+)-/.exec(asText(row.sessionId))
     return hit === null ? '' : hit[1]
@@ -7654,7 +7797,7 @@ function makeHandler(deps) {
               .sort((a, b) => (Number(a.ts) || 0) - (Number(b.ts) || 0))
               .map((row) => ({
                 id: row.id, ts: row.ts, kind: row.kind,
-                author: row.author, text: row.text, refs: row.refs, shots: row.shots,
+                author: row.author, text: row.text, summary: row.summary || boardSummaryOf(row), refs: row.refs, shots: row.shots,
               }))
           })(),
           boardLimit: boardOptions(configStore).limit,
@@ -7952,9 +8095,16 @@ function makeHandler(deps) {
         const patch = body.patch && typeof body.patch === 'object' ? { ...body.patch } : {}
         /* 看板阈值统一夹取：合并条数不超过上限的一半，避免一次合并清空看板 */
         if (patch.board !== undefined && patch.board !== null && typeof patch.board === 'object') {
-          const limit = [50, 100, 200].includes(Number(patch.board.limit)) ? Number(patch.board.limit) : 100
-          const wanted = [25, 50, 100].includes(Number(patch.board.mergeCount)) ? Number(patch.board.mergeCount) : 50
-          patch.board = { limit, mergeCount: Math.min(wanted, Math.max(10, Math.floor(limit / 2))) }
+          const currentBoard = configStore.get().board || {}
+          const limit = [50, 100, 200].includes(Number(patch.board.limit)) ? Number(patch.board.limit) : (Number(currentBoard.limit) || 100)
+          const wanted = [25, 50, 100].includes(Number(patch.board.mergeCount)) ? Number(patch.board.mergeCount) : (Number(currentBoard.mergeCount) || 50)
+          const mergeMode = patch.board.mergeMode === 'ai'
+            ? 'ai'
+            : (patch.board.mergeMode === 'deterministic' ? 'deterministic' : (currentBoard.mergeMode === 'ai' ? 'ai' : 'deterministic'))
+          const mergeModel = ['deep', 'fast'].includes(asText(patch.board.mergeModel))
+            ? asText(patch.board.mergeModel)
+            : (currentBoard.mergeModel === 'deep' ? 'deep' : 'fast')
+          patch.board = { limit, mergeCount: Math.min(wanted, Math.max(10, Math.floor(limit / 2))), mergeMode, mergeModel }
         }
         if (patch.models !== undefined && patch.models !== null && typeof patch.models === 'object' && Array.isArray(patch.models.custom)) {
           const prepared = await customModels.prepare(patch.models.custom)
@@ -8176,6 +8326,7 @@ function makeHandler(deps) {
           author: { role: 'user', name: asText(body.authorName, '你') },
           kind: asText(body.kind, 'note'),
           text: asText(body.text),
+          summary: asText(body.summary),
           refs: body.refs && typeof body.refs === 'object' ? body.refs : {},
           shots: asList(body.shots),
         })
@@ -8212,6 +8363,26 @@ function makeHandler(deps) {
         sendJson(res, 200, await board.remove(eng.id, asText(body.id)))
         return
       }
+      if (op === 'board.summarize') {
+        const eng = await pick(engagementArg)
+        if (eng === undefined) throw new Error('还没有靶标')
+        sendJson(res, 200, { ok: true, entry: await board.summarizeEntry(eng.id, asText(body.id)) })
+        return
+      }
+
+      if (op === 'board.compact') {
+        const eng = await pick(engagementArg)
+        if (eng === undefined) throw new Error('还没有靶标')
+        const merged = await board.compact(eng.id, Number(body.count))
+        if (merged === null) {
+          sendJson(res, 200, { ok: true, merged: null, note: '没有可压缩的 agent 看板条目' })
+          return
+        }
+        await board.persist(eng.id)
+        sendJson(res, 200, { ok: true, merged })
+        return
+      }
+
 
       /* ── 编队 ── */
 
@@ -8815,20 +8986,22 @@ function registerCollabTools(ctx, deps) {
   ctx.tools.register({
     name: 'recon_board',
     description:
-      '团队看板：所有 Agent 共用的协同办公记录。发现（finding）、猜想（hypothesis）、任务（task）、结论（conclusion）、'
-      + '备注（note）都写这里，带节点/漏洞/命令引用，其他人立刻能看到。',
+      '团队看板：所有 Agent 共用的协同办公记录。agent 写看板必须分两层：summary=概括索引，text=完整正文；'
+      + '发现（finding）、猜想（hypothesis）、任务（task）、结论（conclusion）、备注（note）都写这里，带节点/漏洞/命令引用，其他人立刻能看到。',
     parameters: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['post', 'list', 'update', 'edit', 'remove'], description: '默认 post；edit 改正文，remove 删除条目' },
+        action: { type: 'string', enum: ['post', 'list', 'view', 'search', 'summarize', 'update', 'edit', 'remove'], description: '默认 post；view 按 id 查看正文，search 按关键词检索，summarize 用模型生成真正概括，edit 改正文，remove 删除条目' },
         kind: { type: 'string', enum: ['finding', 'hypothesis', 'task', 'conclusion', 'note'], description: '条目类型' },
-        text: { type: 'string', description: '内容：写清证据、判断、下一步' },
+        text: { type: 'string', description: '正文内容：完整证据、判断、下一步' },
+        summary: { type: 'string', description: 'agent 条目的概括索引（必填）；不填会自动取正文首行；用户条目忽略' },
         node: { type: 'string', description: '关联节点 id 或 value' },
         vuln: { type: 'string', description: '关联漏洞 id' },
         commandId: { type: 'string', description: '关联命令 id' },
         shots: { type: 'array', items: { type: 'string' }, description: '截图路径（recon_browser 返回的 shot）' },
         id: { type: 'string', description: 'update 时的条目 id' },
-        limit: { type: 'number', description: 'list 返回条数，默认 40' },
+        query: { type: 'string', description: 'search 的关键词（匹配概括、正文、类型、作者）' },
+        limit: { type: 'number', description: 'list/search 返回条数，默认 40' },
         engagement: { type: 'string', description: '靶标 id 或名称' },
       },
       additionalProperties: false,
@@ -8839,20 +9012,48 @@ function registerCollabTools(ctx, deps) {
         const eng = await resolveEngagement(exec, args.engagement)
         const caller = callerOf(exec)
         if (asText(args.action, 'post') === 'list') {
-          /* 默认返回当前看板的全部条目；agent 必须能看到完整文字，不能只给最近 40 条摘要。 */
+          /* 默认返回全部条目；用户返回正文，agent 只返回概括索引，正文用 view 查看。 */
           const asked = Number.isFinite(args.limit) ? Math.max(1, Math.min(10000, Math.floor(args.limit))) : 0
           const rows = asked > 0 ? await board.list(eng.id, asked) : await board.list(eng.id, 1000000)
           return json({
             ok: true,
             entries: rows.map((row) => ({
               id: row.id, kind: row.kind,
-              author: row.author, text: asText(row.text), refs: row.refs, shots: row.shots,
+              author: row.author,
+              summary: boardSummaryOf(row),
+              text: row.author && row.author.role === 'user' ? asText(row.text) : '',
+              hasBody: !(row.author && row.author.role === 'user'),
+              refs: row.refs, shots: row.shots,
             })),
           })
         }
+        if (asText(args.action) === 'search') {
+          const rows = await board.search(eng.id, asText(args.query), Number(args.limit) || 50)
+          return json({
+            ok: true,
+            entries: rows.map((row) => ({
+              id: row.id, kind: row.kind, author: row.author,
+              summary: boardSummaryOf(row),
+              text: row.author && row.author.role === 'user' ? asText(row.text) : '',
+              hasBody: !(row.author && row.author.role === 'user'),
+              refs: row.refs, shots: row.shots,
+            })),
+          })
+        }
+        if (asText(args.action) === 'summarize') {
+          const row = await board.summarizeEntry(eng.id, asText(args.id))
+          return json({ ok: true, entry: { id: row.id, kind: row.kind, summary: boardSummaryOf(row), text: row.text } })
+        }
+        if (asText(args.action) === 'view') {
+          const rows = await board.list(eng.id, 1000000)
+          const row = rows.find((item) => item.id === asText(args.id))
+          if (row === undefined) throw new Error(`看板条目不存在：${asText(args.id)}`)
+          board.markViewed(eng.id, caller, row.id)
+          return json({ ok: true, entry: { id: row.id, kind: row.kind, author: row.author, text: row.text, refs: row.refs, shots: row.shots } })
+        }
         if (asText(args.action) === 'update' || asText(args.action) === 'edit') {
           const row = await board.update(eng.id, asText(args.id), args)
-          return json({ ok: true, entry: { id: row.id, kind: row.kind, text: row.text } })
+          return json({ ok: true, entry: { id: row.id, kind: row.kind, summary: boardSummaryOf(row), text: row.text } })
         }
         if (asText(args.action) === 'remove') {
           return json(await board.remove(eng.id, asText(args.id)))
@@ -8865,10 +9066,17 @@ function registerCollabTools(ctx, deps) {
         }
         if (asText(args.vuln) !== '') refs.vulnIds = [asText(args.vuln)]
         if (asText(args.commandId) !== '') refs.commandIds = [asText(args.commandId)]
+        const summary = asText(args.summary).replace(/\s+/g, ' ').trim()
+        const body = asText(args.text).replace(/\s+/g, ' ').trim()
+        const bodyPrefix = summary.replace(/…$/g, '').trim()
+        if (summary === '' || summary === body || (bodyPrefix.length >= 80 && body.startsWith(bodyPrefix))) {
+          throw new Error('agent 看板必须提供真正的概括 summary：要语义提炼对象/位置/结论/下一步，不能复制正文或截断正文；text 仍然写完整正文。')
+        }
         const entry = await board.post(eng.id, {
           author: caller,
           kind: asText(args.kind, 'note'),
           text: asText(args.text),
+          summary,
           refs,
           shots: asList(args.shots),
         })
@@ -9683,7 +9891,9 @@ function registerCollabTools(ctx, deps) {
           const current = configStore.get().board || {}
           const limit = [50, 100, 200].includes(Number(values.limit)) ? Number(values.limit) : (Number(current.limit) || 100)
           const wantedMerge = [25, 50, 100].includes(Number(values.mergeCount)) ? Number(values.mergeCount) : (Number(current.mergeCount) || 50)
-          patch.board = { limit, mergeCount: Math.min(wantedMerge, Math.max(10, Math.floor(limit / 2))) }
+          const mergeMode = values.mergeMode === 'ai' ? 'ai' : 'deterministic'
+          const mergeModel = ['deep', 'fast'].includes(asText(values.mergeModel)) ? asText(values.mergeModel) : (current.mergeModel === 'deep' ? 'deep' : 'fast')
+          patch.board = { limit, mergeCount: Math.min(wantedMerge, Math.max(10, Math.floor(limit / 2))), mergeMode, mergeModel }
         } else if (section === 'trace') {
           if (typeof values !== 'object' || Array.isArray(values)) throw new Error('trace 需要对象，如 {limit:1000}')
           const current = configStore.get().trace || {}
@@ -10137,7 +10347,7 @@ export function apply(ctx, config = {}) {
     } catch { /* 广播失败不影响落盘 */ }
   })
   /* 任务账本先于 cockpit / squad 构造：两者都持有同一份引用 */
-  const board = new Board(cfg.root, hub, configStore)
+  const board = new Board(cfg.root, hub, configStore, ctx)
   const trace = new Trace(cfg.root, hub)
   const tasks = new Tasks(cfg.root, hub, trace)
   const cockpit = new Cockpit(ctx, store, cfg, configStore, hub)
