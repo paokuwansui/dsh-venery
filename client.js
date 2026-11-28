@@ -62,9 +62,8 @@ window.__ModuleLoader__.load({
       return rows
     }
     const MODEL_PROTOCOLS = [
-      { id: 'openai-completions', label: 'OpenAI Compatible' },
-      { id: 'openai-responses', label: 'OpenAI Responses' },
-      { id: 'anthropic-messages', label: 'Anthropic Messages' },
+      { id: 'openai-completions', label: 'OpenAI 兼容 / Responses API' },
+      { id: 'anthropic-messages', label: 'Anthropic 兼容' },
     ]
 
     /* ───────────────────────── 文案 ───────────────────────── */
@@ -108,10 +107,10 @@ window.__ModuleLoader__.load({
         squadRoles: '队员岗位（可派遣）',
         tabAutomation: '并发与自动化', automationHint: '先设总并发与自动化独立并发上限；自动化任务超过自己的上限时会排队。下面配置事件触发规则。',
         tabMeeting: '轨迹会议与交接',
-        meetingHint: '轨迹最高显示数量；停滞多久算卡住、两次会议至少隔多久、最多自动开几轮；成员被释放前是否先写离职交接（落看板 + 沉淀记忆）。',
-        meetingStall: '停滞判定（分钟无新信息）', meetingGap: '会议冷却（分钟）', meetingRounds: '最多自动开几轮',
+        meetingHint: '轨迹最高显示数量；全员会议采用周期审查：任务活动期间每 N 分钟检查，只在只剩总指挥/参谋且都空闲时询问总指挥；回复 STUCK/卡壳才自动召开会议，mission close 后停止审查。',
+        meetingReview: '周期审查（分钟）', meetingRounds: '最多自动召开轮次',
         handoverEnabled: '离职交接', handoverTimeout: '交接等待上限（秒）', handoverSkill: '交接输出',
-        automationEnabled: '是否启用自动化', maxAgents: '最大并发数', maxAutomationAgents: '自动化独立并发上限', automationRules: '事件规则', ruleAdd: '加规则', ruleOn: '事件',
+        automationEnabled: '是否启用自动化', maxAgents: '最大成员数（总指挥/参谋除外）', maxAutomationAgents: '自动化独立并发上限', automationRules: '事件规则', ruleAdd: '加规则', ruleOn: '事件',
         ruleRole: '角色', ruleTier: '模型', ruleCooldown: '冷却(ms)', ruleTask: '任务模板', ruleKinds: '资产类型',
         kindFinding: '发现', kindHypothesis: '猜想', kindTask: '任务', kindConclusion: '结论', kindNote: '备注',
         tabModels: '模型', tabKeys: '密钥', tabRole: '角色与提示词', tabMemory: '记忆', tabSkills: '技能', tabMcp: 'MCP', tabUi: '外观',
@@ -122,7 +121,7 @@ window.__ModuleLoader__.load({
         mcpHint: 'stdio 填 command + args（逗号分隔）；streamable-http 填 url。保存后立即向 mcpManager 注册。',
         mcpStatus: 'MCP 运行时状态', noSkills: '没有可列出的技能', memoryEmpty: '还没有记忆条目',
         roleName: '角色名', mission: '使命', rules: '规则（每行一条）', extraPrompt: '驾驶舱附加指令（只影响 lead）',
-        customModels: '自定义模型', customModelsHint: '添加模型（Base URL + API Key + 模型 id + 协议）。保存后注册到 DSH；三档都留空时全部跟随 DSH。', addModel: '添加模型', apiKey: 'API Key', baseUrl: 'Base URL', modelId: '模型 id', thinkingDepth: '思考深度', protocol: '协议', savedKey: '已保存，留空不修改', needKey: '必填', keySaved: 'Key 已保存', keyMissing: 'Key 未保存', route: '路由',
+        customModels: '自定义模型', customModelsHint: '添加模型（名称 → Base URL → API Key → 协议 → 模型 id → 思考深度）。模型 id 可用「获取模型」自动从 /models 拉取；保存后注册到 DSH；三档都留空时全部跟随 DSH。', addModel: '添加模型', apiKey: 'API Key', baseUrl: 'Base URL', modelId: '模型 id', thinkingDepth: '思考深度', protocol: '协议', savedKey: '已保存，留空不修改', needKey: '必填', keySaved: 'Key 已保存', keyMissing: 'Key 未保存', route: '路由',
         accent: '主色', glow: '光晕', grid: '网格', scanlines: '扫描线', danger: 'danger',
         tierChanged: '已切换档位', nodesHidden: '隐藏', viewFull: '全屏', close: '关闭',
         userLabel: '你', aiLabel: '驾驶舱', toolLabel: '工具', copyCmd: '复制命令',
@@ -167,10 +166,10 @@ window.__ModuleLoader__.load({
         squadRoles: 'Member roles (dispatchable)',
         tabAutomation: 'Concurrency & automation', automationHint: 'Set total concurrency and the separate automation concurrency cap; excess automation jobs queue. Event rules follow below.',
         tabMeeting: 'Trace, meetings & handover',
-        meetingHint: 'Max trace rows to render; stall window, minimum meeting gap, max auto rounds, and whether releasing a member writes a handover first.',
-        meetingStall: 'Stall window (minutes)', meetingGap: 'Meeting cooldown (minutes)', meetingRounds: 'Max auto rounds',
+        meetingHint: 'Max trace rows to render; all-hands review runs every N minutes while a mission is active, only when commander/staff are the only idle seats; STUCK triggers a meeting, mission close stops reviews.',
+        meetingReview: 'Review interval (minutes)', meetingRounds: 'Max auto meeting rounds',
         handoverEnabled: 'Handover on release', handoverTimeout: 'Handover wait (seconds)', handoverSkill: 'Handover output',
-        automationEnabled: 'Automation enabled', maxAgents: 'Max concurrency', maxAutomationAgents: 'Automation concurrency cap', automationRules: 'Event rules', ruleAdd: 'Add rule', ruleOn: 'Event',
+        automationEnabled: 'Automation enabled', maxAgents: 'Max members (excluding core)', maxAutomationAgents: 'Automation concurrency cap', automationRules: 'Event rules', ruleAdd: 'Add rule', ruleOn: 'Event',
         ruleRole: 'Role', ruleTier: 'Model', ruleCooldown: 'Cooldown(ms)', ruleTask: 'Task template', ruleKinds: 'Asset kinds',
         kindFinding: 'finding', kindHypothesis: 'hypothesis', kindTask: 'task', kindConclusion: 'conclusion', kindNote: 'note',
         tabModels: 'Models', tabKeys: 'Keys', tabRole: 'Roles & prompts', tabMemory: 'Memory', tabSkills: 'Skills', tabMcp: 'MCP', tabUi: 'Look',
@@ -181,7 +180,7 @@ window.__ModuleLoader__.load({
         mcpHint: 'stdio: command + args (comma separated); streamable-http: url. Saved entries register immediately.',
         mcpStatus: 'MCP runtime', noSkills: 'No skills listed', memoryEmpty: 'No memory entries',
         roleName: 'Role', mission: 'Mission', rules: 'Rules (one per line)', extraPrompt: 'Cockpit extra instructions (lead only)',
-        customModels: 'Custom models', customModelsHint: 'Add a model (Base URL + API key + model id + protocol). It registers into DSH on save; empty tiers follow DSH.', addModel: 'Add model', apiKey: 'API Key', baseUrl: 'Base URL', modelId: 'Model id', thinkingDepth: 'Thinking depth', protocol: 'Protocol', savedKey: 'Saved — leave blank to keep', needKey: 'Required', keySaved: 'Key saved', keyMissing: 'Key missing', route: 'Route',
+        customModels: 'Custom models', customModelsHint: 'Add a model (name → Base URL → API key → protocol → model id → thinking depth). Use Fetch models to auto-load /models; it registers into DSH on save; empty tiers follow DSH.', addModel: 'Add model', apiKey: 'API Key', baseUrl: 'Base URL', modelId: 'Model id', thinkingDepth: 'Thinking depth', protocol: 'Protocol', savedKey: 'Saved — leave blank to keep', needKey: 'Required', keySaved: 'Key saved', keyMissing: 'Key missing', route: 'Route',
         accent: 'Accent', glow: 'Glow', grid: 'Grid', scanlines: 'Scanlines', danger: 'danger',
         tierChanged: 'tier changed', nodesHidden: 'hidden', viewFull: 'Full', close: 'Close',
         userLabel: 'You', aiLabel: 'Cockpit', toolLabel: 'tool', copyCmd: 'Copy',
@@ -578,7 +577,6 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
   color:var(--dsw-alias-label-secondary);opacity:.8}
 .rc2-mb-state{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
   color:var(--dsw-alias-label-secondary)}
-.rc2-mb-state.stall{color:#fb923c}
 .rc2-queue{flex:0 0 auto;border-top:1px dashed color-mix(in srgb,var(--rc-accent) 34%,transparent);
   background:color-mix(in srgb,var(--rc-accent) 5%,transparent);max-height:152px;display:flex;flex-direction:column}
 .rc2-queuehead{display:flex;align-items:center;gap:8px;padding:3px 10px;cursor:pointer;font-size:10.5px}
@@ -1116,7 +1114,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
       const [runnerInfo, setRunnerInfo] = useState({ phase: 'idle', running: 0, checkpoint: null })
       const [pausing, setPausing] = useState(false)
       const [resuming, setResuming] = useState(false)
-      const [meetingInfo, setMeetingInfo] = useState({ stalled: false, reason: '', round: 0 })
+      const [meetingInfo, setMeetingInfo] = useState({ round: 0, reviewActive: false, reviewMinutes: 5 })
       const [meetingBusy, setMeetingBusy] = useState(false)
       /* Markdown 渲染开关：默认开，用户可一键切回原文（记忆到 localStorage） */
       const [mdOn, setMdOn] = useState(() => {
@@ -2052,6 +2050,12 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
         return () => { alive = false; clearInterval(timer) }
       }, [loadRunner])
 
+      useEffect(() => {
+        if (runnerInfo.phase !== 'pausing') return undefined
+        const timer = setInterval(() => { void loadRunner() }, 1000)
+        return () => clearInterval(timer)
+      }, [runnerInfo.phase, loadRunner])
+
       const pauseRunner = useCallback(async () => {
         if (engagement === null) return
         setPausing(true)
@@ -2085,16 +2089,16 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
       }, [engagement, loadRunner])
 
       useEffect(() => {
-        if (engagement === null) { setMeetingInfo({ stalled: false, reason: '', round: 0 }); return }
+        if (engagement === null) { setMeetingInfo({ round: 0, reviewActive: false, reviewMinutes: 5 }); return }
         let alive = true
         const load = async () => {
           const res = await api({ op: 'meeting.status', engagement: engagement.id })
           if (!alive || !res || !res.ok) return
-          const verdict = res.verdict || {}
+          const meeting = res.meeting || {}
           setMeetingInfo({
-            stalled: verdict.stalled === true,
-            reason: Array.isArray(verdict.reasons) ? verdict.reasons.join('；') : '',
-            round: res.meeting ? res.meeting.round : 0,
+            round: meeting.round || 0,
+            reviewActive: meeting.reviewActive === true,
+            reviewMinutes: Number(meeting.reviewMinutes) || 5,
           })
         }
         void load()
@@ -2470,10 +2474,12 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
         engagement !== null && runnerInfo.phase !== 'paused'
           ? h('button', {
             className: 'rc2-btn ghost',
-            title: '停掉所有成员并把断点存下来；关机/断网后重新打开可以接着跑',
-            disabled: pausing || resuming,
+            title: '等待当前模型输出和工具执行结束后冻结，不再发起下一步模型请求',
+            disabled: pausing || resuming || runnerInfo.phase === 'pausing',
             onClick: () => void pauseRunner(),
-          }, pausing ? h('span', { className: 'rc2-busy' }, '◌ 中断中…') : '⏸ 中断')
+          }, (pausing || runnerInfo.phase === 'pausing')
+            ? h('span', { className: 'rc2-busy' }, '◌ 等待当前步骤结束…')
+            : '⏸ 中断')
           : null,
         engagement !== null && runnerInfo.phase === 'paused'
           ? h('button', {
@@ -3574,12 +3580,9 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
       const boardIsUserEntry = (entry) => Boolean(entry && entry.author && entry.author.role === 'user')
       const boardEntrySummary = (entry) => {
         if (boardIsUserEntry(entry)) return ''
-        const text = String(entry.text || '').replace(/\s+/g, ' ').trim()
         const explicit = String(entry.summary || '').replace(/\s+/g, ' ').trim()
         if (entry.refs && entry.refs.merged) return explicit || '📦 已压缩条目摘要'
         if (explicit === '') return '（未提供有效概括，点“看正文”）'
-        const bodyPrefix = explicit.replace(/…$/g, '').trim()
-        if (explicit === text || (bodyPrefix.length >= 80 && text.startsWith(bodyPrefix))) return '（原概括是正文截断，点“看正文”）'
         return explicit
       }
       const boardRow = (entry) => {
@@ -3812,9 +3815,12 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
 
       const meetingBar = h('div', { className: 'rc2-meetingbar' },
         h('span', { className: 'rc2-mb-label' }, '全员会议'),
-        h('span', { className: `rc2-mb-state${meetingInfo.stalled ? ' stall' : ''}` },
-          meetingInfo.stalled ? `检测到停滞：${shortText(meetingInfo.reason, 80)}`
-            : (meetingInfo.round > 0 ? `已召开 ${meetingInfo.round} 轮` : '未触发')),
+        h('span', { className: 'rc2-mb-state' },
+          runnerInfo.phase === 'paused' || runnerInfo.phase === 'pausing'
+            ? '项目已暂停 · 周期审查暂停'
+            : meetingInfo.reviewActive
+              ? `周期审查中 · 每 ${meetingInfo.reviewMinutes} 分钟`
+              : (meetingInfo.round > 0 ? `已召开 ${meetingInfo.round} 轮` : '未触发')),
         h('span', { className: 'rc2-spacer' }),
         h('button', {
           className: 'rc2-btn on',
@@ -4970,13 +4976,23 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
       const [mcpStatus, setMcpStatus] = useState(null)
       const [autoCfg, setAutoCfg] = useState(null)
       const [autoStatus, setAutoStatus] = useState(null)
-      const [meetCfg, setMeetCfg] = useState({ stallMinutes: 20, gapMinutes: 20, maxRounds: 3 })
+      const [meetCfg, setMeetCfg] = useState({ reviewMinutes: 5, maxRounds: 3 })
       const [handCfg, setHandCfg] = useState({ enabled: true, timeoutMs: 90000, keepSkill: true })
-      const [boardCfg, setBoardCfg] = useState({ limit: 100, mergeCount: 50, mergeMode: 'deterministic', mergeModel: 'fast' })
+      const [modelChoices, setModelChoices] = useState({})
+      const [manualModelRows, setManualModelRows] = useState({})
+      const [modelActionStatus, setModelActionStatus] = useState({})
+      const [boardCfg, setBoardCfg] = useState(() => {
+        try {
+          const saved = JSON.parse(window.localStorage.getItem('rc2.boardCfg') || 'null')
+          if (saved && typeof saved === 'object') return { limit: 100, mergeCount: 50, mergeMode: 'deterministic', mergeModel: 'fast', ...saved }
+        } catch { /* 忽略损坏的本地缓存 */ }
+        return { limit: 100, mergeCount: 50, mergeMode: 'deterministic', mergeModel: 'fast' }
+      })
       const [traceCfg, setTraceCfg] = useState({ limit: 500 })
       const [traceMode, setTraceMode] = useState('500')
       const [rolesEdit, setRolesEdit] = useState(null)
       const [coreEdit, setCoreEdit] = useState(null)
+      const [recruitTier, setRecruitTier] = useState('auto')
       const [coreSupported, setCoreSupported] = useState(false)
       const [autoRoles, setAutoRoles] = useState([])
       const [saving, setSaving] = useState(false)
@@ -5002,13 +5018,14 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
             setCoreSupported(supported)
             setCoreEdit(supported ? roleRes.core : legacyCore)
             setRolesEdit(supported ? rows.filter((role) => role.id !== 'commander' && role.id !== 'staff') : rows)
+            setRecruitTier(['auto', ...TIERS].includes(roleRes.recruitTier) ? roleRes.recruitTier : 'auto')
           }
           if (cancelled) return
           if (conf && conf.ok) {
             if (conf.config) conf.config.memory = normalizeMemoryList(conf.config.memory)
             setCfg(conf.config)
             setPresence(conf.keys || {})
-            if (conf.config && conf.config.meeting) setMeetCfg({ ...{ stallMinutes: 20, gapMinutes: 20, maxRounds: 3 }, ...conf.config.meeting })
+            if (conf.config && conf.config.meeting) setMeetCfg({ ...{ reviewMinutes: 5, maxRounds: 3 }, ...conf.config.meeting })
             if (conf.config && conf.config.board) setBoardCfg((prev) => ({ ...prev, ...conf.config.board }))
             if (conf.config && conf.config.handover) setHandCfg({ ...{ enabled: true, timeoutMs: 90000, keepSkill: true }, ...conf.config.handover })
             if (conf.config && conf.config.trace) {
@@ -5022,6 +5039,10 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
         })()
         return () => { cancelled = true }
       }, [])
+
+      useEffect(() => {
+        try { window.localStorage.setItem('rc2.boardCfg', JSON.stringify(boardCfg)) } catch { /* 忽略 */ }
+      }, [boardCfg])
 
       const save = useCallback(async () => {
         if (cfg === null) return
@@ -5054,11 +5075,13 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
           const payloadRoles = coreSupported
             ? rolesEdit
             : [...core, ...rolesEdit.filter((role) => !coreIds.has(role.id))]
-          await api({
+          const roleSave = await api({
             op: 'roles.set',
             roles: payloadRoles,
+            recruitTier,
             ...(coreSupported && Array.isArray(coreEdit) ? { core: coreEdit } : {}),
           })
+          if (roleSave && roleSave.ok && ['auto', ...TIERS].includes(roleSave.recruitTier)) setRecruitTier(roleSave.recruitTier)
         }
         const res = await api({ op: 'config.set', patch })
         setSaving(false)
@@ -5070,7 +5093,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
             if (conf.config) conf.config.memory = normalizeMemoryList(conf.config.memory)
             setCfg(conf.config)
             setPresence(conf.keys || {})
-            if (conf.config && conf.config.meeting) setMeetCfg({ ...{ stallMinutes: 20, gapMinutes: 20, maxRounds: 3 }, ...conf.config.meeting })
+            if (conf.config && conf.config.meeting) setMeetCfg({ ...{ reviewMinutes: 5, maxRounds: 3 }, ...conf.config.meeting })
             if (conf.config && conf.config.board) setBoardCfg((prev) => ({ ...prev, ...conf.config.board }))
             if (conf.config && conf.config.trace) {
               const limit = [500, 1000, 2000].includes(Number(conf.config.trace.limit)) ? Number(conf.config.trace.limit) : Math.max(100, Math.min(5000, Number(conf.config.trace.limit) || 500))
@@ -5085,7 +5108,7 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
         } else {
           setNotice(res && res.error ? res.error : t('errorLabel'))
         }
-      }, [autoCfg, boardCfg, cfg, coreEdit, coreSupported, handCfg, keys, meetCfg, props, rolesEdit, t, traceCfg])
+      }, [autoCfg, boardCfg, cfg, coreEdit, coreSupported, handCfg, keys, meetCfg, props, recruitTier, rolesEdit, t, traceCfg])
 
       const body = (() => {
         if (cfg === null) return h('div', { className: 'rc2-center' }, t('loading'))
@@ -5113,6 +5136,55 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
               }
             }
             setCfg(nextCfg)
+          }
+          const noteModelAction = (row, text) => {
+            setModelActionStatus((prev) => ({ ...prev, [row.id]: text }))
+          }
+          const discoverCustomModels = async (index) => {
+            const row = customRows[index]
+            if (!row) return
+            noteModelAction(row, '正在获取模型…')
+            const res = await api({
+              op: 'customModels.discover',
+              baseUrl: row.baseUrl,
+              apiKey: row.apiKey,
+              keyRef: row.keyRef,
+              protocol: row.protocol,
+              provider: row.provider,
+            })
+            if (!res || !res.ok) {
+              const msg = res && res.error ? res.error : '未知错误'
+              noteModelAction(row, `获取失败：${msg}`)
+              void uiAlert('获取模型失败', msg)
+              return
+            }
+            const models = Array.isArray(res.models) ? res.models : []
+            setModelChoices((prev) => ({ ...prev, [row.id]: models }))
+            setManualModelRows((prev) => ({ ...prev, [row.id]: false }))
+            if ((!row.model || row.model.trim() === '') && models.length > 0) updateCustom(index, 'model', models[0].id)
+            noteModelAction(row, models.length === 0 ? '没有获取到模型' : `已获取 ${models.length} 个模型：${models.map((item) => item.id).join(', ')}`)
+            if (models.length === 0) void uiAlert('没有获取到模型', '端点没有返回 data/models 列表')
+          }
+          const testCustomModel = async (index) => {
+            const row = customRows[index]
+            if (!row) return
+            noteModelAction(row, '正在发送测试对话…')
+            const res = await api({
+              op: 'customModels.test',
+              baseUrl: row.baseUrl,
+              apiKey: row.apiKey,
+              protocol: row.protocol,
+              model: row.model,
+              provider: row.provider,
+            })
+            if (!res || !res.ok) {
+              const msg = res && res.error ? res.error : '未知错误'
+              noteModelAction(row, `测试失败：${msg}`)
+              void uiAlert('模型测试失败', msg)
+              return
+            }
+            noteModelAction(row, `测试成功：模型回复「${res.reply}」`)
+            void uiAlert('模型测试成功', `模型 ${res.model} 已回复：${res.reply}`)
           }
           const addCustom = () => {
             const id = `cm_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`
@@ -5187,30 +5259,64 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
                   placeholder: 'https://api.example.com/v1',
                   onChange: (event) => updateCustom(index, 'baseUrl', event.target.value),
                 })),
-              h('div', { className: 'rc2-field' }, h('label', null, t('modelId')),
-                h('input', {
-                  value: row.model || '',
-                  placeholder: 'gpt-4o-mini',
-                  onChange: (event) => updateCustom(index, 'model', event.target.value),
-                }))),
-            h('div', { className: 'rc2-grid3' },
-              h('div', { className: 'rc2-field' }, h('label', null, t('protocol')),
-                h('select', {
-                  value: MODEL_PROTOCOLS.some((item) => item.id === row.protocol) ? row.protocol : 'openai-completions',
-                  onChange: (event) => updateCustom(index, 'protocol', event.target.value),
-                }, MODEL_PROTOCOLS.map((item) => h('option', { key: item.id, value: item.id }, item.label)))),
               h('div', { className: 'rc2-field' }, h('label', null, t('apiKey')),
                 h('input', {
                   type: 'password',
                   value: row.apiKey || '',
                   placeholder: row.hasKey ? t('savedKey') : t('needKey'),
                   onChange: (event) => updateCustom(index, 'apiKey', event.target.value),
-                })),
+                }))),
+            h('div', { className: 'rc2-grid3' },
+              h('div', { className: 'rc2-field' }, h('label', null, t('protocol')),
+                h('select', {
+                  value: row.protocol === 'openai-responses' || !MODEL_PROTOCOLS.some((item) => item.id === row.protocol) ? 'openai-completions' : row.protocol,
+                  onChange: (event) => updateCustom(index, 'protocol', event.target.value),
+                }, MODEL_PROTOCOLS.map((item) => h('option', { key: item.id, value: item.id }, item.label)))),
+              h('div', { className: 'rc2-field' }, h('label', null, t('modelId')),
+                (manualModelRows[row.id] === true || (modelChoices[row.id] || []).length === 0)
+                  ? h('input', {
+                    value: row.model || '',
+                    placeholder: 'gpt-4o-mini',
+                    onChange: (event) => updateCustom(index, 'model', event.target.value),
+                  })
+                  : h('select', {
+                    value: (modelChoices[row.id] || []).some((item) => item.id === row.model) ? row.model : '',
+                    onChange: (event) => {
+                      if (event.target.value === '__manual__') {
+                        setManualModelRows((prev) => ({ ...prev, [row.id]: true }))
+                        updateCustom(index, 'model', '')
+                        return
+                      }
+                      updateCustom(index, 'model', event.target.value)
+                    },
+                  },
+                  h('option', { value: '' }, '— 选择模型 —'),
+                  (modelChoices[row.id] || []).map((item) => h('option', { key: item.id, value: item.id }, item.name || item.id)),
+                  h('option', { value: '__manual__' }, '手动输入…'))),
               h('div', { className: 'rc2-field' }, h('label', null, t('thinkingDepth')),
                 h('select', {
                   value: THINKING_LEVELS.includes(row.reasoning) ? row.reasoning : 'medium',
                   onChange: (event) => updateCustom(index, 'reasoning', event.target.value),
                 }, THINKING_LEVELS.map((level) => h('option', { key: level, value: level }, THINKING_LABEL[level]))))),
+            h('div', { className: 'rc2-row', style: { marginTop: 6 } },
+              h('button', {
+                className: 'rc2-btn ghost',
+                title: '用当前 Base URL、API Key、协议请求 /models',
+                disabled: String(modelActionStatus[row.id] || '').startsWith('正在'),
+                onClick: () => { void discoverCustomModels(index) },
+              }, '获取模型'),
+              h('button', {
+                className: 'rc2-btn ghost',
+                title: '发送一句话给模型，只有模型回复“测试成功”才算通过',
+                disabled: String(modelActionStatus[row.id] || '').startsWith('正在'),
+                onClick: () => { void testCustomModel(index) },
+              }, '测试模型'),
+              h('button', {
+                className: 'rc2-btn ghost',
+                title: '保存当前模型配置到 DSH',
+                onClick: () => { void save() },
+              }, '保存模型')),
+            h('div', { className: 'rc2-meta', style: { marginTop: 4, minHeight: 18 } }, modelActionStatus[row.id] || ''),
             h('div', { className: 'rc2-row' },
               h('span', { className: 'rc2-meta' }, `${t('route')}: ${row.provider || '—'}`),
               h('span', { className: 'rc2-meta' }, row.hasKey ? t('keySaved') : t('keyMissing')),
@@ -5419,6 +5525,18 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
                 placeholder: t('commonPlaceholder'),
                 onChange: (event) => setCfg(setIn(cfg, 'prompt.common', event.target.value)),
               })),
+            h('div', { className: 'rc2-sect' }, '新队员模型策略'),
+            h('div', { className: 'rc2-field' },
+              h('label', null, '总指挥招募新队员时的模型档位'),
+              h('select', {
+                value: recruitTier,
+                onChange: (event) => setRecruitTier(event.target.value),
+              },
+              h('option', { value: 'auto' }, '由总指挥决定（auto）'),
+              h('option', { value: 'deep' }, '深度 / Deep'),
+              h('option', { value: 'fast' }, 'Flash / 快速'),
+              h('option', { value: 'vision' }, '视觉 / Vision'))),
+            h('div', { className: 'rc2-note' }, '固定档位时，手动派发、自动化、会议和小组扩员创建的新队员都会强制使用该档位；auto 时由总指挥在 spawn.tier 中决定，未指定则使用角色默认档位。'),
             h('div', { className: 'rc2-sect' }, t('coreSeats')),
             h('div', { className: 'rc2-note' }, t('coreSeatsHint')),
             Array.isArray(coreEdit) && coreEdit.length > 0
@@ -5511,21 +5629,16 @@ button.rc2-chip:hover{color:var(--rc-accent);border-color:var(--rc-accent);
                   })
                   : null,
                 h('span', { className: 'rc2-meta' }, `当前：最多显示 ${num(traceCfg.limit, 500)} 条轨迹`))),
-            h('div', { className: 'rc2-grid3' },
-              h('div', { className: 'rc2-field' }, h('label', null, t('meetingStall')),
-                h('select', {
-                  value: String(num(meetCfg.stallMinutes, 20)),
-                  onChange: (e) => setMeetCfg({ ...meetCfg, stallMinutes: Number(e.target.value) }),
-                }, ['10', '20', '40', '60'].map((v) => h('option', { key: v, value: v }, `${v} 分钟`)))),
-              h('div', { className: 'rc2-field' }, h('label', null, t('meetingGap')),
-                h('select', {
-                  value: String(num(meetCfg.gapMinutes, 20)),
-                  onChange: (e) => setMeetCfg({ ...meetCfg, gapMinutes: Number(e.target.value) }),
-                }, ['10', '20', '40', '60'].map((v) => h('option', { key: v, value: v }, `${v} 分钟`)))),
+            h('div', { className: 'rc2-grid2' },
+              h('div', { className: 'rc2-field' }, h('label', null, t('meetingReview')),
+                h('input', {
+                  type: 'number', min: 1, max: 60, value: num(meetCfg.reviewMinutes, 5),
+                  onChange: (e) => setMeetCfg({ ...meetCfg, reviewMinutes: Math.max(1, Math.min(60, Number(e.target.value) || 5)) }),
+                })),
               h('div', { className: 'rc2-field' }, h('label', null, t('meetingRounds')),
                 h('input', {
                   type: 'number', min: 1, max: 20, value: num(meetCfg.maxRounds, 3),
-                  onChange: (e) => setMeetCfg({ ...meetCfg, maxRounds: Number(e.target.value) || 3 }),
+                  onChange: (e) => setMeetCfg({ ...meetCfg, maxRounds: Math.max(1, Math.min(20, Number(e.target.value) || 3)) }),
                 }))),
             h('div', { className: 'rc2-field', style: { marginTop: 12 } }, h('label', null, '看板：保留上限 / 触顶后合并条数'),
               h('div', { className: 'rc2-row rc2-boardcfg-row' },

@@ -118,7 +118,7 @@ const DEFAULT_CONFIG = {
   /** 页面里配置的 MCP 服务器。 */
   mcp: [],
   /** 编队队员角色（留空用内置队员角色；总指挥/参谋不在这里，见 core）。 */
-  roles: { squad: [] },
+  roles: { squad: [], recruitTier: 'auto' },
   /** 常设席位（总指挥/参谋）配置：全局各一个，不能召唤/回收，只能在这里或控制台改。 */
   core: {},
   /** 事件触发规则（留空用内置两条：新资产派猎手、新漏洞派浏览器）。 */
@@ -127,8 +127,8 @@ const DEFAULT_CONFIG = {
   ui: { accent: 'cyan', glow: true, grid: true, scanlines: true },
   /** 对话。 */
   chat: { tier: 'deep', history: 200 },
-  /** 全员会议：多久没新信息算停滞、同一项目开会冷却、最多自动开几轮。 */
-  meeting: { stallMinutes: 20, gapMinutes: 20, maxRounds: 3 },
+  /** 全员会议：任务活动期间的周期审查间隔、最多自动召开轮次。 */
+  meeting: { reviewMinutes: 5, maxRounds: 3 },
   /** 看板：达到上限后的合并方式；AI 语义合并模型档位固定无思考。 */
   board: { limit: 100, mergeCount: 50, mergeMode: 'deterministic', mergeModel: 'fast' },
   /** 轨迹面板最高显示条数（控制台可配置 500/1000/2000/自定义）。 */
@@ -191,7 +191,7 @@ const BOARD_WRITING_RULES = [
   '- 写 agent 看板必须分两层：`summary` 是**概括索引**，`text` 是**完整正文**。',
   '- `summary`：必须是语义提炼，写清对象/位置/结论/下一步；禁止直接复制正文、截断正文或只写空泛的“有发现”。',
   '- `text`：写完整证据、命令 commandId、判断、影响、限制和下一步；禁止用概括冒充正文。',
-  '- 所有 agent 发看板必须同时提供 `summary` 和 `text`。用户看板条目只有正文，不需要 summary。',
+  '- agent 发看板必须写 `text`；`summary` 为空时系统会自动调用快速模型生成。用户看板条目只有正文，不需要 summary。',
   '- 读取看板时默认只拿到概括；需要正文必须用 `recon_board action=view id=...` 按 id 查看。',
   '- 截图只写 `shots` 路径，不在 summary/text 内嵌图片。',
 ].join('\n')
@@ -961,8 +961,8 @@ function addVuln(eng, input) {
 /** 图谱的紧凑文本视图：给模型看的，不是给页面看的。 */
 function graphSummary(eng, options = {}) {
   const limit = Number.isFinite(Number(options.limit))
-    ? Math.max(1, Math.min(2000, Math.floor(Number(options.limit))))
-    : 400
+    ? Math.max(1, Math.min(5000, Math.floor(Number(options.limit))))
+    : 5000
   const activeNodes = (eng.nodes || []).filter((node) => node.archived !== true)
   const activeIds = new Set(activeNodes.map((node) => node.id))
   const nodes = activeNodes.slice(0, limit).map((n) => {
@@ -992,6 +992,26 @@ function graphSummary(eng, options = {}) {
     ...(activeNodes.length > limit ? { note: `节点多于 ${limit}，仅列出前 ${limit} 个；完整数据在页面上。` } : {}),
     ...(eng.nodes.length > activeNodes.length ? { archived: eng.nodes.length - activeNodes.length } : {}),
   }
+}
+
+/** 轻量图谱摘要：进入 slot，绝不包含完整节点/关系列表。 */
+function graphDigestText(eng) {
+  if (eng === undefined || eng === null) return '[GRAPH_SLOT_PLACEHOLDER] 当前没有图谱；需要时调用 recon_view。'
+  const stats = statsOf(eng)
+  const lines = [`图谱摘要：节点 ${stats.nodes} · 关系 ${stats.edges} · 漏洞 ${stats.vulns}（未闭环 ${stats.openVulns}）· 命令 ${stats.commands}`]
+  const recent = (eng.nodes || []).filter((node) => node.archived !== true).slice(-20).map((node) => `${node.kind}:${node.value}`)
+  if (recent.length > 0) lines.push(`最近资产：${recent.join(' , ')}`)
+  const openVulns = (eng.vulns || []).filter((v) => v.status !== 'false-positive' && v.status !== 'fixed').slice(-10)
+  if (openVulns.length > 0) lines.push(`未闭环漏洞：${openVulns.map((v) => `${v.severity}/${v.title}`).join(' ; ')}`)
+  const commands = (eng.commands || []).slice(-10).map((c) => `${c.id} exit=${c.exitCode === null ? 'running' : c.exitCode} ${shortText(c.command, 100)}`)
+  if (commands.length > 0) lines.push(`最近命令：${commands.join(' ; ')}`)
+  lines.push('需要完整节点/关系时调用 recon_view；完整图谱只作为工具结果进入可变区，不重复放入 graph slot。')
+  return lines.join('\n')
+}
+
+function graphVersionOf(eng) {
+  if (eng === undefined || eng === null) return 'none'
+  return `${(eng.nodes || []).length}:${(eng.edges || []).length}:${(eng.vulns || []).length}`
 }
 
 /* ────────────────────────── 命令执行与留痕 ────────────────────────── */
@@ -1220,6 +1240,31 @@ function headTail(text, budget) {
   }
 }
 
+/** 大输出只给模型统计摘要，原始内容留在 outputPath；避免扫描/JSON 反复灌入历史。 */
+function summarizeCommandText(text, label) {
+  const value = String(text || '')
+  const lines = value.split(/\r?\n/)
+  const nonEmpty = lines.filter((line) => line.trim() !== '')
+  const first = nonEmpty.slice(0, 3).map((line) => shortText(line.trim(), 160))
+  const important = nonEmpty
+    .filter((line) => /(?:error|exception|failed|failure|warning|denied|found|total|success|timeout|unauthorized|forbidden)/i.test(line))
+    .slice(0, 5)
+    .map((line) => shortText(line.trim(), 180))
+  let shape = ''
+  try {
+    const parsed = JSON.parse(value)
+    if (Array.isArray(parsed)) shape = `JSON 数组 ${parsed.length} 项`
+    else if (parsed && typeof parsed === 'object') shape = `JSON 对象 ${Object.keys(parsed).length} 个字段`
+  } catch { /* 不是 JSON */ }
+  const bits = [
+    `${label}: ${value.length} 字符 / ${lines.length} 行`,
+    shape,
+    first.length > 0 ? `开头: ${first.join(' | ')}` : '',
+    important.length > 0 ? `关键行: ${important.join(' | ')}` : '',
+  ].filter((x) => x !== '')
+  return bits.join('；')
+}
+
 /* ────────────────────────── 会话绑定 ────────────────────────── */
 
 function sessionInfoOf(exec) {
@@ -1404,6 +1449,126 @@ class CustomModelRegistry {
     return out
   }
 
+  /** 按用户填写的 Base URL / Key / 协议自动拉取模型 ID（不保存配置）。 */
+  async discover({ baseUrl, apiKey, keyRef, protocol, provider } = {}) {
+    const base = asText(baseUrl).replace(/\/+$/, '')
+    if (!/^https?:\/\//i.test(base)) throw new Error('Base URL 必须以 http:// 或 https:// 开头')
+    const key = asText(apiKey)
+    /* 已保存的模型可以用已注册的 provider 读取，无需重新输入 Key。 */
+    if (key === '' && asText(provider) !== '') {
+      const llm = this.ctx.get('llm')
+      if (llm === undefined || llm === null || typeof llm.listModels !== 'function') throw new Error('llm 服务不可用，无法读取已保存模型的列表')
+      const rows = await llm.listModels(asText(provider))
+      return { url: `provider:${provider}`, models: (Array.isArray(rows) ? rows : []).map((row) => ({ id: asText(row.id), name: asText(row.name, row.id) })).filter((row) => row.id !== ''), rawCount: Array.isArray(rows) ? rows.length : 0 }
+    }
+    if (key === '') throw new Error('获取模型前请先填写 API Key')
+    const url = /\/models$/i.test(base) ? base : `${base}/models`
+    const headers = { accept: 'application/json' }
+    if (protocol === 'anthropic-messages') {
+      headers['x-api-key'] = key
+      headers['anthropic-version'] = '2023-06-01'
+    } else {
+      headers.authorization = `Bearer ${key}`
+    }
+    let response
+    try {
+      response = await fetch(url, { headers, signal: AbortSignal.timeout(12000) })
+    } catch (error) {
+      throw new Error(`请求模型列表失败：${error && error.message ? error.message : error}`)
+    }
+    if (!response.ok) {
+      let detail = ''
+      try { detail = await response.text() } catch { /* 忽略 */ }
+      throw new Error(`模型列表 HTTP ${response.status}${detail ? `：${detail.slice(0, 300)}` : ''}`)
+    }
+    let payload
+    try { payload = await response.json() } catch { throw new Error('模型列表不是合法 JSON') }
+    const rows = Array.isArray(payload && payload.data) ? payload.data
+      : (Array.isArray(payload && payload.models) ? payload.models : [])
+    const models = rows
+      .map((row) => ({ id: asText(row && (row.id || row.name)), name: asText(row && (row.name || row.id)) }))
+      .filter((row) => row.id !== '')
+    return { url, models, rawCount: rows.length }
+  }
+
+  /** 直接调用用户填写端点的 chat/responses/messages，要求模型只回复“测试成功”。 */
+  async testEndpoint({ baseUrl, apiKey, protocol, model, provider } = {}) {
+    const base = asText(baseUrl).replace(/\/+$/, '')
+    if (!/^https?:\/\//i.test(base)) throw new Error('Base URL 必须以 http:// 或 https:// 开头')
+    const key = asText(apiKey)
+    const modelId = asText(model)
+    if (modelId === '') throw new Error('测试模型前请先填写模型 ID')
+    if (key === '' && asText(provider) !== '') {
+      const llm = this.ctx.get('llm')
+      if (llm === undefined || llm === null || typeof llm.stream !== 'function') throw new Error('llm 服务不可用，无法测试已保存模型')
+      let reply = ''
+      const stream = llm.stream({
+        provider: asText(provider),
+        model: modelId,
+        reasoningEffort: 'off',
+        messages: [{ role: 'user', content: [{ type: 'text', text: '请只回复四个字：测试成功。不要解释，不要加标点。' }] }],
+        maxTokens: 64,
+      })
+      for await (const chunk of stream) if (chunk && chunk.type === 'text-delta' && typeof chunk.text === 'string') reply += chunk.text
+      const text = asText(reply).trim()
+      if (text.replace(/[。.!！\s]/g, '') !== '测试成功') throw new Error(`模型回复不是「测试成功」：${text.slice(0, 200)}`)
+      return { model: modelId, reply: text, url: `provider:${provider}` }
+    }
+    if (key === '') throw new Error('测试模型前请先填写 API Key')
+    let url = `${base}/chat/completions`
+    let headers = { 'content-type': 'application/json', authorization: `Bearer ${key}` }
+    let body = {
+      model: modelId,
+      messages: [{ role: 'user', content: '请只回复四个字：测试成功。不要解释，不要加标点。' }],
+      temperature: 0,
+      max_tokens: 64,
+    }
+    if (protocol === 'anthropic-messages') {
+      url = `${base}/messages`
+      headers = {
+        'content-type': 'application/json',
+        'x-api-key': key,
+        'anthropic-version': '2023-06-01',
+      }
+      body = { model: modelId, max_tokens: 64, messages: [{ role: 'user', content: '请只回复四个字：测试成功。不要解释，不要加标点。' }] }
+    } else if (protocol === 'openai-responses') {
+      url = `${base}/responses`
+      body = { model: modelId, input: '请只回复四个字：测试成功。不要解释，不要加标点。', max_output_tokens: 64 }
+    }
+    let response
+    try {
+      response = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(30000),
+      })
+    } catch (error) {
+      throw new Error(`测试请求失败：${error && error.message ? error.message : error}`)
+    }
+    let raw = ''
+    try { raw = await response.text() } catch { /* 忽略 */ }
+    if (!response.ok) throw new Error(`测试请求 HTTP ${response.status}${raw ? `：${raw.slice(0, 300)}` : ''}`)
+    let payload
+    try { payload = JSON.parse(raw) } catch { throw new Error('测试响应不是合法 JSON') }
+    let reply = ''
+    if (Array.isArray(payload.choices)) {
+      const content = payload.choices[0] && payload.choices[0].message ? payload.choices[0].message.content : ''
+      if (typeof content === 'string') reply = content
+      else if (Array.isArray(content)) reply = content.map((part) => asText(part && part.text)).join('')
+    }
+    if (reply === '' && typeof payload.output_text === 'string') reply = payload.output_text
+    if (reply === '' && Array.isArray(payload.content)) reply = payload.content.map((part) => asText(part && part.text)).join('')
+    if (reply === '' && Array.isArray(payload.output)) {
+      reply = payload.output.map((item) => Array.isArray(item && item.content) ? item.content.map((part) => asText(part && part.text)).join('') : '').join('')
+    }
+    reply = asText(reply).trim()
+    if (reply === '') throw new Error('模型返回为空，未通过测试')
+    const normalized = reply.replace(/[。.!！\s]/g, '')
+    if (normalized !== '测试成功') throw new Error(`模型回复不是「测试成功」：${reply.slice(0, 200)}`)
+    return { model: modelId, reply, url }
+  }
+
   /** 校验并规范化 UI 提交的自定义模型；apiKey 只用于写 credentials，不会返回。 */
   async prepare(incoming) {
     const rows = Array.isArray(incoming) ? incoming : []
@@ -1569,7 +1734,7 @@ class EventHub {
 }
 /* ────────────────────────── 工具集 ────────────────────────── */
 
-function registerTools(ctx, store, cfg, bindings, configStore, trace, resolveActor, browsersRef, meetingRef, squadRef) {
+function registerTools(ctx, store, cfg, bindings, configStore, trace, resolveActor, browsersRef, meetingRef, squadRef, cockpitRef) {
   const who = (exec) => (typeof resolveActor === 'function' ? resolveActor(exec) : actorOf(exec))
   const browsers = browsersRef
   const squad = squadRef
@@ -2124,9 +2289,12 @@ function registerTools(ctx, store, cfg, bindings, configStore, trace, resolveAct
             out: shortText((outcome.stdout || '') + (outcome.stderr ? `\n[stderr]\n${outcome.stderr}` : ''), 600),
           },
         })
-        const budget = Math.max(2000, Math.floor(cfg.maxOutputChars / 2))
+        /* 单次最多把约 4k 字符带回模型；再大就只给统计摘要和文件路径，原文始终落盘。 */
+        const budget = Math.max(1000, Math.min(2000, Math.floor(cfg.maxOutputChars / 2)))
         const outView = headTail(outcome.stdout, budget)
-        const errView = headTail(outcome.stderr, Math.min(4000, budget))
+        const errView = headTail(outcome.stderr, Math.min(1500, budget))
+        const stdout = outView.clipped ? summarizeCommandText(outcome.stdout, 'stdout') : outView.body
+        const stderr = errView.clipped ? summarizeCommandText(outcome.stderr, 'stderr') : errView.body
         return json({
           ok: true,
           commandId: record.id,
@@ -2138,9 +2306,11 @@ function registerTools(ctx, store, cfg, bindings, configStore, trace, resolveAct
           stdout_chars: outcome.stdout.length,
           stderr_chars: outcome.stderr.length,
           clipped: outView.clipped || errView.clipped,
-          stdout: outView.body,
-          stderr: errView.body,
-          hint: '把命令里发现的资产立即用 recon_asset / recon_ingest 落图，证据用 commandId 关联。',
+          stdout,
+          stderr,
+          hint: outView.clipped || errView.clipped
+            ? '输出已截断为统计摘要；完整内容在 outputPath，需要细节时用 recon_run 只读 head/grep/jq 该文件。'
+            : '把命令里发现的资产立即用 recon_asset / recon_ingest 落图，证据用 commandId 关联。',
         })
       } catch (error) {
         return toolFailure(error)
@@ -2156,7 +2326,7 @@ function registerTools(ctx, store, cfg, bindings, configStore, trace, resolveAct
       properties: {
         engagement: { type: 'string', description: '靶标 id 或名称' },
         node: { type: 'string', description: '只看这个节点及其邻居（id 或 value）' },
-        limit: { type: 'number', description: '最多返回多少条，默认 400' },
+        limit: { type: 'number', description: '节点和关系最多返回多少条，默认 5000，最大 5000' },
       },
       additionalProperties: false,
     },
@@ -2185,6 +2355,18 @@ function registerTools(ctx, store, cfg, bindings, configStore, trace, resolveAct
             vulns,
             commands: commands.map((c) => ({ id: c.id, command: c.command, exitCode: c.exitCode })),
           })
+        }
+        const wantedLimit = Number(args.limit)
+        const neededNodes = Math.min((eng.nodes || []).length, 5000)
+        const fullView = asText(args.node) === '' && (!Number.isFinite(wantedLimit) || wantedLimit >= neededNodes)
+        if (fullView) {
+          const info = sessionInfoOf(exec)
+          const member = squad !== undefined && squad !== null && typeof squad.memberBySessionId === 'function'
+            ? squad.memberBySessionId(info.id)
+            : undefined
+          if (member !== undefined) squad.markGraphViewed(member.key, eng)
+          else if (cockpitRef !== undefined && cockpitRef !== null) cockpitRef.markGraphViewed(eng.id, eng)
+          /* 完整图谱只作为本次工具结果进入可变区，不放入 graph slot。 */
         }
         return json({ ok: true, ...graphSummary(eng, { limit: args.limit }) })
       } catch (error) {
@@ -2290,6 +2472,166 @@ function blocksText(blocks) {
   return out.join('\n').trim()
 }
 
+/**
+ * 同一会话只保留最新一份完整 runtime-context 快照。
+ * DSH 的 runtime-context 默认是 append：旧快照虽在语义上被新快照取代，
+ * 但仍可能作为历史消息计入 token。这里把除最后一份外的旧快照替换为极小占位，
+ * 只保留最新、最全的一份。
+ */
+function pruneRuntimeContextSnapshots(session) {
+  if (session === undefined || session === null || !session.surface || typeof session.eventAt !== 'function' || typeof session.append !== 'function') return
+  try {
+    const contexts = []
+    for (const seq of session.surface.nodes) {
+      const event = session.eventAt(seq)
+      if (event === undefined || event === null || event.type !== 'user/message') continue
+      const message = event.data
+      if (message === null || message === undefined || !message.source || message.source.kind !== 'runtime-context') continue
+      const chars = Array.isArray(message.content)
+        ? message.content.reduce((sum, block) => sum + (block && typeof block.text === 'string' ? block.text.length : 0), 0)
+        : 0
+      contexts.push({ seq, chars })
+    }
+    if (contexts.length <= 1) return
+    /* 保留最后一份：它就是当前最全、最新的快照。 */
+    const keep = contexts[contexts.length - 1]
+    const inputs = []
+    for (const item of contexts) {
+      if (item.seq === keep.seq) continue
+      inputs.push([
+        'user/message',
+        {
+          id: `u_old_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+          role: 'user',
+          content: [{ type: 'text', text: '（旧的动态上下文快照已合并）' }],
+          source: { kind: 'user' },
+        },
+        {
+          surfaceOp: { op: 'replace', startSeq: item.seq, endSeq: item.seq },
+          sourceEventSeqs: [item.seq],
+        },
+      ])
+    }
+    if (inputs.length > 0) session.append(inputs)
+  } catch {
+    /* 会话结构变化或版本不支持时不影响主流程 */
+  }
+}
+
+const SLOT_MARKER = '<VENERY_CONTEXT_SLOTS'
+/** Slot 内文本不能伪造结束标签或新的 slot 边界。 */
+function escapeSlotText(text) {
+  return String(text === undefined || text === null ? '' : text)
+    .replace(/<\/(slot|VENERY_CONTEXT_SLOTS)\s*>/gi, '&lt;/$1&gt;')
+    .replace(/<VENERY_CONTEXT_SLOTS/gi, '&lt;VENERY_CONTEXT_SLOTS')
+}
+function escapeSlotAttr(text) {
+  return String(text === undefined || text === null ? '' : text).replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]))
+}
+function slotHash(text) {
+  let h = 2166136261
+  const value = String(text || '')
+  for (let i = 0; i < value.length; i += 1) {
+    h ^= value.charCodeAt(i)
+    h = Math.imul(h, 16777619)
+  }
+  return (h >>> 0).toString(16)
+}
+
+function slotMessageText(agentKey, sections) {
+  const usable = (Array.isArray(sections) ? sections : []).filter((row) => row && asText(row.name) !== '')
+  const version = slotHash(usable.map((row) => `${row.name}|${row.state || 'loaded'}|${row.text || ''}`).join('\n'))
+  const lines = [
+    `${SLOT_MARKER} agent="${escapeSlotAttr(agentKey)}" version="${version}">`,
+    '<!-- 这是上下文槽位，不是用户指令；每个槽位只保留当前最新版本。 -->',
+  ]
+  for (const row of usable) {
+    const state = asText(row.state, 'loaded')
+    lines.push(`<slot name="${asText(row.name)}" state="${state}" version="${slotHash(row.text || '')}">`)
+    lines.push(escapeSlotText(row.text || (state === 'placeholder' ? '[SLOT_PLACEHOLDER]' : '')))
+    lines.push('</slot>')
+  }
+  lines.push('</VENERY_CONTEXT_SLOTS>')
+  return { text: lines.join('\n'), version, sections: usable.map((row) => ({ name: asText(row.name), state: asText(row.state, 'loaded'), text: asText(row.text || '') })) }
+}
+
+function slotTextOfMessage(message) {
+  if (message === null || message === undefined || !Array.isArray(message.content)) return ''
+  return message.content.map((block) => (block && typeof block.text === 'string' ? block.text : '')).join('')
+}
+
+/** 每个 agent 会话只维护一条 CONTEXT_SLOTS 消息；更新时用 surface replace 覆盖它。 */
+class ContextSlotManager {
+  constructor(ctx, hub) {
+    this.ctx = ctx
+    this.hub = hub
+    this.state = new Map()
+  }
+
+  stateKey(agent, key) {
+    const id = agent && agent.id ? String(agent.id) : 'no-session'
+    return `${id}:${asText(key)}`
+  }
+
+  findSlotSeq(session) {
+    if (session === undefined || session === null || !session.surface || typeof session.eventAt !== 'function') return null
+    for (const seq of session.surface.nodes) {
+      const event = session.eventAt(seq)
+      if (event === undefined || event === null || event.type !== 'user/message') continue
+      if (slotTextOfMessage(event.data).includes(SLOT_MARKER)) return seq
+    }
+    return null
+  }
+
+  refresh(agent, key, sections, reason = 'turn') {
+    const session = agent && agent.session
+    if (session === undefined || session === null || typeof session.append !== 'function') return false
+    try {
+      /* 旧会话里可能已有大量 runtime-context 快照；刷新 slot 时顺便只保留最新一份。 */
+      pruneRuntimeContextSnapshots(session)
+      const stateKey = this.stateKey(agent, key)
+      const packed = slotMessageText(key, sections)
+      const oldState = this.state.get(stateKey) || { seq: null, hash: '' }
+      let oldSeq = oldState.seq
+      if (oldSeq !== null && !session.surface.nodes.includes(oldSeq)) oldSeq = null
+      if (oldSeq === null) oldSeq = this.findSlotSeq(session)
+      if (oldSeq !== null && oldState.hash === packed.version) return false
+      const message = {
+        id: `ctx_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+        role: 'user',
+        content: [{ type: 'text', text: packed.text }],
+        source: { kind: 'user', form: 'venery-context-slot' },
+      }
+      const event = oldSeq !== null
+        ? session.append('user/message', message, {
+          surfaceOp: { op: 'replace', startSeq: oldSeq, endSeq: oldSeq },
+          sourceEventSeqs: [oldSeq],
+        })
+        : session.append('user/message', message, { surfaceOp: 'append' })
+      this.state.set(stateKey, { seq: event.seq, hash: packed.version })
+      try {
+        this.hub.broadcast({
+          type: 'context.slot', key, version: packed.version, reason,
+          chars: packed.text.length,
+          sections: packed.sections.map((row) => ({ name: row.name, state: row.state, chars: String(row.text || '').length })),
+        })
+      } catch { /* 忽略 */ }
+      return true
+    } catch (error) {
+      try { this.ctx?.logger?.warn?.(`[dsh-venery] CONTEXT_SLOTS 写入失败：${error && error.message ? error.message : error}`) } catch { /* 忽略日志失败 */ }
+      return false
+    }
+  }
+
+  /** 会话/成员结束时清理对应的 slot 状态，避免长期运行内存泄漏。 */
+  forget(key) {
+    const suffix = `:${asText(key)}`
+    for (const stateKey of Array.from(this.state.keys())) {
+      if (stateKey.endsWith(suffix)) this.state.delete(stateKey)
+    }
+  }
+}
+
 class Cockpit {
   constructor(ctx, store, cfg, configStore, hub) {
     this.ctx = ctx
@@ -2305,6 +2647,12 @@ class Cockpit {
     this.lastNudge = new Map()
     this.pendingNudges = new Map()
     this.ensuring = new Map()
+    /* 动态上下文使用单条 CONTEXT_SLOTS 消息，每次更新替换旧 slot。 */
+    this.slots = new ContextSlotManager(ctx, hub)
+    /* 中断不 cancel：只让 agent/pre-step 在下一个模型步骤前 reject。 */
+    this.pausedEngagements = new Set()
+    /* graph 查看状态只用于参谋规划门禁，不把完整图谱放进 slot。 */
+    this.graphViewedVersion = new Map()
   }
 
   /** 项目被删除时丢掉它的驾驶舱会话与缓存，避免 session 泄漏 */
@@ -2319,6 +2667,8 @@ class Cockpit {
     this.lastNudge?.delete?.(engagementId)
     this.pendingNudges?.delete?.(engagementId)
     this.promptCache?.delete?.(engagementId)
+    this.slots?.forget?.(engagementId)
+    this.graphViewedVersion?.delete?.(engagementId)
     this.ensuring?.delete?.(engagementId)
     const saveTimer = this.saveTimers?.get?.(engagementId)
     if (saveTimer !== undefined) clearTimeout(saveTimer)
@@ -2405,77 +2755,6 @@ class Cockpit {
       lines.push('')
       lines.push(commanderRole.prompt)
     }
-    const eng = await this.store.load(engagementId)
-    if (eng !== undefined) {
-      const stats = statsOf(eng)
-      lines.push('')
-      lines.push(`当前靶标：${eng.name}（id ${eng.id}）`)
-      if (eng.scope.length > 0) lines.push(`授权范围：${eng.scope.join(', ')}`)
-      lines.push(`图谱现状：节点 ${stats.nodes} · 关系 ${stats.edges} · 漏洞 ${stats.vulns} · 命令 ${stats.commands}`)
-      const recent = eng.nodes.filter((node) => node.archived !== true).slice(-30).map((node) => `${node.kind}:${node.value}`)
-      if (recent.length > 0) lines.push(`已收录资产（尾 30）：${recent.join(' , ')}`)
-      const activeNodeIds = new Set(eng.nodes.filter((node) => node.archived !== true).map((node) => node.id))
-      const openVulns = eng.vulns.filter((v) => activeNodeIds.has(v.nodeId) && v.status !== 'false-positive' && v.status !== 'fixed').slice(-10)
-      if (openVulns.length > 0) {
-        lines.push(`未闭环漏洞：${openVulns.map((v) => `${v.severity}/${v.title}`).join(' ; ')}`)
-      }
-    }
-    /* 完整看板：所有 agent 必须看到全部文字，用户发言全文且无上限 */
-    try {
-      const boardText = await boardPromptText(this.board, engagementId, { actor: { key: 'lead' } })
-      if (boardText !== '') {
-        lines.push('')
-        lines.push(boardText)
-      }
-    } catch { /* 取不到就跳过 */ }
-    try {
-      const taskRows = this.tasks === undefined || this.tasks === null ? [] : await this.tasks.list(engagementId, 80)
-      const open = taskRows.filter((row) => row.status !== 'passed' && row.status !== 'failed')
-      if (open.length > 0) {
-        lines.push('')
-        lines.push('未闭环任务：')
-        for (const row of open.slice(-12)) {
-          lines.push(`- ${row.id} [${row.role}/${row.status}] ${row.title}｜验收：${row.acceptance || '-'}`)
-        }
-      }
-      const failed = taskRows.filter((row) => row.status === 'failed')
-      if (failed.length > 0) {
-        lines.push(`有 ${failed.length} 条任务被验收驳回，优先处理返工。`)
-      }
-    } catch { /* 任务读取失败不影响对话 */ }
-    const memory = Array.isArray(config.memory) ? config.memory : []
-    if (memory.length > 0) {
-      lines.push('')
-      lines.push('## 长期记忆（全局强制阅读，全部条目）')
-      for (const item of memory) {
-        const entry = memoryEntryOf(item)
-        if (entry.content !== '') lines.push(`- [${entry.category || 'other'}] ${entry.title}：${entry.content}`)
-      }
-    }
-    const enabledSkills = Array.isArray(config.skills && config.skills.enabled) ? config.skills.enabled : []
-    if (enabledSkills.length > 0) lines.push(`\n可用技能（需要时用 recon_skill action=load 读取完整技能；若会话另有 skill 工具也可用）：${enabledSkills.join(', ')}`)
-    const presence = this.configStore.keyPresence()
-    const ready = Object.entries(presence).filter(([, ok]) => ok).map(([key]) => key)
-    const missing = Object.entries(presence).filter(([, ok]) => !ok).map(([key]) => key)
-    lines.push(`\n测绘密钥：已配置 ${ready.length > 0 ? ready.join('/') : '（无）'}；未配置 ${missing.length > 0 ? missing.join('/') : '（无）'}`)
-    lines.push('密钥已注入命令环境（如 FOFA_KEY / GITHUB_TOKEN / SHODAN_API_KEY），recon_run 里可直接引用，不要在回答里回显明文。')
-    lines.push('')
-    lines.push('你也可以当指挥：`recon_squad` 派独立 Agent 并行推进（不用等），`recon_board` 读写团队看板，`recon_browser` 做真实页面操作。')
-    lines.push('')
-    lines.push('组织编制（谁干什么）：')
-    const orgRoles = this.squad !== undefined && this.squad !== null
-      ? [...this.squad.coreRoles(), ...this.squad.roles()]
-      : this.roles()
-    for (const role of orgRoles) {
-      const isCore = role.core === true || CORE_ROLES.has(role.id)
-      const roleSkills = asList(role.skills).filter((name) => asText(name) !== '')
-      const roleMcp = asMcpList(role.mcp).filter((row) => row.enabled !== false).map((row) => row.name)
-      const detail = [
-        roleSkills.length > 0 ? `技能：${roleSkills.join(', ')}` : '',
-        roleMcp.length > 0 ? `MCP：${roleMcp.join(', ')}` : '',
-      ].filter((line) => line !== '').join('；')
-      lines.push(`- ${role.name}（${role.id}，${role.tier}）${isCore ? '（常设席位，每靶标各一个，不可召唤）' : (role.reportsTo ? `→ 向 ${role.reportsTo} 汇报` : '（最高指挥）')}${detail !== '' ? `｜${detail}` : ''}`)
-    }
     lines.push('职责边界：Web 页面操作归 web 手；JS/APK/EXE 逆向归 reverser；内网横向/隧道归 intranet；')
     lines.push('漏洞真伪实测与任务达标判定归 qa；方案与优先级归 staff；commander 只调度不亲自扫。')
     lines.push('指纹 Nday：把指纹交给信息收集手（scout），用 `recon_nday` 查 Exploit-DB/NVD 历史漏洞；只查库，不对目标发包，候选先写看板。')
@@ -2540,10 +2819,15 @@ class Cockpit {
           prompt.section({
             name: 'recon-cockpit',
             order: 4901,
-            text: () => {
-              const cached = cockpit.cockpitPromptSync(engagementId)
-              return cached
-            },
+            text: () => cockpit.cockpitPromptSync(engagementId),
+          })
+        }
+        if (typeof agentCtx.on === 'function') {
+          agentCtx.on('agent/pre-step', async (payload, next) => {
+            if (cockpit.pausedEngagements.has(engagementId)) return { kind: 'reject' }
+            /* 每次模型请求前检查一次；内容不变时 hash 会 no-op。 */
+            try { cockpit.refreshContextSnapshot(engagementId) } catch { /* 不阻断模型 */ }
+            return next()
           })
         }
       } catch { /* 提示词注入失败不影响对话 */ }
@@ -2553,13 +2837,14 @@ class Cockpit {
     const handle = await agents.create({
       sessionId,
       meta: { cwd: workDir },
-      agentOptions: selection,
+      agentOptions: { ...selection, maxTokens: 16000 },
       setup,
     })
     state.agent = handle.agent
     COMMANDER_SESSIONS.add(sessionId)
     state.handle = handle
     this.sessions.set(engagementId, state)
+    this.refreshContextSnapshot(engagementId)
     this.hub.broadcast({ type: 'chat.status', engagementId, status: 'idle', sessionId })
     return state
   }
@@ -2572,6 +2857,86 @@ class Cockpit {
 
   cockpitPromptSync(engagementId) {
     return (this.promptCache && this.promptCache.get(engagementId)) || '## 狩猎驾驶舱\n直接调用 recon_* 工具写图。'
+  }
+
+  /** 动态槽位：看板索引/记忆/图谱摘要/任务/团队。所有内容只保留最新一份。 */
+  slotSectionsForCockpit(engagementId) {
+    const sections = []
+    try {
+      const boardText = this.board && this.board.indexText
+        ? this.board.indexText(engagementId, { actor: { key: 'lead' } })
+        : ''
+      sections.push({ name: 'board_index', state: boardText !== '' ? 'loaded' : 'empty', text: boardText })
+    } catch { /* 取不到就跳过 */ }
+    try {
+      const taskRows = this.tasks ? this.tasks.rawSync(engagementId) : []
+      const open = taskRows.filter((row) => row.status !== 'passed' && row.status !== 'failed')
+      const relevant = this.board && this.board.relevantText
+        ? this.board.relevantText(engagementId, { role: 'commander', task: '', taskRows: open })
+        : ''
+      if (relevant !== '') sections.push({ name: 'board_relevant', state: 'loaded', text: relevant })
+    } catch { /* 取不到就跳过 */ }
+    try {
+      const memory = Array.isArray(this.configStore.get().memory) ? this.configStore.get().memory : []
+      const lines = []
+      for (const item of memory) {
+        const entry = memoryEntryOf(item)
+        if (entry.content !== '') lines.push(`- [${entry.category || 'other'}] ${entry.title}：${entry.content}`)
+      }
+      sections.push({ name: 'memory', state: lines.length > 0 ? 'loaded' : 'empty', text: lines.join('\n') })
+    } catch { /* 取不到就跳过 */ }
+    try {
+      const eng = this.store && this.store.cache ? this.store.cache.get(engagementId) : undefined
+      if (eng !== undefined) {
+        sections.push({ name: 'graph', state: 'digest', text: graphDigestText(eng) })
+      } else {
+        sections.push({ name: 'graph', state: 'placeholder', text: '[GRAPH_SLOT_PLACEHOLDER] 当前没有图谱；需要时调用 recon_view。' })
+      }
+    } catch { /* 取不到就跳过 */ }
+    try {
+      const taskRows = this.tasks ? this.tasks.rawSync(engagementId) : []
+      const open = taskRows.filter((row) => row.status !== 'passed' && row.status !== 'failed').slice(-12)
+      const lines = open.map((row) => `- ${row.id} [${row.role}/${row.status}] ${row.title}｜验收：${row.acceptance || '-'}`)
+      sections.push({ name: 'tasks', state: lines.length > 0 ? 'loaded' : 'empty', text: lines.join('\n') })
+    } catch { /* 取不到就跳过 */ }
+    try {
+      const members = this.squad && this.squad.list ? this.squad.list(engagementId) : []
+      const lines = members.map((m) => `- ${m.name}（${m.role}/${m.status}）`)
+      sections.push({ name: 'team', state: lines.length > 0 ? 'loaded' : 'empty', text: lines.join('\n') })
+    } catch { /* 取不到就跳过 */ }
+    try {
+      const config = this.configStore.get()
+      const lines = []
+      const skills = Array.isArray(config.skills && config.skills.enabled) ? config.skills.enabled : []
+      if (skills.length > 0) lines.push(`可用技能：${skills.join(', ')}`)
+      const presence = this.configStore.keyPresence()
+      const ready = Object.entries(presence).filter(([, ok]) => ok).map(([key]) => key)
+      const missing = Object.entries(presence).filter(([, ok]) => !ok).map(([key]) => key)
+      lines.push(`测绘密钥：已配置 ${ready.length > 0 ? ready.join('/') : '（无）'}；未配置 ${missing.length > 0 ? missing.join('/') : '（无）'}`)
+      const orgRoles = this.squad !== undefined && this.squad !== null
+        ? [...this.squad.coreRoles(), ...this.squad.roles()]
+        : this.roles()
+      for (const role of orgRoles) {
+        const roleSkills = asList(role.skills).filter((name) => asText(name) !== '')
+        const roleMcp = asMcpList(role.mcp).filter((row) => row.enabled !== false).map((row) => row.name)
+        const detail = [roleSkills.length > 0 ? `技能：${roleSkills.join(', ')}` : '', roleMcp.length > 0 ? `MCP：${roleMcp.join(', ')}` : ''].filter((x) => x !== '').join('；')
+        lines.push(`- ${role.name}（${role.id}，${role.tier}）${detail !== '' ? `｜${detail}` : ''}`)
+      }
+      sections.push({ name: 'capabilities', state: 'loaded', text: lines.join('\n') })
+    } catch { /* 取不到就跳过 */ }
+    return sections
+  }
+
+  /** 记录总指挥看过当前完整图谱的版本；不把完整图谱放入 slot。 */
+  markGraphViewed(engagementId, eng) {
+    this.graphViewedVersion.set(engagementId, graphVersionOf(eng))
+  }
+
+  /** 更新唯一的 CONTEXT_SLOTS 消息；同一 turn 的工具步骤不会再次刷新。 */
+  refreshContextSnapshot(engagementId) {
+    const state = this.sessions.get(engagementId)
+    if (state === undefined || state.agent === null) return false
+    return this.slots.refresh(state.agent, engagementId, this.slotSectionsForCockpit(engagementId), 'turn')
   }
 
   async refreshPrompt(engagementId) {
@@ -2597,6 +2962,7 @@ class Cockpit {
     const engagementId = await this.resolveEngagementId(engagement)
     const message = asText(text)
     if (message === '') throw new Error('消息不能为空')
+    if (this.pausedEngagements.has(engagementId)) throw new Error('当前项目已暂停；请先点「继续」')
     const wantsVision = Array.isArray(arguments0Images) && arguments0Images.length > 0
     if (wantsVision) {
       const visionSelection = this.modelFor('vision')
@@ -2681,6 +3047,7 @@ class Cockpit {
     }
     this.pushMessage(engagementId, record)
     this.hub.broadcast({ type: 'chat.user', engagementId, message: record })
+    this.refreshContextSnapshot(engagementId)
     state.agent.followup({ id: record.id, role: 'user', content, source: { kind: 'user' } })
     this.hub.broadcast({ type: 'chat.status', engagementId, status: 'running' })
     return { ok: true, engagementId, sessionId: state.sessionId, tier: state.tier }
@@ -2698,6 +3065,7 @@ class Cockpit {
     }
     if (state === undefined) return { skipped: 'no-session' }
     if (state.agent === null) return { skipped: 'no-agent' }
+    if (this.pausedEngagements.has(engagementId)) return { skipped: 'paused' }
     const force = options.force === true
     const final = options.final === true
     const always = options.always === true
@@ -2763,6 +3131,7 @@ class Cockpit {
     const record = { id: `n_${nowMs().toString(36)}`, role: 'user', text, ts: nowMs(), tier: state.tier, system: true }
     this.pushMessage(engagementId, record)
     this.hub.broadcast({ type: 'chat.user', engagementId, message: record })
+    this.refreshContextSnapshot(engagementId)
     state.agent.followup({
       id: record.id,
       role: 'user',
@@ -2781,6 +3150,38 @@ class Cockpit {
     setTimeout(() => {
       void this.nudge(engagementId, pending.reason, pending.options).catch(() => {})
     }, 0)
+  }
+
+  pause(engagementId) {
+    this.pausedEngagements.add(engagementId)
+    return { ok: true, paused: true }
+  }
+
+  resume(engagementId) {
+    this.pausedEngagements.delete(engagementId)
+    const state = this.sessions.get(engagementId)
+    if (state === undefined || state.agent === null) return { ok: false, resumed: false }
+    const text = '【继续】上次暂停时保留的工具结果和上下文继续生效；请从上次中断位置继续，不要从头重跑。'
+    const record = { id: `resume_${Date.now().toString(36)}`, role: 'user', text, ts: Date.now(), tier: state.tier, system: true }
+    this.pushMessage(engagementId, record)
+    this.hub.broadcast({ type: 'chat.user', engagementId, message: record })
+    this.refreshContextSnapshot(engagementId)
+    state.agent.followup({ id: record.id, role: 'user', content: [{ type: 'text', text }], source: { kind: 'user' } })
+    this.hub.broadcast({ type: 'chat.status', engagementId, status: 'running' })
+    return { ok: true, resumed: true }
+  }
+
+  restorePause(engagementId) {
+    this.pausedEngagements.add(engagementId)
+  }
+
+  isPaused(engagementId) {
+    return this.pausedEngagements.has(engagementId)
+  }
+
+  isBusy(engagementId) {
+    const state = this.sessions.get(engagementId)
+    return state !== undefined && state.busy === true
   }
 
   async stop(engagementId) {
@@ -2990,11 +3391,19 @@ class Cockpit {
         })
       } catch { /* 同上 */ }
     })
+    const offContextPrune = ctx.on('session/event', (session, event) => {
+      try {
+        if (event.type !== 'user/message' || !event.data || !event.data.source || event.data.source.kind !== 'runtime-context') return
+        if (!COMMANDER_SESSIONS.has(session.header && session.header.id)) return
+        setTimeout(() => pruneRuntimeContextSnapshots(session), 0)
+      } catch { /* 快照清理失败不影响对话 */ }
+    })
     return () => {
       offStream()
       offEvent()
       offStatus()
       offError()
+      offContextPrune()
     }
   }
 
@@ -3170,7 +3579,7 @@ class Brief {
       }
     }
 
-    /* 完整看板：用户发言全文 + 全部 agent 条目全文 */
+    /* 看板索引：用户发言全文 + agent 摘要；正文按需 view */
     try {
       const boardText = await boardPromptText(this.board, engagementId, { actor: { key: 'brief' } })
       if (boardText !== '') {
@@ -3195,11 +3604,11 @@ class Brief {
     } catch { /* 同上 */ }
 
 
-    /* 停滞判定 */
+    /* 周期审查状态 */
     try {
       const status = await this.meeting?.verdict?.(eng)
-      if (status !== undefined && status !== null && status.stalled === true) {
-        lines.push(`停滞告警：${Array.isArray(status.reasons) ? status.reasons.join('；') : '任务已派完但无新进展'}`)
+      if (status !== undefined && status !== null && Array.isArray(status.reasons) && status.reasons.length > 0 && status.stalled !== true) {
+        lines.push(`会议状态：${status.reasons.join('；')}`)
       }
     } catch { /* 同上 */ }
 
@@ -3276,7 +3685,7 @@ class Brief {
       handle = await agents.create({
         sessionId: state.sessionId,
         meta: { cwd: this.workDirOf() },
-        agentOptions: selection,
+        agentOptions: { ...selection, maxTokens: 16000 },
         setup,
       })
     } catch (error) {
@@ -3289,7 +3698,7 @@ class Brief {
       handle = await agents.create({
         sessionId: state.sessionId,
         meta: { cwd: this.workDirOf() },
-        agentOptions: selection,
+        agentOptions: { ...selection, maxTokens: 16000 },
         setup,
       })
     }
@@ -3698,7 +4107,7 @@ const STAFF_PROMPT = [
       '环境检查只做只读命令，不扫描目标、不扩大攻击面；检查完再把方案交给总指挥。',
       '',
       '## 方案职责',
-      '吃透图谱现状、完整看板和记忆，给出：攻击面优先级、最可能的突破点（含依据）、被忽略了什么，以及可执行的任务拆解建议（目标 / 建议角色 / 模型档位 / skills / MCP / 验收标准）。',
+      '吃透图谱摘要、看板索引/必要正文和记忆，给出：攻击面优先级、最可能的突破点（含依据）、被忽略了什么，以及可执行的任务拆解建议（目标 / 建议角色 / 模型档位 / skills / MCP / 验收标准）。',
       '整体方案写到 `recon_board`（kind=hypothesis），写完后明确 @总指挥 请其拆任务；不要直接派发 Agent，不要自己扫描目标。',
       '需要跨角色能力时，建议总指挥用 `recon_squad action=group` 编组；组内由成员用 `recon_group ask` 串行协作。',
       '',
@@ -3921,17 +4330,11 @@ function boardOptions(configStore) {
   return { limit, mergeCount, mergeMode, mergeModel }
 }
 
-/** 看板概括只接受真实 summary；禁止用正文截断伪造概括。 */
+/** 看板概括只检查是否为空；长度和是否像正文截断都不再限制。 */
 function boardSummaryOf(row) {
   if (row === null || row === undefined || typeof row !== 'object') return ''
   if (row.author && row.author.role === 'user') return ''
-  const text = asText(row.text).replace(/\s+/g, ' ').trim()
   const explicit = asText(row.summary).replace(/\s+/g, ' ').trim()
-  if (explicit === '') return ''
-  /* 压缩摘要本身既是概括也是正文，允许通过 merged 标记识别。 */
-  if (row.refs && row.refs.merged) return explicit
-  const bodyPrefix = explicit.replace(/…$/g, '').trim()
-  if (explicit === text || (bodyPrefix.length >= 80 && text.startsWith(bodyPrefix))) return ''
   return explicit
 }
 
@@ -3945,7 +4348,7 @@ class Board {
     this.cache = new Map()
     this.seq = 0
     this.locks = new Map()
-    /* agent 已经通过 view 看过的条目：后续该 agent 的提示词用正文替换概括。 */
+    /* agent 已经通过 view 看过的条目：只用于避免相关正文包重复注入。 */
     this.viewed = new Map()
   }
 
@@ -4026,9 +4429,6 @@ class Board {
     if (!Array.isArray(rows) || rows.length === 0) return ''
     const userRows = rows.filter((row) => this.isUserEntry(row))
     const agentRows = rows.filter((row) => this.isUserEntry(row) === false)
-    const viewedIds = options && options.viewedIds instanceof Set
-      ? options.viewedIds
-      : (options && options.actor ? this.viewedIdsOf(engagementId, options.actor) : new Set())
     const lines = []
     lines.push('## 团队看板概括索引（强制阅读）')
     lines.push(`统计：用户 ${userRows.length} 条（正文全部注入、无上限）· agent ${agentRows.length} 条（只注入概括索引，正文按需查看）。`)
@@ -4057,14 +4457,9 @@ class Board {
       const who = row.author && row.author.name ? row.author.name : '?'
       lines.push('')
       lines.push(`### [${asText(row.kind, 'note')}] ${who} · ${when} · ${asText(row.id, '')}`)
-      if (viewedIds.has(row.id)) {
-        lines.push('正文（已查看，已替代原概括）：')
-        lines.push(safePromptText(asText(row.text)))
-      } else {
-        const summary = boardSummaryOf(row)
-        lines.push(`概括：${summary === '' ? '⚠️ 未提供有效概括，请按 id 查看正文' : safePromptText(summary)}`)
-        lines.push(`查看正文：recon_board action=view id=${asText(row.id, '')}`)
-      }
+      const summary = boardSummaryOf(row)
+      lines.push(`概括：${summary === '' ? '⚠️ 未提供有效概括，请按 id 查看正文' : safePromptText(summary)}`)
+      lines.push(`查看正文：recon_board action=view id=${asText(row.id, '')}`)
       renderMeta(row)
     }
     if (userRows.length > 0) {
@@ -4076,6 +4471,77 @@ class Board {
     lines.push('### agent 看板简短索引（全部条目）')
     if (agentRows.length === 0) lines.push('（暂无 agent 看板条目）')
     for (const row of agentRows) renderAgentRow(row)
+    return lines.join('\n')
+  }
+
+  /** 强制只看摘要索引；看板正文永远不进入 slot。 */
+  indexText(engagementId, options = {}) {
+    return this.promptText(engagementId, options)
+  }
+
+  /**
+   * 给当前 agent 选择少量与任务相关的看板正文。
+   * 选择是“按相关性挑条目”，不是截断正文；被选中的正文原样完整注入。
+   */
+  relevantText(engagementId, options = {}) {
+    const rows = this.rawSync(engagementId)
+    if (!Array.isArray(rows) || rows.length === 0) return ''
+    const role = asText(options.role)
+    const taskRows = Array.isArray(options.taskRows) ? options.taskRows : []
+    const taskText = asText(options.task)
+    const nodeIds = new Set()
+    const vulnIds = new Set()
+    const commandIds = new Set()
+    for (const task of taskRows) {
+      const ev = task && task.evidence && typeof task.evidence === 'object' ? task.evidence : {}
+      for (const id of Array.isArray(ev.nodeIds) ? ev.nodeIds : []) nodeIds.add(asText(id))
+      for (const id of Array.isArray(ev.vulnIds) ? ev.vulnIds : []) vulnIds.add(asText(id))
+      for (const id of Array.isArray(ev.commandIds) ? ev.commandIds : []) commandIds.add(asText(id))
+      const goal = asText(task && task.goal)
+      const acceptance = asText(task && task.acceptance)
+      if (goal !== '') taskText += `\n${goal}`
+      if (acceptance !== '') taskText += `\n${acceptance}`
+    }
+    const viewedIds = options.actor ? this.viewedIdsOf(engagementId, options.actor) : new Set()
+    const candidates = rows.filter((row) => row && this.isUserEntry(row) === false && !viewedIds.has(row.id))
+    const scoreOf = (row) => {
+      const refs = row.refs && typeof row.refs === 'object' ? row.refs : {}
+      let score = 0
+      for (const id of Array.isArray(refs.nodeIds) ? refs.nodeIds : []) if (nodeIds.has(asText(id))) score += 100
+      for (const id of Array.isArray(refs.vulnIds) ? refs.vulnIds : []) if (vulnIds.has(asText(id))) score += 100
+      for (const id of Array.isArray(refs.commandIds) ? refs.commandIds : []) if (commandIds.has(asText(id))) score += 100
+      const rowValue = asText(row.value)
+      if (taskText !== '' && (taskText.includes(asText(row.id)) || (rowValue !== '' && taskText.includes(rowValue)))) score += 30
+      if (score > 0) return score
+      /* 参谋需要看最近关键结论；QA 需要看最近被验收的结论。 */
+      if (role === 'staff' && (asText(row.kind) === 'hypothesis' || asText(row.kind) === 'conclusion')) return 10
+      if (role === 'qa' && asText(row.kind) === 'conclusion') return 5
+      return 0
+    }
+    const max = role === 'staff' ? 5 : role === 'qa' ? 4 : 2
+    const picked = candidates
+      .map((row, index) => ({ row, index, score: scoreOf(row), ts: Number(row.ts) || 0 }))
+      .filter((item) => item.score > 0)
+      .sort((a, b) => (b.score - a.score) || (b.ts - a.ts) || (b.index - a.index))
+      .slice(0, max)
+      .map((item) => item.row)
+      .sort((a, b) => (Number(a.ts) || 0) - (Number(b.ts) || 0))
+    if (picked.length === 0) return ''
+    const lines = ['## 当前任务相关看板正文（完整，不截断）']
+    for (const row of picked) {
+      const when = new Date(Number(row.ts) || Date.now()).toLocaleString('zh-CN')
+      const who = row.author && row.author.name ? row.author.name : '?'
+      lines.push('')
+      lines.push(`### [${asText(row.kind, 'note')}] ${who} · ${when} · ${asText(row.id, '')}`)
+      lines.push(safePromptText(asText(row.text)))
+      const refs = row.refs && typeof row.refs === 'object' ? row.refs : {}
+      const refParts = []
+      for (const key of ['nodeIds', 'vulnIds', 'commandIds']) {
+        if (Array.isArray(refs[key]) && refs[key].length > 0) refParts.push(`${key}=${refs[key].join(',')}`)
+      }
+      if (refParts.length > 0) lines.push(`引用：${refParts.join('；')}`)
+      if (Array.isArray(row.shots) && row.shots.length > 0) lines.push(`截图（仅路径）：${row.shots.join(' | ')}`)
+    }
     return lines.join('\n')
   }
 
@@ -4161,6 +4627,10 @@ class Board {
       summary: isUser ? '' : boardSummaryOf({ author: entry.author, text, summary: entry.summary }),
       refs: entry.refs || {},
       shots: Array.isArray(entry.shots) ? entry.shots : [],
+    }
+    /* 内部直接 board.post 的 agent/系统条目：summary 为空时自动调用快速模型生成。 */
+    if (!isUser && record.summary === '') {
+      try { record.summary = await this.generateSummary(text) } catch { record.summary = '' }
     }
     rows.push(record)
     let merged = null
@@ -4337,14 +4807,10 @@ class Board {
     return asText(out)
   }
 
-  /** 用一次独立 LLM 调用把已有正文提炼成真正的概括；正文永不改。 */
-  async summarizeEntry(engagementId, id) {
-    const rows = await this.raw(engagementId)
-    const row = rows.find((item) => item.id === asText(id))
-    if (row === undefined) throw new Error(`看板条目不存在：${id}`)
-    if (this.isUserEntry(row)) throw new Error('用户看板条目不需要概括')
-    const body = asText(row.text)
-    if (body === '') throw new Error('看板正文为空，无法生成概括')
+  /** 一次独立的快速模型调用：生成真正的语义概括；不修改正文。 */
+  async generateSummary(body) {
+    const text = asText(body)
+    if (text === '') throw new Error('看板正文为空，无法生成概括')
     const llm = this.ctx && typeof this.ctx.get === 'function' ? this.ctx.get('llm') : undefined
     if (llm === undefined || llm === null || typeof llm.stream !== 'function') throw new Error('llm 服务不可用，无法生成概括')
     let selection = modelSelectionFor(this.ctx, this.configStore, 'fast')
@@ -4357,24 +4823,30 @@ class Board {
     }
     if (asText(selection.provider) === '' || asText(selection.model) === '') throw new Error('没有可用模型，无法生成概括')
     let summary = ''
-    try {
-      const stream = llm.stream({
-        provider: asText(selection.provider),
-        model: asText(selection.model),
-        system: '你是严格的看板概括器。只输出 1-3 句真正的语义概括，说明对象、位置、结论和下一步；禁止复制正文、禁止截断正文、禁止输出 Markdown 标题或前后解释。',
-        messages: [{ role: 'user', content: [{ type: 'text', text: `请概括以下看板正文：\n\n${body}` }] }],
-        maxTokens: 512,
-        temperature: 0.1,
-      })
-      for await (const chunk of stream) {
-        if (chunk && chunk.type === 'text-delta' && typeof chunk.text === 'string') summary += chunk.text
-      }
-    } catch (error) {
-      throw new Error(`生成概括失败：${error && error.message ? error.message : String(error)}`)
+    const stream = llm.stream({
+      provider: asText(selection.provider),
+      model: asText(selection.model),
+      reasoningEffort: 'off',
+      system: '你是严格的看板概括器。只输出 1-3 句真正的语义概括，说明对象、位置、结论和下一步；禁止复制正文、禁止截断正文、禁止输出 Markdown 标题或前后解释。',
+      messages: [{ role: 'user', content: [{ type: 'text', text: `请概括以下看板正文：\n\n${text}` }] }],
+      maxTokens: 512,
+      temperature: 0.1,
+    })
+    for await (const chunk of stream) {
+      if (chunk && chunk.type === 'text-delta' && typeof chunk.text === 'string') summary += chunk.text
     }
     summary = summary.trim()
     if (summary === '') throw new Error('模型没有返回概括')
-    row.summary = summary
+    return summary
+  }
+
+  /** 用一次独立 LLM 调用把已有正文提炼成真正的概括；正文永不改。 */
+  async summarizeEntry(engagementId, id) {
+    const rows = await this.raw(engagementId)
+    const row = rows.find((item) => item.id === asText(id))
+    if (row === undefined) throw new Error(`看板条目不存在：${id}`)
+    if (this.isUserEntry(row)) throw new Error('用户看板条目不需要概括')
+    row.summary = await this.generateSummary(row.text)
     await writeJsonAtomic(this.fileOf(engagementId), rows)
     try { this.hub.broadcast({ type: 'board.update', engagementId, entry: row }) } catch { /* 忽略 */ }
     return row
@@ -4414,7 +4886,7 @@ class Board {
 }
 
 
-/** 给 agent 的完整看板文本：用户发言全文 + 全部 agent 条目全文。 */
+/** 给 agent 的看板索引：用户发言全文 + agent 摘要；agent 正文按需 view。 */
 async function boardPromptText(board, engagementId, options = {}) {
   if (board === undefined || board === null) return ''
   try {
@@ -4708,6 +5180,14 @@ class Tasks {
       goal: asText(input.goal, prev === null ? '' : asText(prev.goal)),
       done: asText(input.done, prev === null ? '' : asText(prev.done)),
       status: asText(input.status, prev === null ? 'running' : asText(prev.status, 'running')),
+      /* 任务开始=1；总指挥 mission close 后=0。旧任务没有该字段时按 status 推断。 */
+      reviewActive: input.reviewActive === true
+        ? true
+        : (input.reviewActive === false
+          ? false
+          : (prev !== null && prev !== undefined && prev.reviewActive !== undefined
+            ? prev.reviewActive === true
+            : asText(input.status, prev === null ? 'running' : asText(prev.status, 'running')) === 'running')),
       rounds: (() => {
         const prevRounds = prev === null || prev === undefined ? 0 : Number(prev.rounds)
         const fallback = Number.isFinite(prevRounds) ? prevRounds : 0
@@ -4899,6 +5379,14 @@ class Squad {
     this.seq = 0
     this.groupSeq = 0
     this.promptCache = new Map()
+    /* 动态上下文使用单条 CONTEXT_SLOTS 消息，每次更新替换旧 slot。 */
+    this.slots = new ContextSlotManager(ctx, hub)
+    /* 中断不 cancel：只让 agent/pre-step 在下一个模型步骤前 reject。 */
+    this.pausedEngagements = new Set()
+    /* 暂停时记录真正活跃的成员，恢复时只唤醒这些成员。 */
+    this.pausedMembers = new Map()
+    /* graph 查看状态只用于参谋规划门禁，不把完整图谱放进 slot。 */
+    this.graphViewedVersion = new Map()
     /* 花名册 key→名字，永久保存：历史看板/任务正文里写的 a7 也要能翻成「验收#1」 */
     this.roster = new Map()
     this.rosterLoaded = false
@@ -5402,6 +5890,8 @@ class Squad {
     let removed = 0
     for (const member of Array.from(this.members.values())) {
       if (asText(engagementId) !== '' && member.engagementId !== asText(engagementId)) continue
+      /* 暂停期间不自动回收：否则空闲 15 分钟后队员会被“离职交接”后消失。 */
+      if (this.pausedEngagements.has(member.engagementId)) continue
       if (member.status === 'running' || member.status === 'starting' || member.status === 'waiting') continue
       if (CORE_ROLES.has(member.role)) continue /* 总指挥/参谋常驻，不回收 */
       const idleSince = member.idleSince || member.startedAt || now
@@ -5468,6 +5958,64 @@ class Squad {
       removed += 1
     }
     return removed
+  }
+
+  pause(engagementId) {
+    if (!this.pausedEngagements.has(engagementId)) {
+      const active = new Set()
+      for (const member of this.members.values()) {
+        if (member.engagementId !== engagementId) continue
+        if (member.status !== 'running' && member.status !== 'starting' && member.status !== 'waiting') continue
+        if (asText(member.task) === '') continue
+        /* 总指挥由 Cockpit 统一恢复，避免 Squad 和 Cockpit 双开。 */
+        if (member.role === 'commander') continue
+        active.add(member.key)
+      }
+      this.pausedMembers.set(engagementId, active)
+    }
+    this.pausedEngagements.add(engagementId)
+    return { ok: true, paused: true, members: Array.from(this.pausedMembers.get(engagementId) || []) }
+  }
+
+  /** 进程重启后从 checkpoint 恢复暂停成员集合。 */
+  restorePause(engagementId, keys) {
+    this.pausedEngagements.add(engagementId)
+    this.pausedMembers.set(engagementId, new Set(Array.isArray(keys) ? keys : []))
+  }
+
+  isPaused(engagementId) {
+    return this.pausedEngagements.has(engagementId)
+  }
+
+  isBusy(engagementId) {
+    return this.activeCount(engagementId) > 0
+  }
+
+  /** 清除暂停，只唤醒暂停前真正活跃的成员；不重新 spawn，不重派任务。 */
+  resume(engagementId) {
+    this.pausedEngagements.delete(engagementId)
+    const paused = this.pausedMembers.get(engagementId) || new Set()
+    this.pausedMembers.delete(engagementId)
+    let resumed = 0
+    for (const key of paused) {
+      const member = this.members.get(key)
+      if (member === undefined) continue
+      if (member.engagementId !== engagementId || member.agent === null || member.agent === undefined) continue
+      if (asText(member.task) === '') continue
+      /* 总指挥由 Cockpit.resume 统一恢复，避免双开。 */
+      if (member.role === 'commander') continue
+      try {
+        const text = '【继续】上次暂停时保留的工具结果和上下文继续生效；请从上次中断位置继续，不要从头重跑。'
+        member.agent.followup({
+          id: `resume_${nowMs().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+          role: 'user',
+          content: [{ type: 'text', text }],
+          source: { kind: 'user' },
+        })
+        resumed += 1
+      } catch { /* 单个成员唤醒失败不影响其它成员 */ }
+    }
+    return { ok: true, resumed }
   }
 
   async stopAll(engagementId) {
@@ -5606,8 +6154,8 @@ class Squad {
    * 每一轮 agent 组装系统提示时调用，数据直接取内存缓存（configStore / members / board.cache / tasks.cache / store.cache），
    * 所以「总指挥刚在看板点了你的名」→ 你下一次思考就已经看到了，不用等任何刷新。
    */
-  renderPromptSync(key) {
-    const member = this.members.get(key)
+  renderPromptSync(key, memberOverride) {
+    const member = memberOverride || this.members.get(key)
     if (member === undefined) return ''
     const engagementId = member.engagementId
     const role = this.roleOf(member.role)
@@ -5651,48 +6199,11 @@ class Squad {
       lines.push('- 你离职后这个目录不会被删除；不要往别人的工位目录里写。')
     }
 
-    /* —— 点名给我的（实时，置顶）—— */
-    const boardRows = this.board === undefined || this.board === null ? [] : this.board.rawSync(engagementId)
-    const myNames = [member.name, member.key].filter((v) => asText(v) !== '')
-    const calledOn = boardRows.filter((row) => {
-      const fromMe = row.author && row.author.name === member.name
-      if (fromMe) return false
-      const body = asText(row.text)
-      return myNames.some((n) => body.includes(n))
-    }).slice(-6)
-    if (calledOn.length > 0) {
+    if (role.id === 'staff') {
       lines.push('')
-      lines.push('## 总指挥点名给你的（最新，优先级高于下面的通用看板）')
-      for (const row of calledOn) {
-        const who = row.author && row.author.name ? row.author.name : '指挥席'
-        lines.push(`- （${new Date(Number(row.ts) || Date.now()).toLocaleString('zh-CN')}）${who}：${shortText(this.humanize(asText(row.text)).replace(/\s+/g, ' '), 400)}`)
-      }
-    }
-
-    /* —— 分给我的任务（实时）—— */
-    const taskRows = this.tasks === undefined || this.tasks === null ? [] : this.tasks.rawSync(engagementId)
-    /* 指派到具体人 + 只写了角色（assignee 为空）的任务都算“分给我”的。 */
-    const mine = taskRows.filter((row) => row.assignee === member.name
-      || (asText(row.assignee) === '' && row.role === member.role))
-    const openMine = mine.filter((row) => row.status !== 'passed' && row.status !== 'failed')
-    if (openMine.length > 0) {
-      lines.push('')
-      lines.push('## 分给你的未完成任务（实时）')
-      for (const row of openMine.slice(-8)) {
-        const ev = row.evidence || {}
-        const evidence = [
-          Array.isArray(ev.commandIds) && ev.commandIds.length > 0 ? `命令 ${ev.commandIds.join(',')}` : '',
-          Array.isArray(ev.vulnIds) && ev.vulnIds.length > 0 ? `漏洞 ${ev.vulnIds.join(',')}` : '',
-          Array.isArray(ev.nodeIds) && ev.nodeIds.length > 0 ? `节点 ${ev.nodeIds.join(',')}` : '',
-          Array.isArray(ev.shots) && ev.shots.length > 0 ? `截图 ${ev.shots.length}` : '',
-        ].filter((x) => x !== '').join('；')
-        lines.push(`- ${row.id} ${this.humanize(row.title)}｜目标：${shortText(this.humanize(row.goal) || '-', 90)}｜验收：${shortText(this.humanize(row.acceptance) || '-', 70)}${evidence !== '' ? `｜已有证据：${evidence}` : ''}`)
-      }
-      lines.push('做完用 `recon_task update` 改成 doing/passed 并附证据。')
-    }
-    const rejected = mine.filter((row) => row.status === 'failed')
-    if (rejected.length > 0) {
-      lines.push(`有 ${rejected.length} 条被验收驳回，优先返工：${rejected.slice(-3).map((r) => `${r.id}（${shortText(r.note || '未达标', 60)}）`).join('；')}`)
+      lines.push('## 参谋规划硬规则')
+      lines.push('- 制定整体方案、提出新一轮 hypothesis 前，必须先调用 `recon_view` 查看当前完整图谱（`node` 留空，`limit` 不传或覆盖当前节点数）；只有节点详情查看不算完成整体图谱审查。')
+      lines.push('- 看板正文默认只给索引；需要某条证据时用 `recon_board action=view id=...`，不要把摘要当正文猜测。')
     }
     if (role.id === 'qa') {
       lines.push('')
@@ -5701,64 +6212,6 @@ class Squad {
       lines.push('2. 用 `recon_audit action=list member=执行者` 核对真实命令、覆盖范围与结果；证据断了或结果不可复现就 reject。')
       lines.push('3. 需要复现时自己 `recon_run` / `recon_browser`；通过才 `recon_task accept`，驳回必须写清缺口并 `recon_task reject`。')
       lines.push('4. 全部任务通过后写最终验收报告到看板（kind=conclusion）；最终只能由总指挥 close，你不要替总指挥宣布结束。')
-    }
-
-    /* —— 在岗同事（实时，方便直接喊人）—— */
-    const peers = Array.from(this.members.values())
-      .filter((m) => m.engagementId === engagementId && m.key !== member.key)
-      .map((m) => `${m.name}（${this.roleOf(m.role).name}）`)
-    if (peers.length > 0) {
-      lines.push('')
-      lines.push(`在岗同事：${peers.join('、')}`)
-      lines.push('要找别人接手，直接在看板写「@名字 + 要他做什么」，或让总指挥派。')
-    }
-    const groupText = this.groupPromptText(member)
-    if (groupText !== '') lines.push(groupText)
-
-    /* —— 完整看板（强制阅读：用户发言全文 + 全部 agent 条目全文）—— */
-    if (this.board !== undefined && this.board !== null) {
-      const boardText = this.board.promptText(engagementId, { actor: member })
-      if (boardText !== '') { lines.push(''); lines.push(boardText) }
-    }
-
-    /* —— 靶标现状 —— */
-    const eng = this.store && this.store.cache ? this.store.cache.get(engagementId) : undefined
-    if (eng !== undefined) {
-      const stats = statsOf(eng)
-      lines.push('')
-      lines.push(`当前靶标：${eng.name}（${eng.id}）；节点 ${stats.nodes} · 关系 ${stats.edges} · 漏洞 ${stats.vulns} · 命令 ${stats.commands}`)
-      const recentNodes = eng.nodes.filter((node) => node.archived !== true).slice(-20).map((node) => `${node.kind}:${node.value}`)
-      if (recentNodes.length > 0) lines.push(`最近资产：${recentNodes.join(' , ')}`)
-    }
-
-    /* —— 全局长期记忆（所有 agent 强制阅读，仅参谋/总指挥可写）—— */
-    const dynamicConfig = this.configStore.get()
-    const dynamicMemory = Array.isArray(dynamicConfig.memory) ? dynamicConfig.memory : []
-    if (dynamicMemory.length > 0) {
-      lines.push('')
-      lines.push('## 长期记忆（全局强制阅读，全部条目）')
-      for (const item of dynamicMemory) {
-        const entry = memoryEntryOf(item)
-        if (entry.content !== '') lines.push(`- [${entry.category || 'other'}] ${entry.title}：${entry.content}`)
-      }
-    }
-    const memberPromptGroupText = this.groupPromptText(member)
-    if (memberPromptGroupText !== '') {
-      lines.push('')
-      lines.push(memberPromptGroupText)
-    }
-
-    /* —— 常设席位的前情 —— */
-    if (CORE_ROLES.has(member.role)) {
-      const rows = this.transcripts === undefined ? undefined : this.transcripts.get(member.key)
-      const recent = Array.isArray(rows) ? rows.filter((row) => asText(row.text) !== '').slice(-6) : []
-      if (recent.length > 0) {
-        lines.push('')
-        lines.push('## 你的前情（这个席位一直在，下面是你之前说过的，接着做，不要重复已完成的事）')
-        for (const row of recent) {
-          lines.push(`- （${new Date(Number(row.ts) || Date.now()).toLocaleString('zh-CN')}）${shortText(asText(row.text).replace(/\s+/g, ' '), 240)}`)
-        }
-      }
     }
 
     lines.push('')
@@ -5770,6 +6223,107 @@ class Squad {
     lines.push('- 命令一律走 `recon_run`（会留痕并上图）；页面操作走 `recon_browser`。')
 
     return safePromptText(withCommonPrompt(this.configStore.get(), lines.join('\n')))
+  }
+
+  /** 结构化动态槽位：看板/记忆/图谱/任务/团队/任务包/前情。 */
+  slotSectionsForMember(key) {
+    const member = this.members.get(key)
+    if (member === undefined) return []
+    const engagementId = member.engagementId
+    const sections = []
+    try {
+      const boardText = this.board && this.board.indexText
+        ? this.board.indexText(engagementId, { actor: member })
+        : ''
+      sections.push({ name: 'board_index', state: boardText !== '' ? 'loaded' : 'empty', text: boardText })
+    } catch { /* 取不到就跳过 */ }
+    try {
+      const taskRows = this.tasks ? this.tasks.rawSync(engagementId) : []
+      const mine = taskRows.filter((row) => row.assignee === member.name
+        || (asText(row.assignee) === '' && row.role === member.role))
+      const relevant = this.board && this.board.relevantText
+        ? this.board.relevantText(engagementId, { role: member.role, task: member.task, taskRows: mine })
+        : ''
+      if (relevant !== '') sections.push({ name: 'board_relevant', state: 'loaded', text: relevant })
+    } catch { /* 取不到就跳过 */ }
+    try {
+      const memory = Array.isArray(this.configStore.get().memory) ? this.configStore.get().memory : []
+      const lines = []
+      for (const item of memory) {
+        const entry = memoryEntryOf(item)
+        if (entry.content !== '') lines.push(`- [${entry.category || 'other'}] ${entry.title}：${entry.content}`)
+      }
+      sections.push({ name: 'memory', state: lines.length > 0 ? 'loaded' : 'empty', text: lines.join('\n') })
+    } catch { /* 取不到就跳过 */ }
+    try {
+      const eng = this.store && this.store.cache ? this.store.cache.get(engagementId) : undefined
+      if (eng !== undefined) {
+        if (member.role === 'staff' || member.role === 'commander') {
+          sections.push({ name: 'graph', state: 'digest', text: graphDigestText(eng) })
+        } else {
+          sections.push({ name: 'graph', state: 'placeholder', text: '[GRAPH_SLOT_PLACEHOLDER] 当前未加载完整图谱；需要时调用 recon_view。' })
+        }
+      } else {
+        sections.push({ name: 'graph', state: 'placeholder', text: '[GRAPH_SLOT_PLACEHOLDER] 当前没有图谱；需要时调用 recon_view。' })
+      }
+    } catch { /* 取不到就跳过 */ }
+    try {
+      const taskRows = this.tasks ? this.tasks.rawSync(engagementId) : []
+      const mine = taskRows.filter((row) => row.assignee === member.name
+        || (asText(row.assignee) === '' && row.role === member.role))
+      const openMine = mine.filter((row) => row.status !== 'passed' && row.status !== 'failed')
+      const lines = []
+      for (const row of openMine.slice(-8)) {
+        const ev = row.evidence || {}
+        const evidence = [
+          Array.isArray(ev.commandIds) && ev.commandIds.length > 0 ? `命令 ${ev.commandIds.join(',')}` : '',
+          Array.isArray(ev.vulnIds) && ev.vulnIds.length > 0 ? `漏洞 ${ev.vulnIds.join(',')}` : '',
+          Array.isArray(ev.nodeIds) && ev.nodeIds.length > 0 ? `节点 ${ev.nodeIds.join(',')}` : '',
+          Array.isArray(ev.shots) && ev.shots.length > 0 ? `截图 ${ev.shots.length}` : '',
+        ].filter((x) => x !== '').join('；')
+        lines.push(`- ${row.id} ${this.humanize(row.title)}｜目标：${shortText(this.humanize(row.goal) || '-', 90)}｜验收：${shortText(this.humanize(row.acceptance) || '-', 70)}${evidence !== '' ? `｜已有证据：${evidence}` : ''}`)
+      }
+      const rejected = mine.filter((row) => row.status === 'failed')
+      if (rejected.length > 0) lines.push(`被驳回：${rejected.slice(-3).map((r) => `${r.id}（${shortText(r.note || '未达标', 60)}）`).join('；')}`)
+      sections.push({ name: 'tasks', state: lines.length > 0 ? 'loaded' : 'empty', text: lines.join('\n') })
+    } catch { /* 取不到就跳过 */ }
+    try {
+      const peers = Array.from(this.members.values())
+        .filter((m) => m.engagementId === engagementId && m.key !== member.key)
+        .map((m) => `${m.name}（${this.roleOf(m.role).name}）`)
+      const lines = peers.length > 0 ? [`在岗同事：${peers.join('、')}`] : []
+      const groupText = this.groupPromptText(member)
+      if (groupText !== '') lines.push(groupText)
+      sections.push({ name: 'team', state: lines.length > 0 ? 'loaded' : 'empty', text: lines.join('\n') })
+    } catch { /* 取不到就跳过 */ }
+    const assignment = asText(member.task)
+    sections.push({ name: 'assignment', state: assignment !== '' ? 'loaded' : 'empty', text: assignment })
+    try {
+      if (CORE_ROLES.has(member.role)) {
+        const rows = this.transcripts === undefined ? undefined : this.transcripts.get(member.key)
+        const recent = Array.isArray(rows) ? rows.filter((row) => asText(row.text) !== '').slice(-6) : []
+        const lines = recent.map((row) => `- （${new Date(Number(row.ts) || Date.now()).toLocaleString('zh-CN')}）${shortText(asText(row.text).replace(/\s+/g, ' '), 240)}`)
+        sections.push({ name: 'history', state: lines.length > 0 ? 'loaded' : 'empty', text: lines.join('\n') })
+      }
+    } catch { /* 取不到就跳过 */ }
+    return sections
+  }
+
+  /** 记录成员看过当前完整图谱的版本；不把完整图谱放入 slot。 */
+  markGraphViewed(key, eng) {
+    const member = this.members.get(key)
+    if (member !== undefined) {
+      member.graphViewedAt = nowMs()
+      member.graphViewedVersion = graphVersionOf(eng)
+    }
+    this.graphViewedVersion.set(key, graphVersionOf(eng))
+  }
+
+  /** 更新唯一的 CONTEXT_SLOTS 消息；同一 turn 内工具步骤不重复刷新。 */
+  refreshContextSnapshot(key) {
+    const member = this.members.get(key)
+    if (member === undefined || member.agent === null) return false
+    return this.slots.refresh(member.agent, key, this.slotSectionsForMember(key), 'turn')
   }
 
   /** 花名册落盘文件 */
@@ -5847,114 +6401,9 @@ class Squad {
     return count
   }
 
+  /** 兼容入口：固定区提示词只有 renderPromptSync 一份，避免两套逻辑漂移。 */
   async memberPrompt(engagementId, role, member) {
-    const config = this.configStore.get()
-    const eng = await this.store.load(engagementId)
-    const lines = []
-    lines.push(`## 你是「狩猎 · 协同团队」里的${role.name}（role=${role.id}）`)
-    lines.push(role.prompt)
-    if (role.id === 'scout' && !String(role.prompt || '').includes('recon_nday')) {
-      lines.push('')
-      lines.push('## 指纹 Nday 检索（探测到指纹后立即查，不必等总指挥指派）')
-      lines.push('- 你在测绘中确认服务 / 中间件 / 产品 / 版本指纹后，立刻调用 `recon_nday fingerprint="..."` 查 Exploit-DB 与 NVD；')
-      lines.push('- 每个指纹至少查一次；候选 CVE / EDB / 受影响版本写看板 kind=hypothesis 并附来源，需要实测的交 Web 手 / QA；')
-      lines.push('- 只查历史漏洞库，不对目标发包；不要凭版本猜结论；工具没查到就写「无匹配」，不要编造 CVE。')
-    }
-    lines.push('')
-    lines.push(`你的汇报对象：${role.reportsTo || '无（最高指挥）'}。`)
-    const roleSkills = Array.isArray(role.skills) ? role.skills : []
-    if (roleSkills.length > 0) lines.push(`你已启用的技能：${roleSkills.join(', ')}（需要细节时用 recon_skill action=load name=技能名 加载完整正文）。`)
-    lines.push(`模型档位：${role.tier === 'dsh' ? '跟随 DSH' : (role.tier || 'deep')}`)
-    if (member !== undefined && member !== null) {
-      lines.push(`你的代号：${member.name}（key=${member.key}）；总指挥点名派的活，汇报时自报这个代号。`)
-      if (asText(member.station) !== '') {
-        lines.push('')
-        lines.push('## 你的工位')
-        lines.push(`工作目录：${member.station}`)
-        lines.push('- 所有命令默认在这里执行，临时文件、脚本、扫描输出的**相对路径**都落在你自己的工位里，不会和别的队员撞车。')
-        lines.push('- 要交接给别的队员或 qa 复核的产物，写到同级共享目录 `../shared/`（不存在就先 mkdir -p ../shared），并在看板条目里写清文件名。')
-        lines.push('- 你离职后这个目录不会被删除，东西都留着；不要往别人的工位目录里写。')
-      }
-      const extraSkills = (Array.isArray(member.skills) ? member.skills : []).filter((name) => roleSkills.includes(name) === false)
-      if (extraSkills.length > 0) lines.push(`总指挥为你点开的技能：${extraSkills.join(', ')}（先用 recon_skill action=load 把它们加载进来再干活）。`)
-      if (asText(member.promptExtra) !== '') {
-        lines.push('')
-        lines.push('总指挥给你的专属指令（最高优先级，必须遵守）：')
-        lines.push(member.promptExtra)
-      }
-      lines.push('')
-      lines.push(...this.mcpPromptLines(member))
-    }
-    try {
-      const rows = this.tasks === undefined || this.tasks === null ? [] : await this.tasks.list(engagementId, 120)
-      const mine = rows.filter((row) => row.role === role.id && row.status !== 'passed')
-      if (mine.length > 0) {
-        lines.push('分给你（或你的角色）的未完成任务：')
-        for (const row of mine.slice(-8)) {
-          lines.push(`- ${row.id} ${row.title}｜目标：${shortText(row.goal || '-', 80)}｜验收：${shortText(row.acceptance || '-', 60)}`)
-        }
-        lines.push('完成后用 `recon_task update` 把状态改成 doing/passed 并附证据。')
-      }
-    } catch { /* 忽略 */ }
-    lines.push('团队纪律：')
-    lines.push('- 你和其它 Agent 并行工作，共享同一份图谱、命令日志和看板；不要重复别人刚写进看板的结论。')
-    lines.push('- 记忆是全局强制阅读的完整事实库；你没有写入权限，重要结论交给总指挥/参谋写记忆，日常过程只写看板。')
-    lines.push('- 每次有发现或猜想，立刻 `recon_board` 记一条（kind=finding/hypothesis/task/conclusion），带上节点/漏洞/命令引用。')
-    lines.push('- 你不能派发新 Agent（那是指挥席的事）。遇到非自己职责的卡点（例如 Web 需要逆向、需要内网隧道），先用 `recon_group action=request role=... task=...` 报给总指挥；等总指挥把你和专业人员编成小组后，用 `recon_group action=ask member=对方 question=...` 串行提问并等待结果，再继续自己的工作。')
-    lines.push('- 命令一律走 `recon_run`（会留痕并上图）；页面操作走 `recon_browser`。')
-    if (eng !== undefined) {
-      const stats = statsOf(eng)
-      lines.push('')
-      lines.push(`当前靶标：${eng.name}（${eng.id}）；节点 ${stats.nodes} · 关系 ${stats.edges} · 漏洞 ${stats.vulns} · 命令 ${stats.commands}`)
-      const recentNodes = eng.nodes.filter((node) => node.archived !== true).slice(-20).map((node) => `${node.kind}:${node.value}`)
-      if (recentNodes.length > 0) lines.push(`最近资产：${recentNodes.join(' , ')}`)
-    }
-    /* 完整看板置顶注入：用户发言全文 + 所有 agent 条目全文 */
-    const boardText = await boardPromptText(this.board, engagementId, { actor: member })
-    if (boardText !== '') {
-      lines.push('')
-      lines.push(boardText)
-      lines.push('')
-    }
-    /* 常设席位（总指挥/参谋）跨重启保持对话记忆：把最近几轮自己的发言带回来 */
-    if (member !== undefined && member !== null && CORE_ROLES.has(member.role)) {
-      try {
-        const rows = await this.transcriptOf(member)
-        const recent = Array.isArray(rows) ? rows.filter((row) => asText(row.text) !== '').slice(-6) : []
-        if (recent.length > 0) {
-          lines.push('')
-          lines.push('## 你的前情（这个席位一直在，下面的对话是你之前说过的，接着做，不要重复已完成的事）')
-          for (const row of recent) {
-            lines.push(`- （${new Date(Number(row.ts) || Date.now()).toLocaleString('zh-CN')}）${shortText(asText(row.text).replace(/\s+/g, ' '), 240)}`)
-          }
-        }
-      } catch { /* 读不到就不带 */ }
-    }
-    try {
-      const taskRows = this.tasks === undefined || this.tasks === null ? [] : await this.tasks.list(engagementId, 80)
-      const open = taskRows.filter((row) => row.status !== 'passed' && row.status !== 'failed')
-      if (open.length > 0) {
-        lines.push('')
-        lines.push('未闭环任务：')
-        for (const row of open.slice(-12)) {
-          lines.push(`- ${row.id} [${row.role}/${row.status}] ${row.title}｜验收：${shortText(row.acceptance || '-', 60)}`)
-        }
-      }
-      const failed = taskRows.filter((row) => row.status === 'failed')
-      if (failed.length > 0) {
-        lines.push(`有 ${failed.length} 条任务被验收驳回，优先处理返工。`)
-      }
-    } catch { /* 任务读取失败不影响对话 */ }
-    const memory = Array.isArray(config.memory) ? config.memory : []
-    if (memory.length > 0) {
-      lines.push('')
-      lines.push('## 长期记忆（全局强制阅读，全部条目）')
-      for (const item of memory) {
-        const entry = memoryEntryOf(item)
-        if (entry.content !== '') lines.push(`- [${entry.category || 'other'}] ${entry.title}：${entry.content}`)
-      }
-    }
-    return safePromptText(withCommonPrompt(config, lines.join('\n')))
+    return this.renderPromptSync(member && member.key ? member.key : '', member)
   }
 
   /** 工位目录名：用队员名，去掉文件系统不允许的字符 */
@@ -5988,6 +6437,7 @@ class Squad {
     if (agents === undefined || agents === null) throw new Error('agents 服务不可用')
     const engagement = await this.store.load(engagementId)
     if (engagement === undefined) throw new Error(`靶标不存在：${engagementId}`)
+    if (this.pausedEngagements.has(engagementId)) throw new Error('当前项目已暂停；请先点「继续」再派发新队员')
     const requestedRole = asText(roleId)
     if (requestedRole !== '') {
       const directRole = this.roles().find((role) => role.id === requestedRole || role.name === requestedRole)
@@ -6029,27 +6479,28 @@ class Squad {
     const maxAgents = Number.isFinite(Number(automationConfig.maxAgents))
       ? Math.max(1, Math.min(50, Math.floor(Number(automationConfig.maxAgents))))
       : 8
-    const configuredMembers = Number.isFinite(Number(automationConfig.maxMembers))
-      ? Math.max(1, Math.min(50, Math.floor(Number(automationConfig.maxMembers))))
-      : 6
-    /* 最大并发数调大时，成员上限跟随，避免被隐藏的 6 人上限拦住 */
-    const maxMembers = Math.max(maxAgents, configuredMembers)
+    /* 最大成员数严格等于控制台的 maxAgents；总指挥/参谋常设席位不计入。 */
+    const maxMembers = maxAgents
     const coreCount = () => Array.from(this.members.values())
       .filter((m) => m.engagementId === engagementId && CORE_ROLES.has(m.role)).length
     if (this.memberCount(engagementId) - coreCount() >= maxMembers) {
       const before = this.memberCount(engagementId)
       await this.pruneIdle(60000)
       if (this.memberCount(engagementId) - coreCount() >= maxMembers) {
-        throw new Error(`队员已满（${maxMembers}）：先停掉/移除空闲成员，或在控制台调大「最大并发数」`)
+        throw new Error(`队员已达上限（${maxMembers}）：先停掉/移除空闲成员，或在控制台调大「最大成员数」`)
       }
       if (before === this.memberCount(engagementId)) {
         /* 没有可回收的，继续走失败分支 */
       }
     }
-    /* 角色只选档位（deep / fast / vision / dsh），实际 provider/model 由模型页决定 */
-    const wantedTier = MODEL_CHOICES.includes(asText(tier))
-      ? asText(tier)
-      : (MODEL_CHOICES.includes(asText(role.tier)) ? asText(role.tier) : 'dsh')
+    /* 角色只选档位（deep / fast / vision / dsh），实际 provider/model 由模型页决定。
+       控制台可强制新队员档位；auto 时由总指挥的 spawn.tier 决定，未指定则用角色默认。 */
+    const recruitPolicy = asText(this.configStore.get().roles && this.configStore.get().roles.recruitTier, 'auto')
+    const explicitTier = MODEL_CHOICES.includes(asText(tier)) ? asText(tier) : ''
+    const roleTier = MODEL_CHOICES.includes(asText(role.tier)) ? asText(role.tier) : 'dsh'
+    const wantedTier = !CORE_ROLES.has(role.id) && MODEL_TIERS.includes(recruitPolicy)
+      ? recruitPolicy
+      : (explicitTier !== '' ? explicitTier : roleTier)
     const selection = this.modelFor(wantedTier)
     const workDir = await ensureDir(join(this.store.workDir, engagementId))
     this.seq += 1
@@ -6086,6 +6537,8 @@ class Squad {
       lastAssistantText: '',
       lastTool: '',
       boardPosts: 0,
+      graphViewedAt: 0,
+      graphViewedVersion: '',
       origin,
       groupId: null,
       answerWaiters: [],
@@ -6103,8 +6556,16 @@ class Squad {
           prompt.section({
             name: `recon-squad-${key}`,
             order: 4902,
-            /* 每轮实时渲染：看板/任务/名字/MCP 变更立刻进上下文，不等任何刷新 */
+            /* 固定角色/技能/MCP；动态看板/记忆改走 CONTEXT_SLOTS。 */
             text: () => squad.renderPromptSync(key) || safePromptText(withCommonPrompt(squad.configStore.get(), `## 你是${role.name}\n${role.prompt}`)),
+          })
+        }
+        if (typeof agentCtx.on === 'function') {
+          agentCtx.on('agent/pre-step', async (payload, next) => {
+            if (squad.pausedEngagements.has(engagementId)) return { kind: 'reject' }
+            /* 关键：队员每次模型请求前也刷新 slot，修复 turn/start 漏刷新。 */
+            try { squad.refreshContextSnapshot(key) } catch { /* 不阻断模型 */ }
+            return next()
           })
         }
         /* 工具隔离：别人挂的私有 MCP 不给这个成员用 */
@@ -6128,7 +6589,7 @@ class Squad {
       const handle = await agents.create({
         sessionId,
         meta: { cwd: member.station || workDir, origin: 'subagent' },
-        agentOptions: selection,
+        agentOptions: { ...selection, maxTokens: 16000 },
         setup,
       })
       member.agent = handle.agent
@@ -6136,6 +6597,7 @@ class Squad {
       member.status = 'idle'
       member.model = asText(selection.provider) !== '' ? `${selection.provider}/${selection.model}` : 'follow-dsh'
       this.members.set(key, member)
+      this.refreshContextSnapshot(key)
     } catch (error) {
       /* agent 没建起来时，把已注册的私有 MCP 和占位状态一并回滚。 */
       this.uninstallMemberMcp(key)
@@ -6254,6 +6716,7 @@ class Squad {
     /* 双花括号会被 prompt 模板当变量解析，直接把整个会话变成 malformed，这里统一消毒 */
     const message = safePromptText(asText(text))
     if (message === '') throw new Error('任务内容不能为空')
+    if (this.pausedEngagements.has(member.engagementId)) throw new Error('当前项目已暂停；请先点「继续」再派活')
     member.task = message
     member.taskNotified = false
     member.lastText = ''
@@ -6435,6 +6898,8 @@ class Squad {
     this.members.delete(key)
     this.removeMemberFromGroup(member)
     this.promptCache.delete(key)
+    this.slots?.forget?.(key)
+    this.graphViewedVersion?.delete?.(key)
     this.transcripts.delete(key)
     this.browsers?.drop?.(member.engagementId, member.sessionId)
     const timer = this.saveTimers.get(key)
@@ -6482,6 +6947,10 @@ class Squad {
         const header = session && session.header ? session.header : {}
         const member = this.memberBySessionId(header.id)
         if (member === undefined) return
+        if (event.type === 'turn/start') {
+          this.refreshContextSnapshot(member.key)
+          return
+        }
         if (event.type === 'tool/result') {
           const rt = blocksText(event.data.message && event.data.message.content)
           const okr = event.data.error === undefined
@@ -6623,11 +7092,19 @@ class Squad {
         })
       } catch { /* 同上 */ }
     })
+    const offContextPrune = ctx.on('session/event', (session, event) => {
+      try {
+        if (event.type !== 'user/message' || !event.data || !event.data.source || event.data.source.kind !== 'runtime-context') return
+        if (this.memberBySessionId(session.header && session.header.id) === undefined) return
+        setTimeout(() => pruneRuntimeContextSnapshots(session), 0)
+      } catch { /* 快照清理失败不影响对话 */ }
+    })
     return () => {
       offStream()
       offEvent()
       offStatus()
       offError()
+      offContextPrune()
     }
   }
 
@@ -6649,7 +7126,7 @@ class Squad {
 
 /** 事件触发引擎：图谱变化 → 按规则派人。 */
 
-/* ═══════════════ 全员会议：停滞检测 + 协同出新方案 ═══════════════ */
+/* ═══════════════ 全员会议：周期审查 + 协同出新方案 ═══════════════ */
 
 
 /* ═══════════ 命令审计：验收员回看某个队员执行过的命令，不合格就返工 ═══════════ */
@@ -7002,20 +7479,25 @@ class Runner {
     }
   }
 
-  /* 中断：停掉所有人 + 记断点（manual 手动，stall 断网/卡死，shutdown 关机） */
+  /* 中断：先让当前模型/工具自然结束，再由 agent/pre-step 拒绝下一步，保存断点。 */
   async pause(eng, reason = 'manual') {
-    const checkpoint = await this.snapshot(eng, 'paused', reason)
+    let pauseState = null
+    try { pauseState = this.squad.pause(eng.id) } catch { /* 忽略 */ }
+    try { this.cockpit?.pause?.(eng.id) } catch { /* 忽略 */ }
+    try { this.automation?.pause?.(eng.id) } catch { /* 忽略 */ }
+    const checkpoint = await this.snapshot(eng, 'pausing', reason)
+    checkpoint.pauseRequestedAt = nowMs()
+    checkpoint.reason = reason
+    checkpoint.pausedMembers = pauseState && Array.isArray(pauseState.members) ? pauseState.members : []
     await this.save(eng.id, checkpoint)
-    let stopped = 0
-    try { stopped = (await this.squad.stopAll(eng.id)) || 0 } catch { /* 没有在跑的 */ }
-    try { await this.cockpit?.stop?.(eng.id) } catch { /* 忽略 */ }
+    const paused = pauseState ? 1 : 0
     await this.board.post(eng.id, {
       author: { role: 'system', name: '调度' },
       kind: 'note',
-      text: `⏸ 已中断（${reason === 'manual' ? '手动' : reason}）。断点已存：任务 ${checkpoint.stats.open + checkpoint.stats.doing} 待办 / ${checkpoint.done} 已通过，成员 ${checkpoint.members.length} 人，最后命令 ${checkpoint.cursor ? checkpoint.cursor.commandId : '无'}。恢复时点「继续」即可从这里接着跑。`,
+      text: `⏸ 已请求中断（${reason === 'manual' ? '手动' : reason}）：正在等待当前模型输出和工具执行结束；结束后保存断点，不再发起下一步请求。`,
       status: 'open',
     })
-    return { ok: true, checkpoint, stopped }
+    return { ok: true, checkpoint, phase: 'pausing', paused }
   }
 
   /* 启动：按断点把人和活重新拉起来 */
@@ -7024,11 +7506,34 @@ class Runner {
     if (checkpoint === undefined) {
       return { ok: false, error: '这个项目还没有断点：先让它跑起来再中断，或直接给总指挥下指令' }
     }
+    if (checkpoint.phase === 'paused' || checkpoint.phase === 'pausing') {
+      try { this.squad.restorePause(eng.id, checkpoint.pausedMembers || []) } catch { /* 忽略 */ }
+      try { this.cockpit?.restorePause?.(eng.id) } catch { /* 忽略 */ }
+      try { this.automation?.pause?.(eng.id) } catch { /* 忽略 */ }
+    }
     const pending = (checkpoint.tasks || []).filter((row) => row.status !== 'passed')
     const pendingText = pending.slice(0, 12)
       .map((row) => `· [${row.status}] ${row.title}${row.role ? `（${row.role}）` : ''}${row.acceptance ? ` —— 验收：${row.acceptance}` : ''}`)
       .join('\n')
     const membersText = (checkpoint.members || []).map((m) => `· ${m.name}（${m.role}）${m.task ? ` 上次任务：${shortText(m.task, 80)}` : ''}`).join('\n')
+    /* 真正的暂停恢复：唤醒原会话，保留工具结果和上下文，不重新派发。 */
+    if (checkpoint.phase === 'paused' || checkpoint.phase === 'pausing') {
+      const memberResume = this.squad.resume(eng.id)
+      const cockpitResume = this.cockpit?.resume?.(eng.id)
+      if ((memberResume && memberResume.resumed > 0) || (cockpitResume && cockpitResume.resumed === true)) {
+        try { this.automation?.resume?.(eng.id) } catch { /* 忽略 */ }
+        const next = await this.save(eng.id, {
+          ...checkpoint,
+          phase: 'running',
+          reason: '',
+          resumedAt: nowMs(),
+          resumedMembers: memberResume ? memberResume.resumed : 0,
+          resumedCockpit: cockpitResume && cockpitResume.resumed === true,
+        })
+        return { ok: true, checkpoint: next, spawned: 0, pending: pending.length, handoff: cockpitResume && cockpitResume.resumed ? 'resumed' : 'skipped', resumed: true }
+      }
+    }
+
     const brief = [
       '【从断点继续】',
       note !== '' ? `说明：${note}` : '',
@@ -7082,6 +7587,7 @@ class Runner {
       handoff = await this.cockpit?.send?.({ engagement: eng.id, text: brief, tier: 'deep' })
     } catch { /* 驾驶舱不可用就只依赖看板 */ }
 
+    try { this.automation?.resume?.(eng.id) } catch { /* 忽略 */ }
     const next = await this.save(eng.id, { ...checkpoint, phase: 'running', reason: '', resumedAt: nowMs(), spawned })
     return { ok: true, checkpoint: next, spawned, pending: pending.length, handoff: handoff ? 'sent' : 'skipped' }
   }
@@ -7094,7 +7600,7 @@ class Runner {
     const members = this.squad.list(eng.id)
     const running = members.filter((m) => m.status === 'running' || m.status === 'starting')
     const phase = checkpoint ? checkpoint.phase : 'idle'
-    if (phase === 'paused') return
+    if (phase === 'paused' || phase === 'pausing') return
     if (running.length === 0) {
       if (phase === 'running') {
         /* 之前被标记在跑，但已经没人在跑：可能全崩了 */
@@ -7128,18 +7634,42 @@ class Runner {
   }
 
   async status(eng) {
-    const checkpoint = eng === undefined ? undefined : await this.load(eng.id)
+    let checkpoint = eng === undefined ? undefined : await this.load(eng.id)
     const members = eng === undefined ? [] : this.squad.list(eng.id)
-    const running = members.filter((m) => m.status === 'running' || m.status === 'starting').length
+    if (eng !== undefined && checkpoint && (checkpoint.phase === 'paused' || checkpoint.phase === 'pausing')) {
+      try { this.squad.restorePause(eng.id, checkpoint.pausedMembers || []) } catch { /* 忽略 */ }
+      try { this.cockpit?.restorePause?.(eng.id) } catch { /* 忽略 */ }
+      try { this.automation?.pause?.(eng.id) } catch { /* 忽略 */ }
+    }
+    const running = members.filter((m) => m.status === 'running' || m.status === 'starting' || m.status === 'waiting').length
+    const cockpitBusy = eng !== undefined && this.cockpit?.isBusy?.(eng.id) === true
+    const meetingBusy = eng !== undefined && this.meeting?.busy?.has?.(eng.id) === true
+    /* 暂停请求只在所有当前模型/工具都结束后才落成 paused。 */
+    if (checkpoint && checkpoint.phase === 'pausing' && running === 0 && !cockpitBusy && !meetingBusy) {
+      const previous = await this.load(eng.id)
+      checkpoint = await this.snapshot(eng, 'paused', checkpoint.reason || 'manual')
+      checkpoint.pauseRequestedAt = previous?.pauseRequestedAt || checkpoint.pauseRequestedAt || 0
+      checkpoint.pausedMembers = previous?.pausedMembers || checkpoint.pausedMembers || []
+      checkpoint.pausedAt = nowMs()
+      await this.save(eng.id, checkpoint)
+      await this.board.post(eng.id, {
+        author: { role: 'system', name: '调度' },
+        kind: 'note',
+        text: `⏸ 已暂停：当前模型输出/工具已收尾，断点已保存；下一步模型请求不会发出。点「继续」从原上下文继续。`,
+        status: 'open',
+      })
+    }
     return {
       phase: checkpoint ? checkpoint.phase : 'idle',
       running,
+      busy: cockpitBusy,
+      meetingBusy,
       checkpoint: checkpoint
         ? {
           phase: checkpoint.phase, reason: checkpoint.reason || '', savedAt: checkpoint.savedAt || 0,
           resumedAt: checkpoint.resumedAt || 0, pending: (checkpoint.tasks || []).length,
           done: checkpoint.done || 0, counts: checkpoint.counts || {}, members: (checkpoint.members || []).length,
-          cursor: checkpoint.cursor || null,
+          cursor: checkpoint.cursor || null, pauseRequestedAt: checkpoint.pauseRequestedAt || 0, pausedAt: checkpoint.pausedAt || 0,
         }
         : null,
     }
@@ -7151,7 +7681,7 @@ class Runner {
 }
 
 class Meeting {
-  constructor({ store, cfg, configStore, hub, board, squad, tasks, cockpit, trace }) {
+  constructor({ store, cfg, configStore, hub, board, squad, tasks, cockpit, runner, trace }) {
     this.store = store
     this.cfg = cfg
     this.configStore = configStore
@@ -7160,11 +7690,15 @@ class Meeting {
     this.squad = squad
     this.tasks = tasks
     this.cockpit = cockpit
+    this.runner = runner
     this.trace = trace
     this.lastAt = new Map()
     this.counts = new Map()
     this.busy = new Set()
     this.loaded = new Set()
+    /* 周期审查状态：key=engagementId */
+    this.reviewAt = new Map()
+    this.reviewAskedAt = new Map()
   }
 
   meetingFile(engagementId) {
@@ -7194,7 +7728,7 @@ class Meeting {
     } catch { /* 会议状态落盘失败不阻断会议 */ }
   }
 
-  /** 会议参数全部来自控制台配置（没设就按默认 20/20/3）。 */
+  /** 全员会议参数：任务活动期间的周期审查间隔、最多自动召开轮次。 */
   options() {
     const raw = (this.configStore && this.configStore.get ? this.configStore.get().meeting : null) || {}
     const clamp = (value, min, max, fallback) => {
@@ -7202,56 +7736,38 @@ class Meeting {
       return Number.isFinite(num) ? Math.min(max, Math.max(min, Math.round(num))) : fallback
     }
     return {
-      stallMinutes: clamp(raw.stallMinutes, 5, 240, 20),
-      gapMinutes: clamp(raw.gapMinutes, 5, 240, 20),
+      reviewMinutes: clamp(raw.reviewMinutes, 1, 60, 5),
       maxRounds: clamp(raw.maxRounds, 1, 20, 3),
     }
   }
 
-  /* 停滞判定：任务全派完 + 没有人在跑 + 一段时间内没有新进展 */
+  /** 只报告 mission 周期审查状态；不再使用旧的时间窗停滞判定。 */
   async verdict(eng) {
     if (eng === undefined || eng === null) return { stalled: false, reasons: [] }
-    await this.load(eng.id)
-    const reasons = []
-    const stats = await this.tasks.stats(eng.id)
-    const members = this.squad.list(eng.id)
-    const running = members.filter((m) => m.status === 'running' || m.status === 'starting').length
-    const pending = stats.open + stats.doing + stats.blocked
-    if (running > 0) return { stalled: false, reasons: ['有成员在跑'] }
-    if (pending > 0) return { stalled: false, reasons: [`还有 ${pending} 个任务没完成`] }
-    if (stats.total === 0) {
-      const nodeCount = (eng.nodes || []).length
-      return { stalled: nodeCount > 0, reasons: [nodeCount > 0 ? '有资产但一个任务都没拆' : '还没有任何资产'] }
+    const mission = await this.tasks.missionOf(eng.id)
+    if (mission === null || mission === undefined) {
+      return { stalled: false, reasons: ['没有进行中的 mission，周期审查未启动'] }
     }
-    if (stats.failed === 0 && stats.passed > 0 && stats.open === 0 && stats.doing === 0 && stats.blocked === 0) {
-      /* 全部通过：那是完成态，不需要开会 */
-      return { stalled: false, reasons: ['所有任务已通过验收'] }
+    return {
+      stalled: false,
+      reasons: mission.reviewActive === false || mission.status === 'done'
+        ? ['作战已结束，周期审查已关闭']
+        : [`周期审查启用中；每 ${this.options().reviewMinutes} 分钟检查一次`],
+      stats: await this.tasks.stats(eng.id),
+      mission,
     }
-    if (stats.failed > 0) reasons.push(`${stats.failed} 个任务被驳回未返工`)
-
-    /* 时间窗：最近一段时间有没有实质进展（新命令 / 新资产 / 新漏洞 / 验收通过） */
-    const options = this.options()
-    const windowMs = options.stallMinutes * 60 * 1000
-    const since = nowMs() - windowMs
-    const freshCommands = (eng.commands || []).filter((c) => toEpoch(c.startedAt) >= since).length
-    const freshNodes = (eng.nodes || []).filter((n) => toEpoch(n.ts || n.createdAt) >= since).length
-    const freshVulns = (eng.vulns || []).filter((v) => toEpoch(v.ts || v.createdAt) >= since).length
-    if (freshCommands === 0 && freshNodes === 0 && freshVulns === 0) {
-      reasons.push(`最近 ${Math.round(windowMs / 60000)} 分钟没有新命令/资产/漏洞`)
-    } else {
-      return { stalled: false, reasons: ['仍在产生新信息'] }
-    }
-
-    const last = this.lastAt.get(eng.id) || 0
-    const wait = last + options.gapMinutes * 60 * 1000 - nowMs()
-    if (wait > 0) return { stalled: false, reasons: [`距离上次会议还有 ${Math.ceil(wait / 60000)} 分钟`] }
-    return { stalled: true, reasons, stats, members }
   }
 
   /* 召集全员：每个在编角色各出一份新方案，总指挥汇总成新一轮计划 */
-  async convene(eng, { reason = '自动检测到停滞', manual = false } = {}) {
+  async convene(eng, { reason = '周期审查判定卡壳', manual = false } = {}) {
     if (eng === undefined || eng === null) throw new Error('还没有项目')
     if (this.busy.has(eng.id)) return { ok: false, error: '这个项目正在开会' }
+    try {
+      const checkpoint = this.runner ? await this.runner.load(eng.id) : undefined
+      if (checkpoint && (checkpoint.phase === 'paused' || checkpoint.phase === 'pausing')) {
+        return { ok: false, error: '项目已暂停；继续后才能召开全员会议' }
+      }
+    } catch { /* 读取断点失败就继续 */ }
     await this.load(eng.id)
     this.busy.add(eng.id)
     const round = (this.counts.get(eng.id) || 0) + 1
@@ -7328,7 +7844,7 @@ class Meeting {
           `🗣 全员会议 #${round}（${manual ? '手动召开' : '自动触发'}）`,
           `原因：${reason}`,
           `参会：${seated.map((row) => row.name).join('、') || '无（成员已满或角色不可用）'}`,
-          '议题：诊断停滞原因 → 每角色出 1-3 条新方案 → 总指挥汇总成新一轮任务。',
+          '议题：诊断卡壳/缺口原因 → 每角色出 1-3 条新方案 → 总指挥汇总成新一轮任务。',
         ].join('\n'),
         status: 'open',
       })
@@ -7365,29 +7881,85 @@ class Meeting {
     }
   }
 
-  /* 定时巡检：只对当前项目、且只在停滞时开会 */
+  /** 只保留总指挥/参谋且都空闲时，才进入周期审查。 */
+  coreOnlyIdle(eng) {
+    const members = this.squad.list(eng.id)
+    const core = members.filter((m) => CORE_ROLES.has(m.role))
+    const nonCore = members.filter((m) => !CORE_ROLES.has(m.role))
+    if (core.length < 2 || nonCore.length > 0) return false
+    return core.every((m) => m.status !== 'running' && m.status !== 'starting' && m.status !== 'waiting')
+  }
+
+  recentCockpitText(eng, since) {
+    try {
+      const rows = this.cockpit?.transcriptOf?.(eng.id) || []
+      return rows
+        /* 只读总指挥回复，不能把审查问题自身包含的 STUCK/DONE 当成回答。 */
+        .filter((row) => row && row.role === 'assistant' && (Number(row.ts) || 0) >= since)
+        .map((row) => `总指挥：${asText(row.text)}`)
+        .join('\n')
+    } catch { return '' }
+  }
+
+  /** 任务活动期间的周期审查。返回 true 表示本轮已经处理。 */
+  async reviewTick(eng) {
+    const mission = await this.tasks.missionOf(eng.id)
+    if (mission === null || mission === undefined) return false
+    if (mission.status === 'done' || mission.reviewActive === false) return false
+    if (mission.reviewActive !== true && mission.status !== 'running') return false
+    /* 手动暂停/断点期间不做周期审查。 */
+    try {
+      const checkpoint = this.runner ? await this.runner.load(eng.id) : undefined
+      if (checkpoint && (checkpoint.phase === 'paused' || checkpoint.phase === 'pausing')) return false
+    } catch { /* 读取断点失败就继续审查 */ }
+    if (!this.coreOnlyIdle(eng)) {
+      this.reviewAt.delete(eng.id)
+      this.reviewAskedAt.delete(eng.id)
+      return false
+    }
+    const now = nowMs()
+    const askedAt = this.reviewAskedAt.get(eng.id) || 0
+    if (askedAt > 0) {
+      const text = this.recentCockpitText(eng, askedAt)
+      if (/(?:STUCK|卡壳|卡住|未完成|没完成|受阻|无法推进|需要.*会议)/i.test(text)) {
+        this.reviewAskedAt.delete(eng.id)
+        this.reviewAt.set(eng.id, now)
+        await this.convene(eng, { reason: '周期审查：总指挥报告任务卡壳' })
+        return true
+      }
+      if (/(?:DONE|已完成|任务完成|已经完成|结束|收工|达标)/i.test(text)) {
+        this.reviewAskedAt.delete(eng.id)
+        this.reviewAt.set(eng.id, now)
+        return true
+      }
+      /* 还没有明确答复：按审查周期再问一次，不重复开会。 */
+      if (now - askedAt < this.options().reviewMinutes * 60 * 1000) return true
+      this.reviewAskedAt.delete(eng.id)
+    }
+    const lastAt = this.reviewAt.get(eng.id) || 0
+    if (now - lastAt < this.options().reviewMinutes * 60 * 1000) return true
+    this.reviewAt.set(eng.id, now)
+    this.reviewAskedAt.set(eng.id, now)
+    const question = [
+      '【周期审查】当前任务仍在进行，且团队里只有总指挥和参谋在岗、都已空闲。',
+      '请明确回答：当前作战目标是否已经完成？是否出现任务卡壳/无法推进？',
+      '如果已经完成，请用 `DONE` 开头回答；如果卡壳，请用 `STUCK` 开头回答，并立即调用 `recon_meeting action=convene reason=周期审查判定卡壳`。',
+    ].join('\n')
+    try {
+      const result = await this.cockpit?.nudge?.(eng.id, question, { always: true })
+      if (result && result.skipped) this.reviewAskedAt.set(eng.id, now)
+    } catch { /* 总指挥不可用时不阻断其它定时任务 */ }
+    return true
+  }
+
+  /* 定时巡检：只对当前项目、且只在 mission 活动期间做周期审查。 */
   async tick() {
     const eng = await this.store.activeEngagement()
     if (eng === undefined) return
-    const verdict = await this.verdict(eng)
-    if (!verdict.stalled) return
-    await this.load(eng.id)
-    const round = this.counts.get(eng.id) || 0
-    const cap = this.options().maxRounds
-    if (round >= cap) {
-      if (round === cap) {
-        this.counts.set(eng.id, round + 1)
-        await this.persist(eng.id)
-        await this.board.post(eng.id, {
-          author: { role: 'system', name: '会议主持' },
-          kind: 'note',
-          text: `❗ 已连续 ${cap} 轮全员会议仍无进展，自动开会暂停。需要人工介入：改目标 / 缩范围 / 换攻击面。`,
-          status: 'open',
-        })
-      }
-      return
-    }
-    await this.convene(eng, { reason: verdict.reasons.join('；') })
+    const mission = await this.tasks.missionOf(eng.id)
+    if (mission === null || mission === undefined) return
+    if (mission.status === 'done' || mission.reviewActive === false) return
+    await this.reviewTick(eng)
   }
 
   status(eng) {
@@ -7396,8 +7968,7 @@ class Meeting {
       round: this.counts.get(eng.id) || 0,
       lastAt: this.lastAt.get(eng.id) || 0,
       maxRounds: options.maxRounds,
-      stallMinutes: options.stallMinutes,
-      gapMinutes: options.gapMinutes,
+      reviewMinutes: options.reviewMinutes,
       busy: this.busy.has(eng.id),
     }
   }
@@ -7424,6 +7995,16 @@ class Automation {
     this.queue = []
     this.draining = null
     this.drainAgain = false
+    this.pausedEngagements = new Set()
+  }
+
+  pause(engagementId) {
+    this.pausedEngagements.add(engagementId)
+  }
+
+  resume(engagementId) {
+    this.pausedEngagements.delete(engagementId)
+    void this.drain()
   }
 
   config() {
@@ -7435,11 +8016,8 @@ class Automation {
     merged.maxAutomationAgents = Number.isFinite(Number(merged.maxAutomationAgents))
       ? Math.max(1, Math.min(50, Math.floor(Number(merged.maxAutomationAgents))))
       : 3
-    const configuredMembers = Number.isFinite(Number(merged.maxMembers))
-      ? Math.max(1, Math.min(50, Math.floor(Number(merged.maxMembers))))
-      : 6
-    /* 控制台只暴露一个「最大并发数」；成员上限不能低于它，否则调大并发也不会生效 */
-    merged.maxMembers = Math.max(merged.maxAgents, configuredMembers)
+    /* maxAgents 是团队非核心成员上限，不再被隐藏的 maxMembers 反超。 */
+    merged.maxMembers = merged.maxAgents
     merged.rules = Array.isArray(merged.rules) ? merged.rules : []
     return merged
   }
@@ -7466,6 +8044,7 @@ class Automation {
 
   /** 自动化队列：同一候选/规则只保留一个，避免事件风暴重复排队。 */
   enqueue(job) {
+    if (this.pausedEngagements.has(job.engagementId)) return false
     const key = asText(job.dedupeKey) || `${job.engagementId}:${job.ruleId}:${job.task}`
     if (this.queue.some((item) => item.dedupeKey === key)) return false
     this.queue.push({ ...job, dedupeKey: key, queuedAt: nowMs() })
@@ -7491,6 +8070,7 @@ class Automation {
           progressed = false
           let index = -1
           for (let i = 0; i < this.queue.length; i += 1) {
+            if (this.pausedEngagements.has(this.queue[i].engagementId)) continue
             if (this.activeAutomationCount(this.queue[i].engagementId) < config.maxAutomationAgents) {
               index = i
               break
@@ -7547,7 +8127,7 @@ class Automation {
     const config = this.config()
     if (!config.enabled) return
     const eng = await this.store.activeEngagement()
-    if (eng === undefined) return
+    if (eng === undefined || this.pausedEngagements.has(eng.id)) return
     const now = nowMs()
     for (const rule of config.rules) {
       if (rule === null || typeof rule !== 'object' || rule.enabled === false) continue
@@ -7580,7 +8160,7 @@ class Automation {
 
   async onDelta(eng, delta) {
     const config = this.config()
-    if (!config.enabled) return
+    if (!config.enabled || this.pausedEngagements.has(eng.id)) return
     const now = nowMs()
     const candidates = []
     for (const command of delta.newCommands) {
@@ -8119,6 +8699,28 @@ function makeHandler(deps) {
         sendJson(res, 200, { ok: true, config, keys: configStore.keyPresence(), mcp: mcpState })
         return
       }
+
+      if (op === 'customModels.discover') {
+        sendJson(res, 200, { ok: true, ...(await customModels.discover({
+          baseUrl: body.baseUrl,
+          apiKey: body.apiKey,
+          keyRef: body.keyRef,
+          protocol: body.protocol,
+          provider: body.provider,
+        })) })
+        return
+      }
+      if (op === 'customModels.test') {
+        sendJson(res, 200, { ok: true, ...(await customModels.testEndpoint({
+          baseUrl: body.baseUrl,
+          apiKey: body.apiKey,
+          protocol: body.protocol,
+          model: body.model,
+          provider: body.provider,
+        })) })
+        return
+      }
+
 
       if (op === 'providers') {
         const llm = ctx.get('llm')
@@ -8668,7 +9270,14 @@ function makeHandler(deps) {
         if (eng === undefined) sendJson(res, 200, { ok: true, meeting: null, verdict: { stalled: false, reasons: [] } })
         else {
           await meeting.load(eng.id)
-          sendJson(res, 200, { ok: true, meeting: meeting.status(eng), verdict: await meeting.verdict(eng) })
+          const mission = await tasks.missionOf(eng.id)
+          const reviewActive = mission !== null && mission !== undefined
+            && mission.status !== 'done' && mission.reviewActive !== false
+          sendJson(res, 200, {
+            ok: true,
+            meeting: { ...meeting.status(eng), reviewActive },
+            verdict: await meeting.verdict(eng),
+          })
         }
         return
       }
@@ -8857,8 +9466,10 @@ function makeHandler(deps) {
           prompt: role.prompt || '', skills: Array.isArray(role.skills) ? role.skills : [],
           mcp: asMcpList(role.mcp), core: true,
         })
+        const recruitTier = asText(configStore.get().roles && configStore.get().roles.recruitTier, 'auto')
         sendJson(res, 200, {
           ok: true,
+          recruitTier: ['auto', ...MODEL_TIERS].includes(recruitTier) ? recruitTier : 'auto',
           roles: squad.roles().map((role) => ({
             id: role.id, name: role.name, tier: role.tier, reportsTo: role.reportsTo || null,
             prompt: role.prompt || '', skills: Array.isArray(role.skills) ? role.skills : [],
@@ -8892,7 +9503,8 @@ function makeHandler(deps) {
           if (roleIds.has(role.id)) throw new Error(`角色 id 重复：${role.id}`)
           roleIds.add(role.id)
         }
-        const patch = { roles: { squad: cleaned } }
+        const recruitTier = ['auto', ...MODEL_TIERS].includes(asText(body.recruitTier)) ? asText(body.recruitTier) : 'auto'
+        const patch = { roles: { squad: cleaned, recruitTier } }
         if (Array.isArray(body.core)) {
           const core = {}
           for (const id of CORE_ROLE_IDS) {
@@ -8917,7 +9529,7 @@ function makeHandler(deps) {
           prompt: role.prompt || '', skills: Array.isArray(role.skills) ? role.skills : [],
           mcp: asMcpList(role.mcp), core: true,
         }))
-        sendJson(res, 200, { ok: true, roles: cleaned, core: coreView })
+        sendJson(res, 200, { ok: true, roles: cleaned, core: coreView, recruitTier })
         return
       }
 
@@ -8994,7 +9606,7 @@ function registerCollabTools(ctx, deps) {
         action: { type: 'string', enum: ['post', 'list', 'view', 'search', 'summarize', 'update', 'edit', 'remove'], description: '默认 post；view 按 id 查看正文，search 按关键词检索，summarize 用模型生成真正概括，edit 改正文，remove 删除条目' },
         kind: { type: 'string', enum: ['finding', 'hypothesis', 'task', 'conclusion', 'note'], description: '条目类型' },
         text: { type: 'string', description: '正文内容：完整证据、判断、下一步' },
-        summary: { type: 'string', description: 'agent 条目的概括索引（必填）；不填会自动取正文首行；用户条目忽略' },
+        summary: { type: 'string', description: 'agent 条目的概括索引；为空时会自动调用快速模型生成，用户条目忽略' },
         node: { type: 'string', description: '关联节点 id 或 value' },
         vuln: { type: 'string', description: '关联漏洞 id' },
         commandId: { type: 'string', description: '关联命令 id' },
@@ -9042,18 +9654,25 @@ function registerCollabTools(ctx, deps) {
         }
         if (asText(args.action) === 'summarize') {
           const row = await board.summarizeEntry(eng.id, asText(args.id))
-          return json({ ok: true, entry: { id: row.id, kind: row.kind, summary: boardSummaryOf(row), text: row.text } })
+          return json({ ok: true, entry: { id: row.id, kind: row.kind, summary: boardSummaryOf(row), hasBody: true } })
         }
         if (asText(args.action) === 'view') {
           const rows = await board.list(eng.id, 1000000)
           const row = rows.find((item) => item.id === asText(args.id))
           if (row === undefined) throw new Error(`看板条目不存在：${asText(args.id)}`)
           board.markViewed(eng.id, caller, row.id)
-          return json({ ok: true, entry: { id: row.id, kind: row.kind, author: row.author, text: row.text, refs: row.refs, shots: row.shots } })
+          /* 正文作为本次工具结果进入可变区，不刷新整份 CONTEXT_SLOTS。 */
+          return json({
+            ok: true,
+            entry: {
+              id: row.id, kind: row.kind, author: row.author,
+              text: row.text, refs: row.refs, shots: row.shots,
+            },
+          })
         }
         if (asText(args.action) === 'update' || asText(args.action) === 'edit') {
           const row = await board.update(eng.id, asText(args.id), args)
-          return json({ ok: true, entry: { id: row.id, kind: row.kind, summary: boardSummaryOf(row), text: row.text } })
+          return json({ ok: true, entry: { id: row.id, kind: row.kind, summary: boardSummaryOf(row), hasBody: true } })
         }
         if (asText(args.action) === 'remove') {
           return json(await board.remove(eng.id, asText(args.id)))
@@ -9066,11 +9685,23 @@ function registerCollabTools(ctx, deps) {
         }
         if (asText(args.vuln) !== '') refs.vulnIds = [asText(args.vuln)]
         if (asText(args.commandId) !== '') refs.commandIds = [asText(args.commandId)]
-        const summary = asText(args.summary).replace(/\s+/g, ' ').trim()
-        const body = asText(args.text).replace(/\s+/g, ' ').trim()
-        const bodyPrefix = summary.replace(/…$/g, '').trim()
-        if (summary === '' || summary === body || (bodyPrefix.length >= 80 && body.startsWith(bodyPrefix))) {
-          throw new Error('agent 看板必须提供真正的概括 summary：要语义提炼对象/位置/结论/下一步，不能复制正文或截断正文；text 仍然写完整正文。')
+        if (caller.kind === 'member' && caller.role === 'staff' && asText(args.kind, 'note') === 'hypothesis') {
+          const mission = tasks && typeof tasks.missionOf === 'function' ? await tasks.missionOf(eng.id) : null
+          if (mission !== null && mission !== undefined && mission.status === 'running' && (eng.nodes || []).length > 0) {
+            const info = sessionInfoOf(exec)
+            const member = squad && typeof squad.memberBySessionId === 'function' ? squad.memberBySessionId(info.id) : undefined
+            if (member === undefined || asText(member.graphViewedVersion) !== graphVersionOf(eng)) {
+              return json({ ok: false, error: '参谋提交方案前必须先调用 recon_view 查看当前完整图谱（node 留空、limit 不传或至少覆盖当前节点数）；看完后再写 hypothesis。' })
+            }
+          }
+        }
+        let summary = asText(args.summary).replace(/\s+/g, ' ').trim()
+        if (summary === '') {
+          try {
+            summary = await board.generateSummary(asText(args.text))
+          } catch (error) {
+            return fail(error)
+          }
         }
         const entry = await board.post(eng.id, {
           author: caller,
@@ -9694,9 +10325,9 @@ function registerCollabTools(ctx, deps) {
   ctx.tools.register({
     name: 'recon_meeting',
     description:
-      '全员会议。action=status 看是否停滞（任务全派完、没人在跑、一段时间无新进展），'
+      '全员会议。action=status 查看周期审查状态；任务活动期间每 N 分钟检查，只有总指挥/参谋在岗且空闲时询问总指挥，STUCK 才召开会议；'
       + 'action=convene 立刻召集全体角色：每人诊断原因 + 出 1-3 条新方案，总指挥汇总成新一轮任务。'
-      + '系统也会自动检测停滞并开会（有冷却与轮次上限）。',
+      + 'mission close 后 reviewActive=false，停止周期审查。',
     parameters: {
       type: 'object',
       properties: {
@@ -9882,8 +10513,7 @@ function registerCollabTools(ctx, deps) {
             return Number.isFinite(num) ? Math.min(max, Math.max(min, Math.round(num))) : fallback
           }
           patch.meeting = {
-            stallMinutes: clamp(values.stallMinutes, 5, 240, Number(current.stallMinutes) || 20),
-            gapMinutes: clamp(values.gapMinutes, 5, 240, Number(current.gapMinutes) || 20),
+            reviewMinutes: clamp(values.reviewMinutes, 1, 60, Number(current.reviewMinutes) || 5),
             maxRounds: clamp(values.maxRounds, 1, 20, Number(current.maxRounds) || 3),
           }
         } else if (section === 'board') {
@@ -9992,6 +10622,7 @@ function registerCollabTools(ctx, deps) {
               goal: asText(args.goal),
               done: acceptanceText,
               status: 'running',
+              reviewActive: true,
               rounds: (prev === null ? 0 : Number(prev.rounds) || 0) + 1,
             })
             await board.post(eng.id, {
@@ -10023,6 +10654,7 @@ function registerCollabTools(ctx, deps) {
               goal: (await tasks.missionOf(eng.id) || {}).goal || '',
               done: (await tasks.missionOf(eng.id) || {}).done || '',
               status: 'done',
+              reviewActive: false,
             })
             cockpit.pendingNudges?.delete?.(eng.id)
             const stopped = await squad.stopAll(eng.id)
@@ -10334,7 +10966,7 @@ async function recoverContextOverflow(ctx, agent, failure, signal) {
 export function apply(ctx, config = {}) {
   const cfg = {
     root: asText(config.root) || join(dshHome(), 'recon'),
-    maxOutputChars: Number.isFinite(config.maxOutputChars) ? config.maxOutputChars : 24000,
+    maxOutputChars: Number.isFinite(config.maxOutputChars) ? Math.max(1000, Math.min(4000, Number(config.maxOutputChars))) : 4000,
     defaultTimeoutMs: Number.isFinite(config.defaultTimeoutMs) ? config.defaultTimeoutMs : 300000,
     systemPrompt: config.systemPrompt !== false,
   }
@@ -10364,8 +10996,10 @@ export function apply(ctx, config = {}) {
   const runner = new Runner({ store, cfg, configStore, hub, board, tasks, squad, cockpit, trace })
   const meeting = new Meeting({
     store, cfg, configStore, hub, board, squad,
-    tasks, cockpit, trace,
+    tasks, cockpit, runner, trace,
   })
+  runner.automation = automation
+  runner.meeting = meeting
   const brief = new Brief(ctx, store, cfg, configStore, hub, {
     tasks, board, squad, trace, runner, meeting, audit,
   })
@@ -10482,7 +11116,7 @@ export function apply(ctx, config = {}) {
       }
     } catch { /* 校正失败不影响启动 */ }
   })()
-  registerTools(ctx, store, cfg, bindings, configStore, trace, actorForTool, browsers, meeting, squad)
+  registerTools(ctx, store, cfg, bindings, configStore, trace, actorForTool, browsers, meeting, squad, cockpit)
   registerCollabTools(ctx, { store, cfg, configStore, hub, board, tasks, squad, browser, automation, cockpit, bindings, browsers, meeting, runner, audit, trace })
 
   /* 内置 bash 工具同样纳入「所有命令留痕」 */
@@ -10556,8 +11190,8 @@ export function apply(ctx, config = {}) {
 
   ctx.effect(() => {
     const timer = setInterval(() => { void automation.tick() }, 60000)
-    /* 停滞检测：每 3 分钟看一次，真的卡住才开会 */
-    const meetingTimer = setInterval(() => { void meeting.tick().catch(() => {}) }, 180000)
+    /* 周期审查：任务活动期间每 5 分钟检查一次；mission close 后 reviewActive=false 不再触发。 */
+    const meetingTimer = setInterval(() => { void meeting.tick().catch(() => {}) }, 60000)
     /* 断点心跳：每 2 分钟刷新一次；心跳超时自动存断点并标记「已中断」 */
     const runnerTimer = setInterval(() => { void runner.tick().catch(() => {}) }, 120000)
     /* 总指挥/参谋常驻：每分钟确认一次在岗，缺了就补 */
